@@ -3,16 +3,12 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import TYPE_CHECKING
 
 from .config import log, GOLDEN_DIR, GOLDEN_TAP, GUEST_IP
 from .types import _SandboxEntry
 from ._boot import _boot_from_snapshot, _teardown_vm
 from ._snapshot import golden_snapshot_exists
 from ._tcp import _read_tcp_output
-
-if TYPE_CHECKING:
-    from .sandbox import Sandbox
 
 
 class SandboxManager:
@@ -22,10 +18,8 @@ class SandboxManager:
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
 
-    def create(self) -> Sandbox:
-        """Start an interactive VM from golden snapshot. Returns a Sandbox."""
-        from .sandbox import Sandbox
-
+    def create(self) -> str:
+        """Start an interactive VM from golden snapshot. Returns the vm_id."""
         if not golden_snapshot_exists():
             raise RuntimeError(f"Golden snapshot not found in {GOLDEN_DIR}")
 
@@ -76,7 +70,7 @@ class SandboxManager:
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot["timings"].items())
         log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
 
-        return Sandbox(entry, self)
+        return vm_id
 
     def kill(self, sandbox_id: str) -> None:
         with self._lock:
@@ -91,18 +85,28 @@ class SandboxManager:
                 pass
         _teardown_vm(entry.process, entry.ns_name, entry.vm_dir)
 
-    def list(self) -> list[Sandbox]:
-        from .sandbox import Sandbox
+    def list_dicts(self) -> list[dict]:
+        """Return JSON-serializable dicts for all VMs."""
         with self._lock:
-            return [Sandbox(entry, self) for entry in self._sandboxes.values()]
+            return [entry.to_dict() for entry in self._sandboxes.values()]
 
-    def get(self, sandbox_id: str) -> Sandbox | None:
-        from .sandbox import Sandbox
+    def get_dict(self, sandbox_id: str) -> dict | None:
+        """Return JSON-serializable dict for a single VM, or None."""
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
         if entry is None:
             return None
-        return Sandbox(entry, self)
+        return entry.to_dict()
+
+    def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
+        """Return the raw entry for a VM (for subscribe/send_raw). None if not found."""
+        with self._lock:
+            return self._sandboxes.get(sandbox_id)
+
+    def vm_ids(self) -> list[str]:
+        """Return list of all VM IDs."""
+        with self._lock:
+            return list(self._sandboxes.keys())
 
     def _on_disconnect(self, sandbox_id: str) -> None:
         with self._lock:

@@ -12,6 +12,10 @@ dependencies = [
     "textual>=8.0.1",
     "pyte>=0.8",
     "pyroute2>=0.9.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "websockets>=14.0",
 ]
 
 [project.scripts]

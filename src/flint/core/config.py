@@ -30,3 +30,11 @@ POOL_WORKERS = 4
 
 TERM_COLS = 120
 TERM_ROWS = 40
+
+# ── Daemon ────────────────────────────────────────────────────────────────
+DAEMON_HOST = "127.0.0.1"
+DAEMON_PORT = 9100
+DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
+DAEMON_DIR = "/tmp/flint"
+DAEMON_STATE_PATH = "/tmp/flint/state.json"
+DAEMON_PID_PATH = "/tmp/flint/flintd.pid"

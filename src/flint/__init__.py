@@ -1,6 +1,6 @@
-from flint.core import Sandbox, SandboxManager, CommandResult
+from flint.sandbox import Sandbox, CommandResult
 
-__all__ = ["Sandbox", "SandboxManager", "CommandResult", "main"]
+__all__ = ["Sandbox", "CommandResult", "main"]
 
 
 def main() -> None:

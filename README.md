@@ -1,55 +1,206 @@
-# Flint
+<p align="center">
+  <h1 align="center">Flint</h1>
+  <p align="center">Lightning-fast Firecracker microVM management with an interactive TUI</p>
+</p>
 
-Firecracker VM management tool with a Python SDK and optional TUI.
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-python-sdk">SDK</a> •
+  <a href="#-tui">TUI</a> •
+  <a href="#-api">API</a> •
+  <a href="#-benchmarks">Benchmarks</a> •
+  <a href="#-architecture">Architecture</a>
+</p>
 
-## Quick Start
+---
+
+Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a terminal UI for interactive VM management.
+
+<!-- TODO: replace with actual screenshot -->
+<p align="center">
+  <img src="assets/tui-screenshot.png" alt="Flint TUI — managing multiple sandboxes with interactive terminals" width="800">
+</p>
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Linux host with [Firecracker](https://github.com/firecracker-microvm/firecracker) installed
+- A rootfs image and vmlinux kernel at `/root/firecracker-vm/`
+- Python 3.12+
+
+### Install
 
 ```bash
-# Install
+git clone https://github.com/jacquesverre/flint.git
+cd flint
 uv sync
-
-# Launch the TUI
-uv run flint start
-
-# CLI commands
-uv run flint list
-uv run flint stop <vm_id>
 ```
 
-## SDK
+### Run
+
+```bash
+# Terminal 1 — start the daemon
+uv run flint start
+
+# Terminal 2 — launch the TUI
+uv run flint app
+```
+
+The daemon creates a golden snapshot on startup, pre-warms a rootfs pool, and listens on `localhost:9100`.
+
+## 🐍 Python SDK
+
+Flint provides an E2B-style `Sandbox` class for programmatic VM management:
 
 ```python
-from flint import Sandbox, SandboxManager
+from flint import Sandbox
 
-manager = SandboxManager()
-
-# Create a sandbox
-sandbox = manager.create()
+# Create a new sandbox
+sandbox = Sandbox()
 
 # Run a command
-result = sandbox.commands.run("ls -la")
-print(result.stdout)
-print(result.exit_code)
+result = sandbox.commands.run("echo hello")
+print(result.stdout)     # "hello"
+print(result.exit_code)  # 0
 
-# Fire-and-forget command
-sandbox.commands.send("sleep 100")
+# Interactive PTY
+terminal = sandbox.pty.create(
+    on_data=lambda data: print(data.decode(), end=''),
+)
+terminal.send_input("ls -la\n")
+terminal.kill()
 
-# File operations
-content = sandbox.files.read("/etc/hosts")
-sandbox.files.write("/tmp/hello.txt", "world")
-entries = sandbox.files.list("/tmp")
+# Properties
+sandbox.id            # str
+sandbox.state         # str
+sandbox.is_running()  # bool
 
-# Interactive PTY session
-pty = sandbox.pty.create(cols=120, rows=40)
-pty.send_input("ls -la\n")
-pty.on_data(lambda data: print(data.decode()))
-pty.resize(cols=200, rows=50)
-pty.kill()
+# List & connect to existing sandboxes
+sandboxes = Sandbox.list()
+sandbox = Sandbox.connect(vm_id)
 
-# List and connect
-sandboxes = manager.list()
-sandbox = manager.get(sandbox_id)
-
-# Cleanup
+# Clean up
 sandbox.kill()
+```
+
+> **Note:** The daemon must be running (`flint start`) before using the SDK.
+
+## 💻 TUI
+
+The TUI connects to the daemon and gives you an interactive terminal into each VM.
+
+| Key | Action |
+|-----|--------|
+| `s` | Start a new VM |
+| `Backspace` / `Delete` | Kill selected VM |
+| `Tab` | Toggle focus between sidebar and terminal |
+| `b` | Run benchmark |
+
+> **Tip:** The sidebar auto-refreshes. You can also manage VMs from the CLI while the TUI is running.
+
+### CLI
+
+```bash
+uv run flint list              # List running VMs
+uv run flint stop <vm_id>      # Kill a VM by ID
+```
+
+## 📡 API
+
+The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check + golden snapshot status |
+| `POST` | `/vms` | Create a new VM |
+| `GET` | `/vms` | List all VMs |
+| `GET` | `/vms/{vm_id}` | Get VM details |
+| `DELETE` | `/vms/{vm_id}` | Kill a VM |
+| `WS` | `/vms/{vm_id}/terminal` | Interactive terminal (binary frames) |
+
+```bash
+# Create a VM
+curl -X POST localhost:9100/vms
+
+# List VMs
+curl localhost:9100/vms
+
+# Kill a VM
+curl -X DELETE localhost:9100/vms/<vm_id>
+```
+
+## ⚡ Benchmarks
+
+Flint includes a built-in benchmark mode that boots N VMs sequentially, measures time-to-interactive for each, and breaks down per-step timings.
+
+<!-- TODO: replace with actual screenshot -->
+<p align="center">
+  <img src="assets/benchmark-screenshot.png" alt="Flint benchmark — booting 16 VMs with per-step timing breakdown" width="800">
+</p>
+
+Press `b` in the TUI to run a benchmark. Results include:
+
+- **Per-VM TTI** (time-to-interactive) with min/avg/median/p95/p99/max
+- **Per-step breakdown**: rootfs copy, netns setup, Firecracker popen, API ready wait, snapshot load, drive patch, VM resume, TCP connect, first command
+- **Throughput**: VMs/second
+
+## 🏗️ Architecture
+
+Flint is split into two processes with a strict separation:
+
+```
+┌─────────────┐
+│  flint app  │  TUI with terminal emulation
+│  (TUI)      │
+└──────┬──────┘
+       │
+       │         Sandbox SDK
+       ▼         (HTTP + WebSocket)
+┌──────────────┐                    ┌─────────────────┐
+│   Sandbox    │ ◄────────────────► │  flint start    │
+│ (Python SDK) │  localhost:9100    │  (daemon)       │
+└──────────────┘                    │                 │
+       ▲                            │  FastAPI        │
+       │                            │  SandboxManager │
+┌──────┴──────┐                     │  Rootfs pool    │
+│  flint list │  CLI commands       └─────────────────┘
+│  flint stop │
+└─────────────┘
+```
+
+- **Daemon** (`flint start`): Manages VM lifecycle — golden snapshot creation, rootfs pool, Firecracker process management, TCP connections. Exposes REST + WebSocket API.
+- **SDK** (`Sandbox`): E2B-style Python SDK for programmatic VM management. Used by both the TUI and CLI internally — also available for your own applications.
+- **TUI** (`flint app`): Interactive terminal UI built on the SDK. Handles terminal emulation (pyte) client-side.
+- **CLI** (`flint list`, `flint stop`): Stateless commands built on the SDK.
+
+### Key Design Decisions
+
+- **Golden snapshot**: A single pre-booted VM snapshot that all new VMs are cloned from, enabling millisecond boot times
+- **Rootfs pool**: Pre-copied rootfs images ready to go, eliminating copy latency at VM creation time
+- **WebSocket terminal**: Raw binary frames over WebSocket for terminal I/O — no base64, no polling
+- **Atomic state file**: Daemon writes `/tmp/flint/state.json` after every state change for crash diagnostics
+
+## 📁 Project Structure
+
+```
+src/flint/
+├── cli.py              # Click CLI commands
+├── daemon/
+│   └── server.py       # FastAPI daemon + lifecycle
+├── sandbox.py          # Public Sandbox SDK
+├── _client/
+│   └── client.py       # Internal HTTP + WebSocket client
+├── core/
+│   ├── manager.py      # VM lifecycle (create/kill)
+│   ├── types.py        # _SandboxEntry dataclass
+│   ├── config.py       # Constants and paths
+│   ├── _boot.py        # Firecracker boot sequence
+│   ├── _snapshot.py    # Golden snapshot creation
+│   ├── _pool.py        # Rootfs pool management
+│   └── _tcp.py         # TCP output reader
+└── tui/
+    ├── app.py           # Textual app
+    ├── screens/         # Home + Benchmark screens
+    └── widgets/         # Sidebar, Terminal, etc.
 ```

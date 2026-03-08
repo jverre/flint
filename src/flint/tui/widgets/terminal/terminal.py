@@ -7,7 +7,7 @@ from textual.message import Message
 from textual.widgets import Input, RichLog, Static
 from ..prompt_row import PromptRow
 from ..throbber import Throbber
-from flint.core.manager import SandboxManager
+from flint.sandbox import Sandbox
 from flint.core.config import TERM_COLS, TERM_ROWS
 from flint.tui.terminal_emulator import TerminalEmulator
 
@@ -85,11 +85,17 @@ class Terminal(Vertical):
     _busy: bool = False
     _current_prompt: str = "~ # "
     _emulator: TerminalEmulator | None = None
-    _pty = None  # PtySession
+    _vm_data: dict | None = None  # cached VM info from API
+    _emulators: dict[str, TerminalEmulator]  # persistent per-VM emulators
+    _sandbox: Sandbox | None = None
+    _pty_sessions: dict  # vm_id -> PtySession
 
-    @property
-    def manager(self) -> SandboxManager:
-        return self.app.manager
+    def _get_sandbox(self, vm_id: str) -> Sandbox:
+        """Get or create a Sandbox for the given vm_id."""
+        sandboxes = self.app.sandboxes
+        if vm_id not in sandboxes:
+            sandboxes[vm_id] = Sandbox.connect(vm_id)
+        return sandboxes[vm_id]
 
     def compose(self) -> ComposeResult:
         yield Throbber(id="activity-bar")
@@ -99,6 +105,8 @@ class Terminal(Vertical):
             yield PromptRow(id="prompt-row")
 
     def on_mount(self) -> None:
+        self._emulators = {}
+        self._pty_sessions = {}
         self.query_one(PromptRow).display = False
         self.set_interval(0.2, self._refresh)
         self._update_status()
@@ -108,13 +116,15 @@ class Terminal(Vertical):
             self.query_one("#vm-input", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if not self._current_vm_id or not self._pty:
+        if not self._current_vm_id:
             return
         command = event.value
         event.input.value = ""
         self.query_one("#vm-log", RichLog).write(f"{self._current_prompt}{command}")
         self._scroll_to_bottom()
-        self._pty.send_input(f"{command}\n")
+        pty_session = self._pty_sessions.get(self._current_vm_id)
+        if pty_session:
+            pty_session.send_input(f"{command}\n")
         self._set_busy()
 
     def _set_busy(self) -> None:
@@ -133,20 +143,15 @@ class Terminal(Vertical):
             self._current_prompt = prefix if prefix.endswith(" ") else prefix + " "
         prompt = self.query_one(PromptRow)
         prompt.set_prompt(self._current_prompt)
-        if not prompt.display:
-            prompt.display = True
-            self.post_message(
-                self.PromptReady(self.query_one("#vm-input", Input))
-            )
+        prompt.display = True
+        inp = self.query_one("#vm-input", Input)
+        inp.focus()
+        self.post_message(self.PromptReady(inp))
 
     def _scroll_to_bottom(self) -> None:
         self.query_one("#log-scroll", VerticalScroll).scroll_end(animate=False)
 
     def show_vm(self, vm_id: str) -> None:
-        if self._pty:
-            self._pty.kill()
-            self._pty = None
-
         self._current_vm_id = vm_id
         self._lines_written = 0
         self._last_screen_version = 0
@@ -154,49 +159,80 @@ class Terminal(Vertical):
         self._current_prompt = "~ # "
         self.query_one(PromptRow).display = False
 
-        # Get sandbox and create PTY session
-        sandbox = self.manager.get(vm_id)
-        if not sandbox:
+        # Get sandbox and VM info
+        sandbox = self._get_sandbox(vm_id)
+        self._sandbox = sandbox
+        vm_data = sandbox._fetch()
+        if not vm_data:
             return
-        self._emulator = TerminalEmulator(cols=TERM_COLS, rows=TERM_ROWS)
-        self._pty = sandbox.pty.create(cols=TERM_COLS, rows=TERM_ROWS)
-        self._pty.on_data(self._emulator.feed)
+        self._vm_data = vm_data
 
-        self._render_full()
-        if sandbox.tcp_connected and self._emulator:
+        # Reuse existing emulator + PTY session, or create new ones
+        if vm_id in self._emulators:
+            self._emulator = self._emulators[vm_id]
+        else:
+            self._emulator = TerminalEmulator(cols=TERM_COLS, rows=TERM_ROWS)
+            self._emulators[vm_id] = self._emulator
+            pty_session = sandbox.pty.create(on_data=self._emulator.feed)
+            self._pty_sessions[vm_id] = pty_session
+            # New session — nudge the shell to emit a prompt
+            pty_session.send_input("\n")
+
+        self._render_full(vm_data)
+        if vm_data.get("tcp_connected") and self._emulator:
             cursor_line = self._get_cursor_line()
             if PROMPT_PATTERN.search(cursor_line):
                 self._set_idle(cursor_line)
         self._update_status()
 
+    def evict_vm(self, vm_id: str) -> None:
+        """Clean up emulator and PTY session for a specific VM."""
+        pty_session = self._pty_sessions.pop(vm_id, None)
+        if pty_session:
+            pty_session.kill()
+        self._emulators.pop(vm_id, None)
+        if self._current_vm_id == vm_id:
+            self._emulator = None
+            self._sandbox = None
+            self._current_vm_id = None
+            self._vm_data = None
+            self._lines_written = 0
+            self._last_screen_version = 0
+            self._busy = False
+            self._current_prompt = "~ # "
+            self.query_one("#vm-log", RichLog).clear()
+            self.query_one(PromptRow).display = False
+            self._update_status()
+
     def clear(self) -> None:
-        if self._pty:
-            self._pty.kill()
-            self._pty = None
+        if self._current_vm_id:
+            self.evict_vm(self._current_vm_id)
         self._emulator = None
+        self._sandbox = None
         self._current_vm_id = None
-        self._lines_written = 0
-        self._last_screen_version = 0
-        self._busy = False
-        self._current_prompt = "~ # "
+        self._vm_data = None
         self.query_one("#vm-log", RichLog).clear()
         self.query_one(PromptRow).display = False
         self._update_status()
 
-    def _render_log_and_screen(self, sandbox, log_widget: "RichLog") -> None:
+    def _render_log_and_screen(self, vm_data: dict, log_widget: "RichLog") -> None:
         log_widget.clear()
-        for line in list(sandbox.log_lines):
+        for line in vm_data.get("log_lines", []):
             log_widget.write(line)
-        self._lines_written = sandbox.line_count
-        if sandbox.tcp_connected and self._emulator:
+        self._lines_written = vm_data.get("line_count", 0)
+        if vm_data.get("tcp_connected") and self._emulator:
             self._render_screen(log_widget)
             self._last_screen_version = self._emulator.version
 
-    def _render_full(self) -> None:
-        sandbox = self.manager.get(self._current_vm_id)
-        if not sandbox:
-            return
-        self._render_log_and_screen(sandbox, self.query_one("#vm-log", RichLog))
+    def _render_full(self, vm_data: dict | None = None) -> None:
+        if vm_data is None:
+            if not self._sandbox:
+                return
+            vm_data = self._sandbox._fetch()
+            if not vm_data:
+                return
+            self._vm_data = vm_data
+        self._render_log_and_screen(vm_data, self.query_one("#vm-log", RichLog))
         self._scroll_to_bottom()
 
     def _render_screen(self, log_widget: "RichLog") -> None:
@@ -220,20 +256,22 @@ class Terminal(Vertical):
     def _refresh(self) -> None:
         if self._current_vm_id is None:
             return
-        sandbox = self.manager.get(self._current_vm_id)
-        if not sandbox:
+        sandbox = self._get_sandbox(self._current_vm_id)
+        vm_data = sandbox._fetch()
+        if not vm_data:
             return
+        self._vm_data = vm_data
 
-        boot_changed = sandbox.line_count != self._lines_written
+        boot_changed = vm_data.get("line_count", 0) != self._lines_written
         screen_changed = self._emulator and self._emulator.version != self._last_screen_version
 
         if not boot_changed and not screen_changed:
             self._update_status()
             return
 
-        self._render_log_and_screen(sandbox, self.query_one("#vm-log", RichLog))
+        self._render_log_and_screen(vm_data, self.query_one("#vm-log", RichLog))
 
-        if sandbox.tcp_connected and self._emulator:
+        if vm_data.get("tcp_connected") and self._emulator:
             cursor_line = self._get_cursor_line()
             if PROMPT_PATTERN.search(cursor_line):
                 self._set_idle(cursor_line)
@@ -245,26 +283,31 @@ class Terminal(Vertical):
         self._update_status()
 
     def _update_status(self) -> None:
-        sandbox = self.manager.get(self._current_vm_id) if self._current_vm_id else None
-        if not sandbox:
+        vm_data = self._vm_data if self._current_vm_id else None
+        if not vm_data:
             self.query_one("#status-bar", Static).update("")
             return
 
-        boot_str = f"{sandbox.boot_time_ms:.0f}ms" if sandbox.boot_time_ms is not None else "-"
-        ready_str = f"{sandbox.ready_time_ms:.0f}ms" if sandbox.ready_time_ms is not None else "-"
+        boot_ms = vm_data.get("boot_time_ms")
+        ready_ms = vm_data.get("ready_time_ms")
+        boot_str = f"{boot_ms:.0f}ms" if boot_ms is not None else "-"
+        ready_str = f"{ready_ms:.0f}ms" if ready_ms is not None else "-"
 
-        if sandbox.state == "Started" and sandbox.tcp_connected:
+        state = vm_data.get("state", "")
+        tcp_connected = vm_data.get("tcp_connected", False)
+
+        if state == "Started" and tcp_connected:
             icon = "[bold green]\u25cf[/]"
             status_text = "Connected"
-        elif sandbox.state == "Error":
+        elif state == "Error":
             icon = "[bold red]\u25cf[/]"
             status_text = "Error"
-        elif sandbox.state == "Starting":
+        elif state == "Starting":
             icon = "[bold yellow]\u25cb[/]"
             status_text = "Booting"
         else:
             icon = "[dim]\u25cb[/]"
-            status_text = sandbox.state
+            status_text = state
 
         short_id = self._current_vm_id[:8]
         status = (

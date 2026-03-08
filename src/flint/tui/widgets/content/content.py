@@ -19,5 +19,8 @@ class ContentArea(Vertical):
     def show_vm_logs(self, vm_id: str) -> None:
         self.query_one(Terminal).show_vm(vm_id)
 
+    def evict_vm(self, vm_id: str) -> None:
+        self.query_one(Terminal).evict_vm(vm_id)
+
     def clear_terminal(self) -> None:
         self.query_one(Terminal).clear()

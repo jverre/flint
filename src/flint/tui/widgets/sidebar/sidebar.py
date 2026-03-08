@@ -5,7 +5,7 @@ from textual.events import Click
 from textual.reactive import reactive
 from textual.widgets import Static, ListView, ListItem, Label
 
-from flint.core.manager import SandboxManager
+from flint.sandbox import Sandbox
 
 
 class Sidebar(Container):
@@ -51,11 +51,6 @@ class Sidebar(Container):
     """
 
     vm_count = reactive(0)
-    _last_snapshot: list[tuple[str, str]] = []
-
-    @property
-    def manager(self) -> SandboxManager:
-        return self.app.manager
 
     def compose(self) -> ComposeResult:
         yield Static("Virtual Machines", classes="sidebar-title")
@@ -66,6 +61,7 @@ class Sidebar(Container):
         self.query_one("#vm-list", ListView).focus()
 
     def on_mount(self) -> None:
+        self._last_snapshot: list[tuple[str, str]] = []
         self.set_interval(0.5, self._refresh_list)
 
     def watch_vm_count(self) -> None:
@@ -82,8 +78,11 @@ class Sidebar(Container):
         return f" {short_id}   {badge}"
 
     def _refresh_list(self) -> None:
-        infos = self.manager.list()
-        snapshot = [(info.id, info.state) for info in infos]
+        try:
+            sandboxes = Sandbox.list()
+        except Exception:
+            return
+        snapshot = [(sb.id, sb.state) for sb in sandboxes]
         if snapshot == self._last_snapshot:
             return
         self._last_snapshot = snapshot

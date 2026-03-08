@@ -62,3 +62,18 @@ class _SandboxEntry:
             cbs = list(self._output_callbacks)
         for cb in cbs:
             cb(data)
+
+    def to_dict(self) -> dict:
+        """Return JSON-serializable representation (excludes process, socket, lock, callbacks)."""
+        return {
+            "vm_id": self.vm_id,
+            "pid": self.pid,
+            "state": self.state,
+            "tcp_connected": self.tcp_connected,
+            "created_at": self.created_at,
+            "boot_time_ms": self.boot_time_ms,
+            "ready_time_ms": self.ready_time_ms,
+            "timings": dict(self.timings),
+            "log_lines": list(self.log_lines),
+            "line_count": self.line_count,
+        }
