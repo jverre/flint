@@ -21,10 +21,6 @@ Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snap
 https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 </p>
 
-
-https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
-
-
 ## 🚀 Quick Start
 
 ### Prerequisites
