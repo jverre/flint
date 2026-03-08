@@ -18,8 +18,12 @@
 Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a terminal UI for interactive VM management.
 
 <p align="center">
-  <video src="assets/demo.mp4" width="800" autoplay loop muted></video>
+https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 </p>
+
+
+https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
+
 
 ## 🚀 Quick Start
 
