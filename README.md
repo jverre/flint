@@ -9,16 +9,16 @@
   <a href="#-tui">TUI</a> •
   <a href="#-api">API</a> •
   <a href="#-benchmarks">Benchmarks</a> •
-  <a href="#-architecture">Architecture</a>
+  <a href="#-architecture">Architecture</a> •
+  <a href="#-host-setup">Host Setup</a>
 </p>
 
 ---
 
 Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a terminal UI for interactive VM management.
 
-<!-- TODO: replace with actual screenshot -->
 <p align="center">
-  <img src="assets/tui-screenshot.png" alt="Flint TUI — managing multiple sandboxes with interactive terminals" width="800">
+  <video src="assets/demo.mp4" width="800" autoplay loop muted></video>
 </p>
 
 ## 🚀 Quick Start
@@ -204,3 +204,64 @@ src/flint/
     ├── screens/         # Home + Benchmark screens
     └── widgets/         # Sidebar, Terminal, etc.
 ```
+
+## 🔧 Host Setup
+
+Flint expects a Linux host with Firecracker, a kernel, and a rootfs image. Follow these steps to set everything up.
+
+### 1. Install Firecracker
+
+Download the latest release from GitHub:
+
+```bash
+ARCH="$(uname -m)"
+release_url="https://github.com/firecracker-microvm/firecracker/releases"
+latest=$(basename $(curl -fsSLI -o /dev/null -w %{url_effective} ${release_url}/latest))
+curl -L ${release_url}/download/${latest}/firecracker-${latest}-${ARCH}.tgz | tar -xz
+
+sudo mv release-${latest}-${ARCH}/firecracker-${latest}-${ARCH} /usr/local/bin/firecracker
+rm -rf release-${latest}-${ARCH}
+
+firecracker --version
+```
+
+### 2. Get a Linux kernel
+
+Firecracker needs an uncompressed `vmlinux` kernel. You can grab one from the Firecracker CI builds:
+
+```bash
+sudo mkdir -p /root/firecracker-vm
+KERNEL_VERSION="6.1"
+ARCH="$(uname -m)"
+curl -fsSL -o /root/firecracker-vm/vmlinux \
+  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v${KERNEL_VERSION}/${ARCH}/vmlinux-5.10.217"
+```
+
+> **Note:** Check the [Firecracker docs](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) for the latest recommended kernel version.
+
+### 3. Build the rootfs image
+
+Flint uses an Alpine-based rootfs with `socat` for the in-guest TCP shell server. The `setup-rootfs.sh` script builds it:
+
+```bash
+# Download Alpine minirootfs
+curl -fsSL -o /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz \
+  "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz"
+
+# Build the rootfs (requires root)
+sudo ./setup-rootfs.sh
+```
+
+This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4` containing Alpine with `socat` and a network init script that starts the TCP shell on port 5000.
+
+### 4. Verify
+
+You should have two files:
+
+```
+/root/firecracker-vm/
+├── vmlinux        # Uncompressed Linux kernel
+└── rootfs.ext4    # Alpine rootfs with socat + init script
+```
+
+Once these are in place, `flint start` will create the golden snapshot automatically on first run.
