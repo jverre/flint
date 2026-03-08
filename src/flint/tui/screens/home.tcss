@@ -1,0 +1,7 @@
+HomeScreen {
+    layout: horizontal;
+}
+
+ContentArea {
+    margin-bottom: 1;
+}

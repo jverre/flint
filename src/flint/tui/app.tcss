@@ -1,0 +1,5 @@
+Screen {
+    background: $background;
+    color: $text;
+    scrollbar-size: 1 1;
+}

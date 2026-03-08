@@ -1,0 +1,53 @@
+Terminal {
+    height: 1fr;
+    border: round $primary 30%;
+}
+
+Terminal:focus-within {
+    border: round $primary;
+}
+
+Terminal.-state-busy {
+    border: round $warning 50%;
+}
+
+Terminal.-state-idle {
+    border: round $success 30%;
+}
+
+#status-bar {
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+    text-style: dim;
+}
+
+#log-scroll {
+    height: 1fr;
+    overflow-x: hidden;
+}
+
+#vm-log {
+    height: auto;
+    overflow: hidden hidden;
+    padding: 0 1;
+}
+
+#prompt-row {
+    height: 1;
+}
+
+.prompt-label {
+    width: auto;
+    height: 1;
+    color: $primary;
+    text-style: bold;
+}
+
+#vm-input {
+    border: none;
+    margin: 0;
+    padding: 0;
+    height: 1;
+}

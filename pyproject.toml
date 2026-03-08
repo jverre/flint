@@ -1,0 +1,28 @@
+[project]
+name = "flint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Jacques Verre", email = "jverre@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.3.1",
+    "textual>=8.0.1",
+    "pyte>=0.8",
+    "pyroute2>=0.9.1",
+]
+
+[project.scripts]
+flint = "flint.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flint"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = []
