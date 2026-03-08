@@ -129,8 +129,8 @@ class BenchmarkGrid(Widget):
         self.auto_refresh = 1 / 15
 
     def initialize(self, count: int) -> None:
-        self._rows = min(MAX_ROWS, count)
-        self._cols = math.ceil(count / self._rows)
+        self._cols = math.ceil(math.sqrt(count))
+        self._rows = min(MAX_ROWS, math.ceil(count / self._cols))
         self._cell_states = [None] * count
         self._cell_times = [None] * count
         self._completion_times = [None] * count
