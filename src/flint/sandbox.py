@@ -11,7 +11,7 @@ from flint._client.client import DaemonClient, _TerminalConnection
 from flint.core.config import DAEMON_URL, TERM_COLS, TERM_ROWS
 
 _client: DaemonClient | None = None
-_SENTINEL = re.compile(r"__FLINT_DONE__:(\d+)\r?\n?$")
+_SENTINEL = re.compile(r"__FLINT_DONE__:(\d+)")
 
 
 def _get_client() -> DaemonClient:
@@ -102,7 +102,7 @@ class Commands:
         ws_url = f"{ws_base}/vms/{self._vm_id}/terminal"
         conn = _TerminalConnection(ws_url, _on_output)
         try:
-            sentinel_cmd = f'{cmd} ; echo "__FLINT_DONE__:$?"\n'
+            sentinel_cmd = f'({cmd}); echo "__FLINT_DONE__:$?"\n'
             conn.send(sentinel_cmd.encode())
             if not done.wait(timeout=timeout):
                 raise TimeoutError(f"Command timed out after {timeout}s: {cmd}")
@@ -185,10 +185,25 @@ class Sandbox:
         return self._pty
 
     def is_running(self) -> bool:
-        return self.state in ("Starting", "Started")
+        return self.state in ("Starting", "Started", "Running")
 
     def kill(self) -> None:
-        _get_client().kill(self._id)
+        try:
+            _get_client().kill(self._id)
+        except Exception:
+            pass  # VM may already be deleted
+
+    def pause(self) -> None:
+        """Pause the sandbox, preserving state to disk."""
+        _get_client().pause(self._id)
+
+    def resume(self) -> None:
+        """Resume a paused sandbox."""
+        _get_client().resume(self._id)
+
+    def set_timeout(self, timeout_seconds: float, policy: str = "kill") -> None:
+        """Set auto-cleanup timeout for this sandbox."""
+        _get_client().set_timeout(self._id, timeout_seconds, policy)
 
     def _fetch(self) -> dict | None:
         return _get_client().get(self._id)

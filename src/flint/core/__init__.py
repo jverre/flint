@@ -1,4 +1,4 @@
 from .manager import SandboxManager
-from .types import CommandResult
+from .types import CommandResult, SandboxState
 
-__all__ = ["SandboxManager", "CommandResult"]
+__all__ = ["SandboxManager", "CommandResult", "SandboxState"]

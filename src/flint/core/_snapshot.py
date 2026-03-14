@@ -6,7 +6,7 @@ import time
 
 from .config import (
     log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
-    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, TCP_PORT,
+    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, TCP_PORT, DATA_DIR,
 )
 from ._netns import _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _enter_netns, _restore_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok
@@ -38,7 +38,7 @@ def create_golden_snapshot(
     """
     log.info("Creating golden snapshot (dir=%s)...", snapshot_dir)
     vm_id = "golden-snapshot"
-    vm_dir = f"/microvms/{vm_id}"
+    vm_dir = f"{DATA_DIR}/{vm_id}"
     socket_path = f"{vm_dir}/firecracker.sock"
     rootfs_path = f"{vm_dir}/rootfs.ext4"
 

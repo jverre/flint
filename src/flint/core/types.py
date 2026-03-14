@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import subprocess
 import socket
 import threading
@@ -7,6 +8,27 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
+
+
+class SandboxState(enum.Enum):
+    STARTING = "Starting"
+    RUNNING = "Running"
+    PAUSED = "Paused"
+    ERROR = "Error"
+    DEAD = "Dead"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+# Backward-compat mapping: API still returns old string names
+_STATE_API_NAMES: dict[SandboxState, str] = {
+    SandboxState.STARTING: "Starting",
+    SandboxState.RUNNING: "Started",
+    SandboxState.PAUSED: "Paused",
+    SandboxState.ERROR: "Error",
+    SandboxState.DEAD: "Dead",
+}
 
 
 @dataclass
@@ -27,7 +49,7 @@ class _SandboxEntry:
     guest_ip: str
     tcp_socket: socket.socket | None
     tcp_connected: bool
-    state: str
+    state: SandboxState
     template_id: str = "default"
     screen_version: int = 0
     t_instance_start: float = 0.0
@@ -69,7 +91,7 @@ class _SandboxEntry:
         return {
             "vm_id": self.vm_id,
             "pid": self.pid,
-            "state": self.state,
+            "state": _STATE_API_NAMES.get(self.state, str(self.state)),
             "template_id": self.template_id,
             "tcp_connected": self.tcp_connected,
             "created_at": self.created_at,

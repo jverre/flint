@@ -14,6 +14,7 @@ import uvicorn
 from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
     GOLDEN_DIR, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
+    DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, DEFAULT_SANDBOX_TIMEOUT, ERROR_CLEANUP_DELAY,
 )
 from flint.core.manager import SandboxManager
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
@@ -26,20 +27,34 @@ from flint.core._template_registry import (
 from flint.core._template_build import build_template as _build_template
 
 app = FastAPI()
-manager: SandboxManager | None = None
-_golden_ready = False
 
 
-def _write_state() -> None:
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _get_daemon() -> FlintDaemon:
+    daemon = getattr(app.state, "daemon", None)
+    if daemon is None:
+        raise HTTPException(status_code=503, detail="Daemon not initialized")
+    return daemon
+
+
+def _require_manager() -> SandboxManager:
+    daemon = _get_daemon()
+    if daemon.manager is None:
+        raise HTTPException(status_code=503, detail="Manager not initialized")
+    return daemon.manager
+
+
+def _write_state(daemon: FlintDaemon) -> None:
     """Atomically write daemon state to JSON file."""
     state = {
         "pid": os.getpid(),
-        "started_at": _started_at,
-        "golden_snapshot_ready": _golden_ready,
+        "started_at": daemon.started_at,
+        "golden_snapshot_ready": daemon.golden_ready,
         "vms": {},
     }
-    if manager:
-        for d in manager.list_dicts():
+    if daemon.manager:
+        for d in daemon.manager.list_dicts():
             state["vms"][d["vm_id"]] = d
     tmp_path = DAEMON_STATE_PATH + ".tmp"
     with open(tmp_path, "w") as f:
@@ -47,39 +62,35 @@ def _write_state() -> None:
     os.rename(tmp_path, DAEMON_STATE_PATH)
 
 
-_started_at: float = 0.0
-
-
-def _require_manager() -> SandboxManager:
-    if not manager:
-        raise HTTPException(status_code=503, detail="Manager not initialized")
-    return manager
-
+# ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     print("GET /health")
-    return {"status": "ok", "golden_snapshot_ready": _golden_ready}
+    daemon = _get_daemon()
+    return {"status": "ok", "golden_snapshot_ready": daemon.golden_ready}
 
 
 @app.post("/vms")
 def create_vm(template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
     print(f"POST /vms — creating VM (template={template_id}, internet={allow_internet_access})...")
+    daemon = _get_daemon()
     mgr = _require_manager()
-    if template_id == DEFAULT_TEMPLATE_ID and not _golden_ready:
+    if template_id == DEFAULT_TEMPLATE_ID and not daemon.golden_ready:
         raise HTTPException(status_code=503, detail="Golden snapshot not ready")
     vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
-    _write_state()
+    _write_state(daemon)
     print(f"POST /vms — created {vm_id[:8]}")
     return {"vm": result}
 
 
 @app.get("/vms")
 def list_vms():
-    if not manager:
+    daemon = _get_daemon()
+    if not daemon.manager:
         return {"vms": []}
-    entries = manager.list_dicts()
+    entries = daemon.manager.list_dicts()
     print(f"GET /vms — {len(entries)} VMs")
     return {"vms": entries}
 
@@ -97,23 +108,60 @@ def get_vm(vm_id: str):
 @app.delete("/vms/{vm_id}")
 def delete_vm(vm_id: str):
     print(f"DELETE /vms/{vm_id[:8]}")
+    daemon = _get_daemon()
     mgr = _require_manager()
     if mgr.get_dict(vm_id) is None:
         print(f"DELETE /vms/{vm_id[:8]} — not found")
         raise HTTPException(status_code=404, detail="VM not found")
     mgr.kill(vm_id)
-    _write_state()
+    _write_state(daemon)
     print(f"DELETE /vms/{vm_id[:8]} — killed")
+    return {"ok": True}
+
+
+@app.post("/vms/{vm_id}/pause")
+def pause_vm(vm_id: str):
+    print(f"POST /vms/{vm_id[:8]}/pause")
+    daemon = _get_daemon()
+    mgr = _require_manager()
+    mgr.pause(vm_id)
+    _write_state(daemon)
+    print(f"POST /vms/{vm_id[:8]}/pause — paused")
+    return {"ok": True}
+
+
+@app.post("/vms/{vm_id}/resume")
+def resume_vm(vm_id: str):
+    print(f"POST /vms/{vm_id[:8]}/resume")
+    daemon = _get_daemon()
+    mgr = _require_manager()
+    mgr.resume(vm_id)
+    result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
+    _write_state(daemon)
+    print(f"POST /vms/{vm_id[:8]}/resume — resumed")
+    return {"vm": result}
+
+
+@app.patch("/vms/{vm_id}")
+def patch_vm(vm_id: str, body: dict):
+    mgr = _require_manager()
+    if mgr.get_dict(vm_id) is None:
+        raise HTTPException(status_code=404, detail="VM not found")
+    timeout = body.get("timeout_seconds")
+    policy = body.get("timeout_policy", "kill")
+    if timeout is not None:
+        mgr.set_timeout(vm_id, float(timeout), policy)
     return {"ok": True}
 
 
 @app.websocket("/vms/{vm_id}/terminal")
 async def terminal_ws(websocket: WebSocket, vm_id: str):
     print(f"WS /vms/{vm_id[:8]}/terminal — connecting")
-    if not manager:
+    daemon = _get_daemon()
+    if not daemon.manager:
         await websocket.close(code=1011, reason="Manager not initialized")
         return
-    entry = manager.get_entry(vm_id)
+    entry = daemon.manager.get_entry(vm_id)
     if not entry:
         print(f"WS /vms/{vm_id[:8]}/terminal — VM not found")
         await websocket.close(code=1011, reason="VM not found")
@@ -209,53 +257,120 @@ def delete_template_endpoint(template_id: str):
     return {"ok": True}
 
 
-class FlintDaemon:
-    def run(self) -> None:
-        global manager, _golden_ready, _started_at
+# ── FlintDaemon ──────────────────────────────────────────────────────────
 
-        _started_at = time.time()
+class FlintDaemon:
+    def __init__(self) -> None:
+        self.manager: SandboxManager | None = None
+        self.golden_ready: bool = False
+        self.started_at: float = 0.0
+        self._state_store = None
+        self._health_monitor = None
+        self._lifecycle_manager = None
+
+    def run(self) -> None:
+        self.started_at = time.time()
+        app.state.daemon = self
+
+        self._init_dirs()
+        self._write_pid()
+        self._setup_networking()
+        self._create_golden_snapshot()
+        self._register_templates()
+        self._start_pool()
+        self._init_state_store()
+        self._init_manager()
+        self._recover_sandboxes()
+        self._start_health_monitor()
+        self._start_lifecycle()
+        self._install_signal_handlers()
+        self._serve()
+
+    def _init_dirs(self) -> None:
         os.makedirs(DAEMON_DIR, exist_ok=True)
 
-        # Write PID file
+    def _write_pid(self) -> None:
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(os.getpid()))
 
-        # Ensure bridge is ready for VM networking
+    def _setup_networking(self) -> None:
         _ensure_bridge()
         print("Bridge ready.")
 
-        # Create golden snapshot
+    def _create_golden_snapshot(self) -> None:
         print("Creating golden snapshot...")
         shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
         create_golden_snapshot()
-        _golden_ready = True
+        self.golden_ready = True
         print("Golden snapshot ready.")
 
-        # Register existing golden snapshot as "default" template
+    def _register_templates(self) -> None:
         os.makedirs(TEMPLATES_DIR, exist_ok=True)
         register_template(DEFAULT_TEMPLATE_ID, "Default (Alpine)", GOLDEN_DIR)
         print("Default template registered.")
 
-        # Start rootfs pool
+    def _start_pool(self) -> None:
         start_pool()
         print("Rootfs pool started.")
 
-        # Initialize manager
-        manager = SandboxManager()
-        _write_state()
+    def _init_state_store(self) -> None:
+        from flint.core._state_store import StateStore
+        self._state_store = StateStore(DAEMON_DB_PATH)
+        print("State store initialized.")
 
-        print(f"Daemon ready on {DAEMON_HOST}:{DAEMON_PORT}")
+    def _init_manager(self) -> None:
+        self.manager = SandboxManager(state_store=self._state_store)
+        _write_state(self)
 
+    def _recover_sandboxes(self) -> None:
+        if not self._state_store or not self.manager:
+            return
+        from flint.core._recovery import RecoveryEngine
+        engine = RecoveryEngine(self._state_store, self.manager)
+        report = engine.recover()
+        print(f"Recovery: {report}")
+
+    def _start_health_monitor(self) -> None:
+        from flint.core._health import HealthMonitor
+        self._health_monitor = HealthMonitor(
+            state_store=self._state_store,
+            manager=self.manager,
+            interval=HEALTH_CHECK_INTERVAL,
+        )
+        self._health_monitor.start()
+        print("Health monitor started.")
+
+    def _start_lifecycle(self) -> None:
+        from flint.core._lifecycle import LifecycleManager
+        self._lifecycle_manager = LifecycleManager(
+            state_store=self._state_store,
+            manager=self.manager,
+            interval=1.0,
+            error_cleanup_delay=ERROR_CLEANUP_DELAY,
+        )
+        self._lifecycle_manager.start()
+        print("Lifecycle manager started.")
+
+    def _install_signal_handlers(self) -> None:
         def _shutdown(signum, frame):
-            print("\nShutting down...")
-            if manager:
-                for vm_id in manager.vm_ids():
-                    try:
-                        manager.kill(vm_id)
-                    except Exception:
-                        pass
+            print("\nShutting down (VMs will keep running)...")
+            if self._health_monitor:
+                self._health_monitor.stop()
+            if self._lifecycle_manager:
+                self._lifecycle_manager.stop()
+            # Detach from VMs without killing them — they'll be recovered on restart
+            if self.manager:
+                with self.manager._lock:
+                    for entry in self.manager._sandboxes.values():
+                        if entry.tcp_socket:
+                            try:
+                                entry.tcp_socket.close()
+                            except OSError:
+                                pass
+                    self.manager._sandboxes.clear()
             stop_pool()
-            # Clean up state files
+            if self._state_store:
+                self._state_store.close()
             for path in (DAEMON_STATE_PATH, DAEMON_PID_PATH):
                 try:
                     os.unlink(path)
@@ -266,4 +381,6 @@ class FlintDaemon:
         signal.signal(signal.SIGINT, _shutdown)
         signal.signal(signal.SIGTERM, _shutdown)
 
+    def _serve(self) -> None:
+        print(f"Daemon ready on {DAEMON_HOST}:{DAEMON_PORT}")
         uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning")

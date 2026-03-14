@@ -4,7 +4,7 @@ import subprocess
 import threading
 import uuid
 
-from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID
+from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID, DATA_DIR
 from ._snapshot import golden_snapshot_exists
 
 _pool_lock = threading.Lock()
@@ -86,7 +86,7 @@ def _claim_pool_entry(template_id: str, vm_id: str) -> str | None:
         remaining = sum(1 for e in _pool_entries if e["state"] == "ready" and e["template_id"] == template_id)
     log.debug("pool: claimed %s for %s (%d remaining)", match["id"][:8], vm_id[:8], remaining)
 
-    vm_dir = f"/microvms/{vm_id}"
+    vm_dir = f"{DATA_DIR}/{vm_id}"
     try:
         os.rename(match["dir_path"], vm_dir)
         return vm_dir

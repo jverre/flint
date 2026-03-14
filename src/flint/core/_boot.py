@@ -1,14 +1,54 @@
+from __future__ import annotations
+
 import os
+import signal
 import shutil
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass, field
 
-from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID
+from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID, DATA_DIR
 from ._netns import _ns_name, _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _setup_netns_subprocess
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _tcp_connect
 from ._pool import _claim_pool_entry
 from ._template_registry import get_template_dir
+
+import socket as _socket_mod
+
+
+@dataclass
+class BootResult:
+    vm_id: str
+    vm_dir: str
+    socket_path: str
+    ns_name: str
+    process: subprocess.Popen
+    tcp_socket: _socket_mod.socket
+    timings: dict[str, float] = field(default_factory=dict)
+    t_total: float = 0.0
+
+
+class _RecoveredProcess:
+    """Lightweight process handle for VMs recovered after daemon restart."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def kill(self) -> None:
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def wait(self, timeout: float | None = None) -> None:
+        deadline = time.monotonic() + (timeout or 10)
+        while time.monotonic() < deadline:
+            try:
+                os.kill(self.pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                return
 
 
 def _timed(timings: dict, key: str):
@@ -41,14 +81,14 @@ def _boot_from_snapshot(
     use_pool: bool = True,
     use_pyroute2: bool = True,
     network_overrides: list[dict] | None = None,
-) -> dict:
+) -> BootResult:
     """Boot a VM from a template snapshot. Returns dict with VM info.
 
     On failure, cleans up all resources and raises.
     On success, caller owns the process/netns/dir and must clean up.
     """
     vm_id = str(uuid.uuid4())
-    vm_dir = f"/microvms/{vm_id}"
+    vm_dir = f"{DATA_DIR}/{vm_id}"
     rootfs_path = f"{vm_dir}/rootfs.ext4"
     ns_name = _ns_name(vm_id)
     sid = vm_id[:8]
@@ -117,11 +157,11 @@ def _boot_from_snapshot(
         parts = " | ".join(f"{k}={v:.1f}" for k, v in timings.items())
         log.debug("[%s] boot %.0f ms: %s", sid, total_ms, parts)
 
-        return {
-            "vm_id": vm_id, "vm_dir": vm_dir, "socket_path": socket_path,
-            "ns_name": ns_name, "process": process, "tcp_socket": tcp_sock,
-            "timings": timings, "t_total": t_total,
-        }
+        return BootResult(
+            vm_id=vm_id, vm_dir=vm_dir, socket_path=socket_path,
+            ns_name=ns_name, process=process, tcp_socket=tcp_sock,
+            timings=timings, t_total=t_total,
+        )
 
     except:
         if process:

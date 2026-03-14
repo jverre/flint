@@ -1,9 +1,16 @@
 import logging
+import os
 
 log = logging.getLogger(__name__)
 
-# Debug log to file — tail -f /tmp/flint-debug.log
-_log_handler = logging.FileHandler("/tmp/flint-debug.log")
+# ── Env-var-driven directories ────────────────────────────────────────────
+DAEMON_PORT = int(os.environ.get("FLINT_PORT", "9100"))
+DATA_DIR = os.environ.get("FLINT_DATA_DIR", "/microvms")
+STATE_DIR = os.environ.get("FLINT_STATE_DIR", "/tmp/flint")
+
+# Debug log to file
+os.makedirs(STATE_DIR, exist_ok=True)
+_log_handler = logging.FileHandler(f"{STATE_DIR}/flint-debug.log")
 _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
 log.addHandler(_log_handler)
 log.setLevel(logging.DEBUG)
@@ -27,13 +34,13 @@ VETH_SUBNET = "10.0.0"  # VMs get 10.0.0.{2..254}
 
 GOLDEN_TAP = "tap-golden"
 GOLDEN_NS = "fc-golden"
-GOLDEN_DIR = "/microvms/.golden"
+GOLDEN_DIR = f"{DATA_DIR}/.golden"
 
-POOL_DIR = "/microvms/.pool"
+POOL_DIR = f"{DATA_DIR}/.pool"
 POOL_TARGET_SIZE = 8
 POOL_WORKERS = 4
 
-TEMPLATES_DIR = "/microvms/.templates"
+TEMPLATES_DIR = f"{DATA_DIR}/.templates"
 DEFAULT_TEMPLATE_ID = "default"
 
 TERM_COLS = 120
@@ -41,8 +48,13 @@ TERM_ROWS = 40
 
 # ── Daemon ────────────────────────────────────────────────────────────────
 DAEMON_HOST = "127.0.0.1"
-DAEMON_PORT = 9100
 DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
-DAEMON_DIR = "/tmp/flint"
-DAEMON_STATE_PATH = "/tmp/flint/state.json"
-DAEMON_PID_PATH = "/tmp/flint/flintd.pid"
+DAEMON_DIR = STATE_DIR
+DAEMON_STATE_PATH = f"{STATE_DIR}/state.json"
+DAEMON_PID_PATH = f"{STATE_DIR}/flintd.pid"
+DAEMON_DB_PATH = f"{STATE_DIR}/flint.db"
+
+# ── State management ─────────────────────────────────────────────────────
+HEALTH_CHECK_INTERVAL = 5.0         # seconds between health probes
+DEFAULT_SANDBOX_TIMEOUT = 300       # seconds before auto-cleanup (5 min)
+ERROR_CLEANUP_DELAY = 60            # seconds to keep error-state sandboxes before cleanup

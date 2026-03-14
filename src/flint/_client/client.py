@@ -100,6 +100,25 @@ class DaemonClient:
         if conn:
             conn.close()
 
+    # ── Sandbox lifecycle ────────────────────────────────────────────────
+
+    def pause(self, vm_id: str) -> None:
+        self.disconnect_terminal(vm_id)
+        resp = self._http.post(f"/vms/{vm_id}/pause")
+        resp.raise_for_status()
+
+    def resume(self, vm_id: str) -> dict:
+        resp = self._http.post(f"/vms/{vm_id}/resume")
+        resp.raise_for_status()
+        return resp.json()["vm"]
+
+    def set_timeout(self, vm_id: str, timeout_seconds: float, policy: str = "kill") -> None:
+        resp = self._http.patch(
+            f"/vms/{vm_id}",
+            json={"timeout_seconds": timeout_seconds, "timeout_policy": policy},
+        )
+        resp.raise_for_status()
+
     # ── Template methods ───────────────────────────────────────────────────
 
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:

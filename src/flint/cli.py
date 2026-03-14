@@ -1,3 +1,4 @@
+import os
 import time
 
 import click
@@ -10,8 +11,17 @@ def cli():
 
 
 @cli.command()
-def start():
+@click.option("--port", default=None, type=int, help="Daemon port (default: 9100)")
+@click.option("--data-dir", default=None, type=str, help="Data directory for VMs (default: /microvms)")
+@click.option("--state-dir", default=None, type=str, help="State directory for daemon files (default: /tmp/flint)")
+def start(port, data_dir, state_dir):
     """Start the Flint manager daemon."""
+    if port is not None:
+        os.environ["FLINT_PORT"] = str(port)
+    if data_dir is not None:
+        os.environ["FLINT_DATA_DIR"] = data_dir
+    if state_dir is not None:
+        os.environ["FLINT_STATE_DIR"] = state_dir
     from flint.daemon.server import FlintDaemon
     FlintDaemon().run()
 

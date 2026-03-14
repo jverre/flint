@@ -75,6 +75,14 @@ sandbox.id            # str
 sandbox.state         # str
 sandbox.is_running()  # bool
 
+# Pause & resume (state is preserved to disk)
+sandbox.pause()
+sandbox.resume()
+
+# Auto-cleanup timeout (seconds)
+sandbox.set_timeout(300)              # kill after 5 min
+sandbox.set_timeout(300, policy="pause")  # pause instead of kill
+
 # List & connect to existing sandboxes
 sandboxes = Sandbox.list()
 sandbox = Sandbox.connect(vm_id)
@@ -116,6 +124,9 @@ The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`:
 | `GET` | `/vms` | List all VMs |
 | `GET` | `/vms/{vm_id}` | Get VM details |
 | `DELETE` | `/vms/{vm_id}` | Kill a VM |
+| `POST` | `/vms/{vm_id}/pause` | Pause a VM (snapshot to disk) |
+| `POST` | `/vms/{vm_id}/resume` | Resume a paused VM |
+| `PATCH` | `/vms/{vm_id}` | Set timeout / timeout policy |
 | `WS` | `/vms/{vm_id}/terminal` | Interactive terminal (binary frames) |
 
 ```bash
@@ -124,6 +135,14 @@ curl -X POST localhost:9100/vms
 
 # List VMs
 curl localhost:9100/vms
+
+# Pause / resume
+curl -X POST localhost:9100/vms/<vm_id>/pause
+curl -X POST localhost:9100/vms/<vm_id>/resume
+
+# Set auto-timeout (seconds)
+curl -X PATCH localhost:9100/vms/<vm_id> -H 'Content-Type: application/json' \
+  -d '{"timeout_seconds": 300, "timeout_policy": "kill"}'
 
 # Kill a VM
 curl -X DELETE localhost:9100/vms/<vm_id>
@@ -178,7 +197,10 @@ Flint is split into two processes with a strict separation:
 - **Golden snapshot**: A single pre-booted VM snapshot that all new VMs are cloned from, enabling millisecond boot times
 - **Rootfs pool**: Pre-copied rootfs images ready to go, eliminating copy latency at VM creation time
 - **WebSocket terminal**: Raw binary frames over WebSocket for terminal I/O — no base64, no polling
-- **Atomic state file**: Daemon writes `/tmp/flint/state.json` after every state change for crash diagnostics
+- **SQLite state store**: All sandbox state is durably persisted to SQLite (WAL mode) so VMs survive daemon restarts. The daemon detaches from VMs on shutdown and reclaims them on startup.
+- **Crash recovery**: On startup the daemon probes for orphaned Firecracker processes from a previous run, reconnects to healthy ones, and cleans up dead ones
+- **Health monitoring**: Background thread checks process liveness every 5s and transitions dead VMs to error state
+- **Pause/resume**: VMs can be paused to disk (Firecracker snapshot) and resumed later, preserving full guest state
 
 ## 📁 Project Structure
 
@@ -193,13 +215,18 @@ src/flint/
 ├── _client/
 │   └── client.py       # Internal HTTP + WebSocket client
 ├── core/
-│   ├── manager.py      # VM lifecycle (create/kill)
-│   ├── types.py        # _SandboxEntry dataclass
+│   ├── manager.py      # VM lifecycle (create/kill/pause/resume)
+│   ├── types.py        # SandboxState enum, _SandboxEntry dataclass
 │   ├── config.py       # Constants and paths
-│   ├── _boot.py        # Firecracker boot sequence
+│   ├── _boot.py        # Firecracker boot sequence + BootResult
 │   ├── _snapshot.py    # Golden snapshot creation
 │   ├── _pool.py        # Rootfs pool management
-│   └── _tcp.py         # TCP output reader
+│   ├── _tcp.py         # TCP output reader
+│   ├── _state_store.py # SQLite WAL state persistence
+│   ├── _state_machine.py # State transition validator
+│   ├── _recovery.py    # Crash recovery engine
+│   ├── _health.py      # Background health monitor
+│   └── _lifecycle.py   # Timeout enforcement + error cleanup
 └── tui/
     ├── app.py           # Textual app
     ├── screens/         # Home + Benchmark screens
