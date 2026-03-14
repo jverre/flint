@@ -20,6 +20,11 @@ TCP_PORT = 5000
 GUEST_IP = "172.16.0.2"
 HOST_IP = "172.16.0.1"
 
+BRIDGE_NAME = "br-flint"
+BRIDGE_IP = "10.0.0.1"
+BRIDGE_CIDR = 24
+VETH_SUBNET = "10.0.0"  # VMs get 10.0.0.{2..254}
+
 GOLDEN_TAP = "tap-golden"
 GOLDEN_NS = "fc-golden"
 GOLDEN_DIR = "/microvms/.golden"
@@ -27,6 +32,9 @@ GOLDEN_DIR = "/microvms/.golden"
 POOL_DIR = "/microvms/.pool"
 POOL_TARGET_SIZE = 8
 POOL_WORKERS = 4
+
+TEMPLATES_DIR = "/microvms/.templates"
+DEFAULT_TEMPLATE_ID = "default"
 
 TERM_COLS = 120
 TERM_ROWS = 40

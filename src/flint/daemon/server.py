@@ -3,18 +3,27 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
+import threading
 import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 import uvicorn
 
 from flint.core.config import (
-    log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH, GOLDEN_DIR,
+    log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
+    GOLDEN_DIR, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
 )
 from flint.core.manager import SandboxManager
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
 from flint.core._pool import start_pool, stop_pool
+from flint.core._netns import _ensure_bridge
+from flint.core._template_registry import (
+    list_templates, get_template, register_template, delete_template as _delete_template,
+    get_template_dir,
+)
+from flint.core._template_build import build_template as _build_template
 
 app = FastAPI()
 manager: SandboxManager | None = None
@@ -54,12 +63,12 @@ def health():
 
 
 @app.post("/vms")
-def create_vm():
-    print("POST /vms — creating VM...")
+def create_vm(template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
+    print(f"POST /vms — creating VM (template={template_id}, internet={allow_internet_access})...")
     mgr = _require_manager()
-    if not _golden_ready:
+    if template_id == DEFAULT_TEMPLATE_ID and not _golden_ready:
         raise HTTPException(status_code=503, detail="Golden snapshot not ready")
-    vm_id = mgr.create()
+    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state()
     print(f"POST /vms — created {vm_id[:8]}")
@@ -136,6 +145,70 @@ async def terminal_ws(websocket: WebSocket, vm_id: str):
         entry.unsubscribe_output(on_output)
 
 
+# ── Template endpoints ──────────────────────────────────────────────────────
+
+_build_threads: dict[str, threading.Thread] = {}
+
+
+@app.post("/templates/build")
+def build_template_endpoint(body: dict):
+    name = body.get("name")
+    dockerfile = body.get("dockerfile")
+    rootfs_size_mb = body.get("rootfs_size_mb", 500)
+    if not name or not dockerfile:
+        raise HTTPException(status_code=400, detail="name and dockerfile are required")
+
+    from flint.core._template_build import _slugify
+    template_id = _slugify(name)
+    print(f"POST /templates/build — building {template_id}...")
+
+    def _run_build():
+        try:
+            _build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+            print(f"Template {template_id} built successfully")
+        except Exception as e:
+            print(f"Template {template_id} build failed: {e}")
+            log.exception("Template build failed: %s", template_id)
+
+    t = threading.Thread(target=_run_build, daemon=True, name=f"build-{template_id}")
+    t.start()
+    _build_threads[template_id] = t
+
+    return {"template_id": template_id, "status": "building"}
+
+
+@app.get("/templates")
+def list_templates_endpoint():
+    templates = list_templates()
+    print(f"GET /templates — {len(templates)} templates")
+    return {"templates": templates}
+
+
+@app.get("/templates/{template_id}")
+def get_template_endpoint(template_id: str):
+    tmpl = get_template(template_id)
+    if tmpl is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"template": tmpl}
+
+
+@app.delete("/templates/{template_id}")
+def delete_template_endpoint(template_id: str):
+    print(f"DELETE /templates/{template_id}")
+    if template_id == DEFAULT_TEMPLATE_ID:
+        raise HTTPException(status_code=400, detail="Cannot delete default template")
+    tmpl = get_template(template_id)
+    if tmpl is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    # Remove snapshot files
+    tdir = tmpl.get("template_dir", "")
+    if tdir and os.path.isdir(tdir):
+        shutil.rmtree(tdir, ignore_errors=True)
+    _delete_template(template_id)
+    print(f"DELETE /templates/{template_id} — deleted")
+    return {"ok": True}
+
+
 class FlintDaemon:
     def run(self) -> None:
         global manager, _golden_ready, _started_at
@@ -147,13 +220,21 @@ class FlintDaemon:
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(os.getpid()))
 
+        # Ensure bridge is ready for VM networking
+        _ensure_bridge()
+        print("Bridge ready.")
+
         # Create golden snapshot
         print("Creating golden snapshot...")
-        import shutil
         shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
         create_golden_snapshot()
         _golden_ready = True
         print("Golden snapshot ready.")
+
+        # Register existing golden snapshot as "default" template
+        os.makedirs(TEMPLATES_DIR, exist_ok=True)
+        register_template(DEFAULT_TEMPLATE_ID, "Default (Alpine)", GOLDEN_DIR)
+        print("Default template registered.")
 
         # Start rootfs pool
         start_pool()

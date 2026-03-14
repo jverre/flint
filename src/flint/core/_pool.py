@@ -4,7 +4,7 @@ import subprocess
 import threading
 import uuid
 
-from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR
+from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID
 from ._snapshot import golden_snapshot_exists
 
 _pool_lock = threading.Lock()
@@ -13,12 +13,15 @@ _pool_stop_event = threading.Event()
 _pool_threads: list[threading.Thread] = []
 
 
-def _copy_one_to_pool(source_path: str, source_label: str) -> str | None:
+TEMPLATE_POOL_SIZE = 2  # pool size for non-default templates
+
+
+def _copy_one_to_pool(source_path: str, template_id: str) -> str | None:
     pool_id = str(uuid.uuid4())
     pool_entry_dir = f"{POOL_DIR}/{pool_id}"
     rootfs_dest = f"{pool_entry_dir}/rootfs.ext4"
 
-    entry = {"id": pool_id, "dir_path": pool_entry_dir, "source": source_label, "state": "copying"}
+    entry = {"id": pool_id, "dir_path": pool_entry_dir, "template_id": template_id, "state": "copying"}
     with _pool_lock:
         _pool_entries.append(entry)
 
@@ -39,31 +42,48 @@ def _copy_one_to_pool(source_path: str, source_label: str) -> str | None:
 def _pool_refill_loop():
     while not _pool_stop_event.is_set():
         try:
+            filled = False
+            # Refill default template
             with _pool_lock:
-                ready_count = sum(1 for e in _pool_entries if e["state"] == "ready")
-                copying_count = sum(1 for e in _pool_entries if e["state"] == "copying")
-            if ready_count + copying_count < POOL_TARGET_SIZE:
+                default_count = sum(1 for e in _pool_entries if e["template_id"] == DEFAULT_TEMPLATE_ID and e["state"] in ("ready", "copying"))
+            if default_count < POOL_TARGET_SIZE:
                 if golden_snapshot_exists():
-                    _copy_one_to_pool(f"{GOLDEN_DIR}/rootfs.ext4", "golden")
+                    _copy_one_to_pool(f"{GOLDEN_DIR}/rootfs.ext4", DEFAULT_TEMPLATE_ID)
                 else:
-                    _copy_one_to_pool(SOURCE_ROOTFS, "cold")
-            else:
+                    _copy_one_to_pool(SOURCE_ROOTFS, DEFAULT_TEMPLATE_ID)
+                filled = True
+
+            # Refill non-default templates
+            from ._template_registry import registered_template_ids, template_snapshot_exists, get_template_dir
+            for tid in registered_template_ids():
+                if tid == DEFAULT_TEMPLATE_ID:
+                    continue
+                if not template_snapshot_exists(tid):
+                    continue
+                with _pool_lock:
+                    tid_count = sum(1 for e in _pool_entries if e["template_id"] == tid and e["state"] in ("ready", "copying"))
+                if tid_count < TEMPLATE_POOL_SIZE:
+                    tdir = get_template_dir(tid)
+                    _copy_one_to_pool(f"{tdir}/rootfs.ext4", tid)
+                    filled = True
+
+            if not filled:
                 _pool_stop_event.wait(0.02)
         except Exception:
             log.exception("pool: refill loop error")
             _pool_stop_event.wait(1.0)
 
 
-def _claim_pool_entry(source_label: str, vm_id: str) -> str | None:
+def _claim_pool_entry(template_id: str, vm_id: str) -> str | None:
     with _pool_lock:
-        match = next((e for e in _pool_entries if e["state"] == "ready" and e["source"] == source_label), None)
+        match = next((e for e in _pool_entries if e["state"] == "ready" and e["template_id"] == template_id), None)
         if not match:
             ready_count = sum(1 for e in _pool_entries if e["state"] == "ready")
             copying_count = sum(1 for e in _pool_entries if e["state"] == "copying")
-            log.debug("pool: miss for %s (ready=%d, copying=%d)", source_label, ready_count, copying_count)
+            log.debug("pool: miss for %s (ready=%d, copying=%d)", template_id, ready_count, copying_count)
             return None
         _pool_entries.remove(match)
-        remaining = sum(1 for e in _pool_entries if e["state"] == "ready" and e["source"] == source_label)
+        remaining = sum(1 for e in _pool_entries if e["state"] == "ready" and e["template_id"] == template_id)
     log.debug("pool: claimed %s for %s (%d remaining)", match["id"][:8], vm_id[:8], remaining)
 
     vm_dir = f"/microvms/{vm_id}"

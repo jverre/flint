@@ -1,0 +1,202 @@
+"""Template build pipeline: Dockerfile generation, Docker build, rootfs extraction."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+
+from .config import log, TEMPLATES_DIR, KERNEL_PATH, BOOT_ARGS, GUEST_MAC
+from ._snapshot import create_golden_snapshot
+from ._template_registry import register_template, update_template_status
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "template"
+
+
+def _generate_dockerfile(base_image: str, steps: list[dict], flint_injection: bool = True) -> str:
+    lines = [f"FROM {base_image}", ""]
+    for step in steps:
+        kind = step["type"]
+        if kind == "run":
+            lines.append(f"RUN {step['cmd']}")
+        elif kind == "apt_install":
+            pkgs = " ".join(step["packages"])
+            lines.append(f"RUN apt-get update && apt-get install -y {pkgs} && rm -rf /var/lib/apt/lists/*")
+        elif kind == "pip_install":
+            pkgs = " ".join(step["packages"])
+            lines.append(f"RUN pip install --no-cache-dir {pkgs}")
+        elif kind == "npm_install":
+            pkgs = " ".join(step["packages"])
+            lines.append(f"RUN npm install -g {pkgs}")
+        elif kind == "copy":
+            lines.append(f"COPY {step['src']} {step['dest']}")
+        elif kind == "workdir":
+            lines.append(f"WORKDIR {step['path']}")
+        elif kind == "env":
+            for k, v in step["envs"].items():
+                lines.append(f"ENV {k}={v}")
+        elif kind == "git_clone":
+            lines.append(f"RUN git clone {step['repo']} {step.get('dest', '')}")
+
+    if flint_injection:
+        lines.append("")
+        lines.append("# Flint injection (always last)")
+        lines.append("RUN apt-get update && apt-get install -y iproute2 || apk add iproute2 || true")
+        lines.append("COPY tcp-relay /usr/local/bin/tcp-relay")
+        lines.append("COPY init-net.sh /etc/init-net.sh")
+        lines.append("RUN chmod +x /usr/local/bin/tcp-relay /etc/init-net.sh")
+
+    return "\n".join(lines) + "\n"
+
+
+def _compile_tcp_relay(output_path: str) -> None:
+    """Compile guest/tcp-relay.c with musl-gcc, or fall back to assets/ pre-built binary."""
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    prebuilt = os.path.join(project_root, "assets", "tcp-relay")
+    if os.path.exists(prebuilt):
+        shutil.copy2(prebuilt, output_path)
+        log.info("Using pre-built tcp-relay from assets/")
+        return
+
+    source = os.path.join(project_root, "guest", "tcp-relay.c")
+    if not os.path.exists(source):
+        raise FileNotFoundError(f"tcp-relay source not found: {source}")
+
+    subprocess.run(
+        ["musl-gcc", "-static", "-O2", "-o", output_path, source],
+        check=True,
+        capture_output=True,
+    )
+    log.info("Compiled tcp-relay from %s", source)
+
+
+def _find_init_net_sh() -> str:
+    """Locate init-net.sh — check assets/ then the source rootfs."""
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    candidate = os.path.join(project_root, "assets", "init-net.sh")
+    if os.path.exists(candidate):
+        return candidate
+    # Fallback: extract from the default rootfs (it's at /etc/init-net.sh inside ext4)
+    raise FileNotFoundError(
+        "init-net.sh not found in assets/. Place it at assets/init-net.sh."
+    )
+
+
+def _docker_build(template_id: str, dockerfile_content: str, context_dir: str) -> str:
+    tag = f"flint-template:{template_id}"
+    dockerfile_path = os.path.join(context_dir, "Dockerfile")
+    with open(dockerfile_path, "w") as f:
+        f.write(dockerfile_content)
+
+    log.info("Building Docker image %s ...", tag)
+    subprocess.run(
+        ["docker", "build", "-t", tag, "-f", dockerfile_path, context_dir],
+        check=True,
+    )
+    return tag
+
+
+def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
+    log.info("Extracting rootfs from %s (%d MB) ...", image_tag, size_mb)
+
+    # Create empty ext4 image
+    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
+    subprocess.run(["mkfs.ext4", "-F", rootfs_path], check=True, capture_output=True)
+
+    # Mount, export docker filesystem, unmount
+    mount_dir = f"/tmp/flint-rootfs-mount-{os.getpid()}"
+    os.makedirs(mount_dir, exist_ok=True)
+    try:
+        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
+
+        # Create container, export, extract
+        result = subprocess.run(
+            ["docker", "create", image_tag],
+            check=True, capture_output=True, text=True,
+        )
+        container_id = result.stdout.strip()
+        try:
+            export_proc = subprocess.Popen(
+                ["docker", "export", container_id],
+                stdout=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["tar", "-x", "-C", mount_dir],
+                stdin=export_proc.stdout,
+                check=True,
+            )
+            export_proc.wait()
+        finally:
+            subprocess.run(["docker", "rm", container_id], capture_output=True)
+    finally:
+        subprocess.run(["umount", mount_dir], capture_output=True)
+        shutil.rmtree(mount_dir, ignore_errors=True)
+
+    log.info("Rootfs extracted to %s", rootfs_path)
+
+
+def build_template(
+    name: str,
+    dockerfile_content: str,
+    *,
+    rootfs_size_mb: int = 500,
+) -> str:
+    """Full build pipeline: Docker build -> rootfs extraction -> golden snapshot -> register.
+
+    Returns template_id.
+    """
+    template_id = _slugify(name)
+    template_dir = f"{TEMPLATES_DIR}/{template_id}"
+    os.makedirs(template_dir, exist_ok=True)
+
+    # Register as "building"
+    register_template(template_id, name, template_dir, status="building", rootfs_size_mb=rootfs_size_mb)
+
+    try:
+        # Prepare build context directory
+        context_dir = f"/tmp/flint-build-{template_id}"
+        os.makedirs(context_dir, exist_ok=True)
+
+        # Copy tcp-relay binary and init-net.sh into context
+        _compile_tcp_relay(os.path.join(context_dir, "tcp-relay"))
+        init_net = _find_init_net_sh()
+        shutil.copy2(init_net, os.path.join(context_dir, "init-net.sh"))
+
+        # Save Dockerfile for reproducibility
+        with open(f"{template_dir}/Dockerfile", "w") as f:
+            f.write(dockerfile_content)
+
+        # Docker build
+        image_tag = _docker_build(template_id, dockerfile_content, context_dir)
+
+        # Extract rootfs
+        rootfs_path = f"{template_dir}/rootfs.ext4"
+        _extract_rootfs(image_tag, rootfs_path, rootfs_size_mb)
+
+        # Create golden snapshot for this template
+        ns_name = f"fc-tmpl-{template_id[:12]}"
+        tap_name = f"tap-tmpl-{template_id[:8]}"
+        create_golden_snapshot(
+            source_rootfs=rootfs_path,
+            snapshot_dir=template_dir,
+            ns_name=ns_name,
+            tap_name=tap_name,
+        )
+
+        # Update status
+        update_template_status(template_id, "ready")
+
+        # Cleanup
+        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
+        shutil.rmtree(context_dir, ignore_errors=True)
+
+        log.info("Template %s built successfully", template_id)
+        return template_id
+
+    except Exception:
+        update_template_status(template_id, "failed")
+        raise

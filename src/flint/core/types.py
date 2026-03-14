@@ -28,6 +28,7 @@ class _SandboxEntry:
     tcp_socket: socket.socket | None
     tcp_connected: bool
     state: str
+    template_id: str = "default"
     screen_version: int = 0
     t_instance_start: float = 0.0
     boot_time_ms: float | None = None
@@ -69,6 +70,7 @@ class _SandboxEntry:
             "vm_id": self.vm_id,
             "pid": self.pid,
             "state": self.state,
+            "template_id": self.template_id,
             "tcp_connected": self.tcp_connected,
             "created_at": self.created_at,
             "boot_time_ms": self.boot_time_ms,

@@ -13,7 +13,7 @@ from textual.timer import Timer
 from textual.widgets import Button, Checkbox, Footer, Input, Static
 from textual.worker import Worker
 
-from flint.core.benchmark import benchmark_vm
+from flint.sandbox import Sandbox
 from flint.tui.widgets.benchmark_grid import BenchmarkGrid, CellState
 
 
@@ -40,56 +40,6 @@ class BenchmarkScreen(Screen):
         Binding("escape", "cancel", "Close"),
     ]
 
-    SNAPSHOT_TIMING_KEYS = [
-        "copy_rootfs_ms",
-        "netns_setup_ms",
-        "popen_ms",
-        "wait_api_ready_ms",
-        "api_snapshot_load_ms",
-        "api_drives_ms",
-        "api_resume_ms",
-        "tcp_connect_ms",
-        "exec_command_ms",
-    ]
-
-    SNAPSHOT_STEP_LABELS = {
-        "copy_rootfs_ms": "Copy rootfs",
-        "netns_setup_ms": "Netns + TAP",
-        "popen_ms": "Popen FC",
-        "wait_api_ready_ms": "Wait API ready",
-        "api_snapshot_load_ms": "Snapshot load",
-        "api_drives_ms": "PATCH drives",
-        "api_resume_ms": "Resume VM",
-        "tcp_connect_ms": "TCP connect",
-        "exec_command_ms": "Exec command",
-    }
-
-    SIMPLE_SNAPSHOT_TIMING_KEYS = [
-        "copy_rootfs_ms",
-        "netns_create_ms",
-        "tap_setup_ms",
-        "popen_ms",
-        "wait_api_ready_ms",
-        "api_snapshot_load_ms",
-        "api_drives_ms",
-        "api_resume_ms",
-        "tcp_connect_ms",
-        "exec_command_ms",
-    ]
-
-    SIMPLE_SNAPSHOT_STEP_LABELS = {
-        "copy_rootfs_ms": "Copy rootfs",
-        "netns_create_ms": "Create netns",
-        "tap_setup_ms": "TAP setup",
-        "popen_ms": "Popen FC",
-        "wait_api_ready_ms": "Wait API ready",
-        "api_snapshot_load_ms": "Snapshot load",
-        "api_drives_ms": "PATCH drives",
-        "api_resume_ms": "Resume VM",
-        "tcp_connect_ms": "TCP connect",
-        "exec_command_ms": "Exec command",
-    }
-
     def __init__(self) -> None:
         super().__init__()
         self._grid_positions: list[int] = []
@@ -97,9 +47,7 @@ class BenchmarkScreen(Screen):
         self._start_time: float = 0.0
         self._completed: int = 0
         self._ready_times: list[float] = []
-        self._timing_keys: list[str] = []
-        self._step_labels: dict[str, str] = {}
-        self._step_times: dict[str, list[float]] = {}
+        self._step_timings: list[dict[str, float]] = []
         self._poll_timer: Timer | None = None
         self._launch_worker: Worker | None = None
         self._phase: str = "input"
@@ -143,15 +91,6 @@ class BenchmarkScreen(Screen):
         self._use_rootfs_pool = self.query_one("#benchmark-rootfs-drive-checkbox", Checkbox).value
         self._phase = "running"
 
-        # Pick timing keys/labels based on mode
-        if self._use_pyroute2:
-            self._timing_keys = self.SNAPSHOT_TIMING_KEYS
-            self._step_labels = self.SNAPSHOT_STEP_LABELS
-        else:
-            self._timing_keys = self.SIMPLE_SNAPSHOT_TIMING_KEYS
-            self._step_labels = self.SIMPLE_SNAPSHOT_STEP_LABELS
-        self._step_times = {k: [] for k in self._timing_keys}
-
         self.query_one("#benchmark-input-container").display = False
         self.query_one("#benchmark-grid-container").display = True
         self.query_one("#benchmark-status").display = True
@@ -166,28 +105,26 @@ class BenchmarkScreen(Screen):
         self._launch_worker = self.run_worker(self._run_benchmark, thread=True)
 
     def _run_benchmark(self) -> None:
-        """Sequential benchmark: create VM → verify TCP → tear down → next."""
+        """Sequential benchmark: create VM via daemon → measure time → kill → next."""
         grid = self.query_one("#benchmark-grid", BenchmarkGrid)
 
         for i in range(self._vm_count):
             pos = self._grid_positions[i]
             grid.set_cell_state(pos, CellState.STARTING)
 
-            result = benchmark_vm(
-                use_pool=self._use_rootfs_pool,
-                use_pyroute2=self._use_pyroute2,
-            )
+            try:
+                sb = Sandbox(
+                    use_pool=self._use_rootfs_pool,
+                    use_pyroute2=self._use_pyroute2,
+                )
+                ready_ms = sb.ready_time_ms or 0.0
 
-            if result["success"] and result["ready_time_ms"] is not None:
-                ready_ms = result["ready_time_ms"]
                 self._ready_times.append(ready_ms)
-                for key in self._timing_keys:
-                    val = result["timings"].get(key)
-                    if val is not None:
-                        self._step_times[key].append(val)
+                self._step_timings.append(sb.timings)
                 grid.set_cell_state(pos, CellState.READY, ready_ms)
-            else:
-                self._last_error = result.get("error", "unknown")
+                sb.kill()
+            except Exception as exc:
+                self._last_error = str(exc)
                 grid.set_cell_state(pos, CellState.FAILED)
 
             self._completed = i + 1
@@ -215,6 +152,7 @@ class BenchmarkScreen(Screen):
 
     def _show_results(self) -> None:
         self._phase = "results"
+        self._update_status()
         if self._poll_timer:
             self._poll_timer.stop()
 
@@ -235,42 +173,8 @@ class BenchmarkScreen(Screen):
 
         grid = self.query_one("#benchmark-grid", BenchmarkGrid)
         state_counts = Counter(grid._cell_states)
-        # Compute throughput from sum of TTI times (excludes destroy overhead)
         tti_total_ms = sum(self._ready_times)
         throughput = s['count'] / (tti_total_ms / 1000) if tti_total_ms > 0 else 0
-
-        step_parts = []
-        agg = {"avg": 0.0, "min": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
-        for key in self._timing_keys:
-            times = self._step_times[key]
-            label = self._step_labels.get(key, key)
-            if times:
-                st = _compute_stats(times)
-                for k in agg:
-                    agg[k] += st[k]
-                step_parts.append(
-                    f"  {label:<20s}"
-                    f"  avg [yellow]{st['avg']:>7,.1f}[/]"
-                    f"  min [green]{st['min']:>7,.1f}[/]"
-                    f"  p95 [yellow]{st['p95']:>7,.1f}[/]"
-                    f"  p99 [red]{st['p99']:>7,.1f}[/]"
-                    f"  max [red]{st['max']:>7,.1f}[/]"
-                )
-        step_parts.append(
-            f"  {'─' * 20}"
-            f"  {'─' * 11}"
-            f"  {'─' * 11}"
-            f"  {'─' * 11}"
-            f"  {'─' * 11}"
-            f"  {'─' * 11}\n"
-            f"  {'Total':<20s}"
-            f"  avg [yellow]{agg['avg']:>7,.1f}[/]"
-            f"  min [green]{agg['min']:>7,.1f}[/]"
-            f"  p95 [yellow]{agg['p95']:>7,.1f}[/]"
-            f"  p99 [red]{agg['p99']:>7,.1f}[/]"
-            f"  max [red]{agg['max']:>7,.1f}[/]"
-        )
-        step_lines = "\n".join(step_parts) + "\n"
 
         # State counts line
         state_parts = []
@@ -284,21 +188,49 @@ class BenchmarkScreen(Screen):
                 state_parts.append(f"[{color}]{st.value}: {cnt}[/]")
         state_line = "  " + "   ".join(state_parts) if state_parts else ""
 
+        # Build per-step breakdown from collected timings
+        step_breakdown = ""
+        if self._step_timings:
+            # Collect all timing keys across iterations
+            all_keys: list[str] = []
+            seen: set[str] = set()
+            for t in self._step_timings:
+                for k in t:
+                    if k not in seen:
+                        all_keys.append(k)
+                        seen.add(k)
+
+            if all_keys:
+                step_breakdown = "\n[bold]Per-step breakdown (ms):[/]\n"
+                step_breakdown += f"  {'Step':<24s} {'Avg':>8s} {'Min':>8s} {'Max':>8s} {'P95':>8s}\n"
+                for key in all_keys:
+                    vals = [t[key] for t in self._step_timings if key in t]
+                    if not vals:
+                        continue
+                    st = _compute_stats(vals)
+                    label = key.replace("_ms", "").replace("_", " ")
+                    step_breakdown += (
+                        f"  {label:<24s} "
+                        f"[yellow]{st['avg']:>7,.0f}[/] "
+                        f"[green]{st['min']:>7,.0f}[/] "
+                        f"[red]{st['max']:>7,.0f}[/] "
+                        f"[yellow]{st['p95']:>7,.0f}[/]\n"
+                    )
+
         results_widget.update(
             f"[bold]Benchmark Complete: {self._vm_count} VMs[/]\n\n"
             f"  TTI total:    [bold]{tti_total_ms:>8,.0f} ms[/]\n"
             f"  Wall clock:   [dim]{wall_ms:>8,.0f} ms[/]  [dim](incl. teardown)[/]\n"
             f"  Throughput:   [bold]{throughput:>8.2f} VMs/s[/]\n"
             f"{state_line}\n\n"
-            f"[bold]Total ready time (ms):[/]\n"
+            f"[bold]Ready time (ms):[/]\n"
             f"  Min:    [green]{s['min']:>8,.0f} ms[/]"
             f"     Median: [cyan]{s['median']:>8,.0f} ms[/]\n"
             f"  Avg:    [yellow]{s['avg']:>8,.0f} ms[/]"
             f"     P95:    [yellow]{s['p95']:>8,.0f} ms[/]\n"
             f"  Max:    [red]{s['max']:>8,.0f} ms[/]"
-            f"     P99:    [red]{s['p99']:>8,.0f} ms[/]\n\n"
-            f"[bold]Per-step breakdown (ms):[/]\n"
-            f"{step_lines}\n"
+            f"     P99:    [red]{s['p99']:>8,.0f} ms[/]\n"
+            f"{step_breakdown}\n"
             f"  [dim]Press Escape to return[/]"
         )
 

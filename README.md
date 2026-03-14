@@ -25,6 +25,7 @@ https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 
 - Linux host with [Firecracker](https://github.com/firecracker-microvm/firecracker) installed
 - A rootfs image and vmlinux kernel at `/root/firecracker-vm/`
+- `musl-tools`, `musl-dev`, `binutils` (for building the guest relay — auto-installed by `setup-rootfs.sh`)
 - Python 3.12+
 
 ### Install
@@ -182,6 +183,8 @@ Flint is split into two processes with a strict separation:
 ## 📁 Project Structure
 
 ```
+guest/
+└── tcp-relay.c          # Static C relay: pre-spawned PTY shell over TCP
 src/flint/
 ├── cli.py              # Click CLI commands
 ├── daemon/
@@ -239,7 +242,7 @@ curl -fsSL -o /root/firecracker-vm/vmlinux \
 
 ### 3. Build the rootfs image
 
-Flint uses an Alpine-based rootfs with `socat` for the in-guest TCP shell server. The `setup-rootfs.sh` script builds it:
+Flint uses an Alpine-based rootfs with a static C TCP-to-PTY relay for the in-guest shell server. The `setup-rootfs.sh` script builds it:
 
 ```bash
 # Download Alpine minirootfs
@@ -250,7 +253,7 @@ curl -fsSL -o /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz \
 sudo ./setup-rootfs.sh
 ```
 
-This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4` containing Alpine with `socat` and a network init script that starts the TCP shell on port 5000.
+This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4` containing Alpine with a pre-spawned shell relay and a network init script that listens on TCP port 5000.
 
 ### 4. Verify
 
@@ -259,7 +262,7 @@ You should have two files:
 ```
 /root/firecracker-vm/
 ├── vmlinux        # Uncompressed Linux kernel
-└── rootfs.ext4    # Alpine rootfs with socat + init script
+└── rootfs.ext4    # Alpine rootfs with tcp-relay + init script
 ```
 
 Once these are in place, `flint start` will create the golden snapshot automatically on first run.

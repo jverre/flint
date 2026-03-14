@@ -24,9 +24,16 @@ trap 'sudo umount "$MOUNT_POINT" 2>/dev/null || true' EXIT
 # Extract Alpine rootfs
 sudo tar xzf "$ALPINE_TAR" -C "$MOUNT_POINT"
 
-# Setup DNS for chroot and install socat
-sudo cp /etc/resolv.conf "$MOUNT_POINT/etc/resolv.conf"
-sudo chroot "$MOUNT_POINT" /bin/sh -c "apk add --no-cache socat"
+# Install musl toolchain if not present
+if ! command -v musl-gcc &>/dev/null; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools musl-dev binutils
+fi
+
+# Cross-compile static tcp-relay binary (musl for Alpine compatibility)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+musl-gcc -static -O2 -o /tmp/tcp-relay "$SCRIPT_DIR/guest/tcp-relay.c" -lutil
+sudo cp /tmp/tcp-relay "$MOUNT_POINT/usr/local/bin/tcp-relay"
+sudo chmod +x "$MOUNT_POINT/usr/local/bin/tcp-relay"
 
 # Write network init script (TAP + TCP replaces vsock)
 sudo tee "$MOUNT_POINT/etc/init-net.sh" > /dev/null << 'INITSCRIPT'
@@ -42,8 +49,11 @@ ip addr add 172.16.0.2/30 dev eth0
 ip link set eth0 up
 ip route add default via 172.16.0.1
 
-# Start TCP shell server
-socat TCP-LISTEN:5000,bind=0.0.0.0,reuseaddr,fork EXEC:"/bin/sh -i",pty,stderr,setsid,sigint,sane &
+# DNS
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Start pre-spawned shell with TCP relay (no fork/exec per connection)
+/usr/local/bin/tcp-relay &
 
 echo "READY"
 exec /bin/sh

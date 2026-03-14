@@ -65,6 +65,7 @@ def _tcp_connect(ns_name: str, retries: int = 500) -> socket.socket:
     try:
         for _ in range(retries):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 sock.settimeout(0.05)
                 sock.connect((GUEST_IP, TCP_PORT))

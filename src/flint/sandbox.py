@@ -124,13 +124,26 @@ class Sandbox:
         sandbox.kill()                               # clean up
     """
 
-    def __init__(self, vm_id: str | None = None) -> None:
+    def __init__(
+        self,
+        vm_id: str | None = None,
+        *,
+        template_id: str = "default",
+        allow_internet_access: bool = True,
+        use_pool: bool = True,
+        use_pyroute2: bool = True,
+    ) -> None:
         client = _get_client()
         if vm_id is None:
-            vm = client.create()
+            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
             self._id = vm["vm_id"]
+            self._timings: dict[str, float] = vm.get("timings", {})
+            self._ready_time_ms: float | None = vm.get("ready_time_ms")
         else:
             self._id = vm_id
+            self._timings = {}
+            self._ready_time_ms = None
+        self._template_id = template_id
         self._commands = Commands(self._id)
         self._pty = Pty(self._id)
 
@@ -152,6 +165,16 @@ class Sandbox:
     def created_at(self) -> float:
         data = self._fetch()
         return data.get("created_at", 0.0) if data else 0.0
+
+    @property
+    def timings(self) -> dict[str, float]:
+        """Per-step boot timings from the daemon (empty for reconnected VMs)."""
+        return self._timings
+
+    @property
+    def ready_time_ms(self) -> float | None:
+        """Total time-to-ready in ms as measured by the daemon (None for reconnected VMs)."""
+        return self._ready_time_ms
 
     @property
     def commands(self) -> Commands:
@@ -182,6 +205,8 @@ class Sandbox:
         """Wrap an existing VM without creating a new one."""
         sb = object.__new__(cls)
         sb._id = vm_id
+        sb._timings = {}
+        sb._ready_time_ms = None
         sb._commands = Commands(vm_id)
         sb._pty = Pty(vm_id)
         return sb

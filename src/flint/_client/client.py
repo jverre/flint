@@ -61,8 +61,8 @@ class DaemonClient:
         self._terminals.clear()
         self._http.close()
 
-    def create(self) -> dict:
-        resp = self._http.post("/vms")
+    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True) -> dict:
+        resp = self._http.post("/vms", params={"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2})
         resp.raise_for_status()
         return resp.json()["vm"]
 
@@ -99,6 +99,33 @@ class DaemonClient:
         conn = self._terminals.pop(vm_id, None)
         if conn:
             conn.close()
+
+    # ── Template methods ───────────────────────────────────────────────────
+
+    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+        resp = self._http.post(
+            "/templates/build",
+            json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb},
+            timeout=600.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_templates(self) -> list[dict]:
+        resp = self._http.get("/templates")
+        resp.raise_for_status()
+        return resp.json()["templates"]
+
+    def get_template(self, template_id: str) -> dict | None:
+        resp = self._http.get(f"/templates/{template_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()["template"]
+
+    def delete_template(self, template_id: str) -> None:
+        resp = self._http.delete(f"/templates/{template_id}")
+        resp.raise_for_status()
 
     @staticmethod
     def is_daemon_running(base_url: str = DEFAULT_URL) -> bool:

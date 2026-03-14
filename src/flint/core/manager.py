@@ -4,10 +4,11 @@ import socket
 import threading
 import time
 
-from .config import log, GOLDEN_DIR, GOLDEN_TAP, GUEST_IP
+from .config import log, GOLDEN_DIR, GOLDEN_TAP, GUEST_IP, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry
 from ._boot import _boot_from_snapshot, _teardown_vm
 from ._snapshot import golden_snapshot_exists
+from ._template_registry import template_snapshot_exists as _template_snapshot_exists
 from ._tcp import _read_tcp_output
 
 
@@ -18,12 +19,20 @@ class SandboxManager:
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
 
-    def create(self) -> str:
-        """Start an interactive VM from golden snapshot. Returns the vm_id."""
-        if not golden_snapshot_exists():
-            raise RuntimeError(f"Golden snapshot not found in {GOLDEN_DIR}")
+    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True) -> str:
+        """Start an interactive VM from a template snapshot. Returns the vm_id."""
+        if template_id == DEFAULT_TEMPLATE_ID:
+            if not golden_snapshot_exists():
+                raise RuntimeError(f"Golden snapshot not found in {GOLDEN_DIR}")
+        else:
+            if not _template_snapshot_exists(template_id):
+                raise RuntimeError(f"Template snapshot not found: {template_id}")
 
         boot = _boot_from_snapshot(
+            template_id=template_id,
+            allow_internet_access=allow_internet_access,
+            use_pool=use_pool,
+            use_pyroute2=use_pyroute2,
             network_overrides=[{"iface_id": "eth0", "host_dev_name": GOLDEN_TAP}],
         )
 
@@ -52,6 +61,7 @@ class SandboxManager:
             tcp_socket=sock,
             tcp_connected=True,
             state="Started",
+            template_id=template_id,
             t_instance_start=boot["t_total"],
             ready_time_ms=(time.monotonic() - boot["t_total"]) * 1000,
             timings=boot["timings"],
