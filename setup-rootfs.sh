@@ -24,16 +24,12 @@ trap 'sudo umount "$MOUNT_POINT" 2>/dev/null || true' EXIT
 # Extract Alpine rootfs
 sudo tar xzf "$ALPINE_TAR" -C "$MOUNT_POINT"
 
-# Install musl toolchain if not present
-if ! command -v musl-gcc &>/dev/null; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools musl-dev binutils
-fi
-
-# Cross-compile static tcp-relay binary (musl for Alpine compatibility)
+# Build flintd guest agent (static Go binary)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-musl-gcc -static -O2 -o /tmp/tcp-relay "$SCRIPT_DIR/guest/tcp-relay.c" -lutil
-sudo cp /tmp/tcp-relay "$MOUNT_POINT/usr/local/bin/tcp-relay"
-sudo chmod +x "$MOUNT_POINT/usr/local/bin/tcp-relay"
+cd "$SCRIPT_DIR/guest/flintd" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o /tmp/flintd .
+cd "$SCRIPT_DIR"
+sudo cp /tmp/flintd "$MOUNT_POINT/usr/local/bin/flintd"
+sudo chmod +x "$MOUNT_POINT/usr/local/bin/flintd"
 
 # Write network init script (TAP + TCP replaces vsock)
 sudo tee "$MOUNT_POINT/etc/init-net.sh" > /dev/null << 'INITSCRIPT'
@@ -52,8 +48,18 @@ ip route add default via 172.16.0.1
 # DNS
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
-# Start pre-spawned shell with TCP relay (no fork/exec per connection)
-/usr/local/bin/tcp-relay &
+# Start flintd guest agent (HTTP+WebSocket process manager)
+/usr/local/bin/flintd > /var/log/flintd.log 2>&1 &
+
+# Wait for flintd to be listening before signaling READY
+i=0
+while [ "$i" -lt 200 ]; do
+    if grep -q ":1388" /proc/net/tcp 2>/dev/null; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.05 2>/dev/null || sleep 1
+done
 
 echo "READY"
 exec /bin/sh

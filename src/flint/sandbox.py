@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import threading
 from dataclasses import dataclass
 from typing import Callable
 
@@ -11,7 +9,6 @@ from flint._client.client import DaemonClient, _TerminalConnection
 from flint.core.config import DAEMON_URL, TERM_COLS, TERM_ROWS
 
 _client: DaemonClient | None = None
-_SENTINEL = re.compile(r"__FLINT_DONE__:(\d+)")
 
 
 def _get_client() -> DaemonClient:
@@ -26,7 +23,16 @@ class CommandResult:
     """Result of running a command in a sandbox."""
 
     stdout: str
+    stderr: str
     exit_code: int
+
+    @staticmethod
+    def from_response(resp: dict) -> "CommandResult":
+        return CommandResult(
+            stdout=resp.get("stdout", ""),
+            stderr=resp.get("stderr", ""),
+            exit_code=resp.get("exit_code", -1),
+        )
 
 
 class PtySession:
@@ -76,39 +82,13 @@ class Commands:
         on_stdout: Callable[[str], None] | None = None,
         timeout: float = 60,
     ) -> CommandResult:
-        collected: list[bytes] = []
-        done = threading.Event()
-        result_holder: list[CommandResult] = []
-
-        def _on_output(data: bytes) -> None:
-            collected.append(data)
-            text = b"".join(collected).decode(errors="replace")
-            m = _SENTINEL.search(text)
-            if m:
-                exit_code = int(m.group(1))
-                stdout = text[: m.start()]
-                # Strip the command echo (first line) and trailing newline
-                lines = stdout.split("\n")
-                if lines and lines[0].rstrip().endswith(f'echo "__FLINT_DONE__:$?"'):
-                    lines = lines[1:]
-                stdout = "\n".join(lines).strip()
-                if on_stdout:
-                    for line in stdout.split("\n"):
-                        on_stdout(line)
-                result_holder.append(CommandResult(stdout=stdout, exit_code=exit_code))
-                done.set()
-
-        ws_base = DAEMON_URL.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_base}/vms/{self._vm_id}/terminal"
-        conn = _TerminalConnection(ws_url, _on_output)
-        try:
-            sentinel_cmd = f'({cmd}); echo "__FLINT_DONE__:$?"\n'
-            conn.send(sentinel_cmd.encode())
-            if not done.wait(timeout=timeout):
-                raise TimeoutError(f"Command timed out after {timeout}s: {cmd}")
-            return result_holder[0]
-        finally:
-            conn.close()
+        """Execute a shell command via the guest agent. Returns structured result."""
+        resp = _get_client().exec_command(self._vm_id, cmd, timeout=timeout)
+        result = CommandResult.from_response(resp)
+        if on_stdout:
+            for line in result.stdout.split("\n"):
+                on_stdout(line)
+        return result
 
 
 class Sandbox:
@@ -204,6 +184,33 @@ class Sandbox:
     def set_timeout(self, timeout_seconds: float, policy: str = "kill") -> None:
         """Set auto-cleanup timeout for this sandbox."""
         _get_client().set_timeout(self._id, timeout_seconds, policy)
+
+    # ── New high-level methods ──────────────────────────────────────────────
+
+    def run_command(self, cmd: str, timeout: float = 60) -> CommandResult:
+        """Run a shell command. Returns structured result."""
+        return self._commands.run(cmd, timeout=timeout)
+
+    def run_code(self, code: str, runtime: str | None = None, timeout: float = 60) -> CommandResult:
+        """Execute code with auto-detected runtime (python/node)."""
+        resp = _get_client().run_code(self._id, code, runtime=runtime, timeout=timeout)
+        return CommandResult.from_response(resp)
+
+    # ── Filesystem methods ──────────────────────────────────────────────────
+
+    def read_file(self, path: str) -> bytes:
+        """Read a file from the sandbox."""
+        return _get_client().read_file(self._id, path)
+
+    def write_file(self, path: str, content: bytes | str, mode: str = "0644") -> None:
+        """Write a file to the sandbox."""
+        if isinstance(content, str):
+            content = content.encode()
+        _get_client().write_file(self._id, path, content, mode)
+
+    def list_files(self, path: str = "/") -> list[dict]:
+        """List files in a directory."""
+        return _get_client().list_files(self._id, path)
 
     def _fetch(self) -> dict | None:
         return _get_client().get(self._id)

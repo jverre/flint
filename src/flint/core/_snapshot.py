@@ -1,12 +1,12 @@
 import os
 import shutil
-import socket
 import subprocess
 import time
+import urllib.request
 
 from .config import (
     log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
-    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, TCP_PORT, DATA_DIR,
+    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, DATA_DIR,
 )
 from ._netns import _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _enter_netns, _restore_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok
@@ -32,7 +32,7 @@ def create_golden_snapshot(
     ns_name: str = GOLDEN_NS,
     tap_name: str = GOLDEN_TAP,
 ) -> None:
-    """Boot a VM, wait for READY, pause, snapshot, store as golden.
+    """Boot a VM, wait for READY, verify agent health, pause, snapshot, store as golden.
 
     Parameters are configurable to support per-template snapshots.
     """
@@ -97,41 +97,45 @@ def create_golden_snapshot(
                 break
     log.info("Golden VM ready (%.0f ms)", (time.monotonic() - t0) * 1000)
 
-    # 7. Verify TCP listener and warm up pre-spawned shell
-    t0_tcp = time.monotonic()
+    # 7. Verify flintd agent health and warm up
+    t0_agent = time.monotonic()
+    agent_url = f"http://{GUEST_IP}:{AGENT_PORT}"
     orig_fd = _enter_netns(ns_name)
     connected = False
+    last_err = None
     try:
-        for attempt in range(100):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        for attempt in range(300):
             try:
-                sock.settimeout(2.0)
-                sock.connect((GUEST_IP, TCP_PORT))
-                # Drain initial shell prompt
-                try:
-                    sock.recv(4096)
-                except socket.timeout:
-                    pass
-                # Send a command to fully warm up the shell
-                sock.sendall(b'echo WARM\n')
-                try:
-                    sock.recv(4096)
-                except socket.timeout:
-                    pass
-                sock.close()
-                connected = True
-                log.info("Shell warm-up complete (%.0f ms, attempt %d)",
-                         (time.monotonic() - t0_tcp) * 1000, attempt + 1)
-                break
-            except (ConnectionRefusedError, TimeoutError, OSError):
-                sock.close()
-                time.sleep(0.01)
+                req = urllib.request.Request(f"{agent_url}/health", method="GET")
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    if resp.status == 200:
+                        connected = True
+                        log.info("Agent health OK (%.0f ms, attempt %d)",
+                                 (time.monotonic() - t0_agent) * 1000, attempt + 1)
+                        break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.02)
+
+        # Warm up with a simple exec (best-effort, don't fail on error)
+        if connected:
+            import json
+            exec_body = json.dumps({"cmd": ["/bin/sh", "-c", "echo WARM"], "timeout": 5}).encode()
+            exec_req = urllib.request.Request(f"{agent_url}/exec", data=exec_body, method="POST")
+            exec_req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(exec_req, timeout=5.0) as exec_resp:
+                    result = exec_resp.read()
+                    log.info("Agent warm-up exec result: %s", result.decode(errors="replace"))
+            except Exception as e:
+                log.warning("Agent warm-up exec failed (non-fatal): %s", e)
     finally:
         _restore_netns(orig_fd)
     if not connected:
+        log.error("Agent unreachable after %.0f ms, last error: %s",
+                  (time.monotonic() - t0_agent) * 1000, last_err)
         _golden_cleanup(process, ns_name, vm_dir)
-        raise TimeoutError("Golden VM TCP listener not reachable")
+        raise TimeoutError(f"Golden VM flintd agent not reachable: {last_err}")
 
     # 8. Pause
     resp = _fc_patch(socket_path, "/vm", {"state": "Paused"})

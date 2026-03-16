@@ -100,6 +100,52 @@ class DaemonClient:
         if conn:
             conn.close()
 
+    # ── Command execution ──────────────────────────────────────────────────
+
+    def exec_command(self, vm_id: str, command: str | list[str], timeout: float = 60) -> dict:
+        """Execute a command in the VM via the guest agent. Returns {stdout, stderr, exit_code}."""
+        if isinstance(command, str):
+            cmd = ["/bin/sh", "-c", command]
+        else:
+            cmd = command
+        resp = self._http.post(
+            f"/vms/{vm_id}/exec",
+            json={"cmd": cmd, "timeout": int(timeout)},
+            timeout=timeout + 10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def run_code(self, vm_id: str, code: str, runtime: str | None = None, timeout: float = 60) -> dict:
+        """Execute code in the VM. Returns {stdout, stderr, exit_code}."""
+        if runtime is None:
+            runtime = "python3"
+        cmd = [runtime, "-c", code]
+        return self.exec_command(vm_id, cmd, timeout=timeout)
+
+    # ── Filesystem operations ──────────────────────────────────────────────
+
+    def read_file(self, vm_id: str, path: str) -> bytes:
+        """Read a file from the VM."""
+        resp = self._http.get(f"/vms/{vm_id}/files", params={"path": path})
+        resp.raise_for_status()
+        return resp.content
+
+    def write_file(self, vm_id: str, path: str, content: bytes, mode: str = "0644") -> None:
+        """Write a file to the VM."""
+        resp = self._http.post(
+            f"/vms/{vm_id}/files",
+            params={"path": path, "mode": mode},
+            content=content,
+        )
+        resp.raise_for_status()
+
+    def list_files(self, vm_id: str, path: str) -> list[dict]:
+        """List files in a directory on the VM."""
+        resp = self._http.get(f"/vms/{vm_id}/files/list", params={"path": path})
+        resp.raise_for_status()
+        return resp.json()["entries"]
+
     # ── Sandbox lifecycle ────────────────────────────────────────────────
 
     def pause(self, vm_id: str) -> None:

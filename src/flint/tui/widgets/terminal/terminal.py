@@ -179,7 +179,7 @@ class Terminal(Vertical):
             pty_session.send_input("\n")
 
         self._render_full(vm_data)
-        if vm_data.get("tcp_connected") and self._emulator:
+        if vm_data.get("agent_healthy") and self._emulator:
             cursor_line = self._get_cursor_line()
             if PROMPT_PATTERN.search(cursor_line):
                 self._set_idle(cursor_line)
@@ -220,7 +220,7 @@ class Terminal(Vertical):
         for line in vm_data.get("log_lines", []):
             log_widget.write(line)
         self._lines_written = vm_data.get("line_count", 0)
-        if vm_data.get("tcp_connected") and self._emulator:
+        if vm_data.get("agent_healthy") and self._emulator:
             self._render_screen(log_widget)
             self._last_screen_version = self._emulator.version
 
@@ -271,7 +271,7 @@ class Terminal(Vertical):
 
         self._render_log_and_screen(vm_data, self.query_one("#vm-log", RichLog))
 
-        if vm_data.get("tcp_connected") and self._emulator:
+        if vm_data.get("agent_healthy") and self._emulator:
             cursor_line = self._get_cursor_line()
             if PROMPT_PATTERN.search(cursor_line):
                 self._set_idle(cursor_line)
@@ -294,9 +294,9 @@ class Terminal(Vertical):
         ready_str = f"{ready_ms:.0f}ms" if ready_ms is not None else "-"
 
         state = vm_data.get("state", "")
-        tcp_connected = vm_data.get("tcp_connected", False)
+        agent_healthy = vm_data.get("agent_healthy", False)
 
-        if state == "Started" and tcp_connected:
+        if state == "Started" and agent_healthy:
             icon = "[bold green]\u25cf[/]"
             status_text = "Connected"
         elif state == "Error":

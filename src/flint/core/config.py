@@ -23,7 +23,7 @@ BOOT_ARGS = "console=ttyS0 quiet loglevel=0 reboot=k panic=1 pci=off random.trus
 GUEST_MAC = "06:00:AC:10:00:02"
 HOST_TAP_MAC = "06:00:AC:10:00:01"
 
-TCP_PORT = 5000
+AGENT_PORT = 5000
 GUEST_IP = "172.16.0.2"
 HOST_IP = "172.16.0.1"
 

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
-import socket
 import threading
 import time
+import urllib.request
 from typing import TYPE_CHECKING
 
 from .config import log, GOLDEN_DIR, GOLDEN_TAP, GUEST_IP, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
 from ._boot import _boot_from_snapshot, _teardown_vm, BootResult
+from ._netns import _enter_netns, _restore_netns
 from ._snapshot import golden_snapshot_exists
 from ._template_registry import template_snapshot_exists as _template_snapshot_exists
-from ._tcp import _read_tcp_output
 
 if TYPE_CHECKING:
     from ._state_store import StateStore
@@ -43,17 +44,14 @@ class SandboxManager:
         )
 
         vm_id = boot.vm_id
-        sock = boot.tcp_socket
+        agent_url = boot.agent_url
 
-        # Send initial command to measure time-to-interactive
+        # Warmup: send a quick exec to measure time-to-interactive
         t0 = time.monotonic()
-        sock.sendall(b'echo benchmark\n')
-        sock.settimeout(5.0)
         try:
-            sock.recv(4096)
-        except socket.timeout:
+            self._agent_exec(boot.ns_name, agent_url, ["echo", "benchmark"], timeout=5)
+        except Exception:
             pass
-        sock.settimeout(None)
         boot.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
 
         entry = _SandboxEntry(
@@ -64,8 +62,8 @@ class SandboxManager:
             socket_path=boot.socket_path,
             ns_name=boot.ns_name,
             guest_ip=GUEST_IP,
-            tcp_socket=sock,
-            tcp_connected=True,
+            agent_url=agent_url,
+            agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=template_id,
             t_instance_start=boot.t_total,
@@ -91,12 +89,6 @@ class SandboxManager:
                 timings_json=boot.timings,
             )
 
-        threading.Thread(
-            target=_read_tcp_output,
-            args=(sock, entry.dispatch_output, lambda: self._on_disconnect(vm_id)),
-            daemon=True,
-        ).start()
-
         total_ms = (time.monotonic() - boot.t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
         log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
@@ -109,11 +101,6 @@ class SandboxManager:
         if not entry:
             return
 
-        if entry.tcp_socket:
-            try:
-                entry.tcp_socket.close()
-            except OSError:
-                pass
         _teardown_vm(entry.process, entry.ns_name, entry.vm_dir)
 
         if self._state_store:
@@ -145,14 +132,7 @@ class SandboxManager:
             _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
             raise RuntimeError(f"Snapshot create failed: {resp}")
 
-        # 3. Close TCP socket
-        if entry.tcp_socket:
-            try:
-                entry.tcp_socket.close()
-            except OSError:
-                pass
-
-        # 4. Kill Firecracker process (snapshot is on disk)
+        # 3. Kill Firecracker process (snapshot is on disk)
         if entry.process:
             entry.process.kill()
             try:
@@ -160,18 +140,17 @@ class SandboxManager:
             except Exception:
                 pass
 
-        # 5. Update state
+        # 4. Update state
         entry.state = SandboxState.PAUSED
-        entry.tcp_connected = False
-        entry.tcp_socket = None
+        entry.agent_healthy = False
         entry.process = None
 
-        # 6. Persist
+        # 5. Persist
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.PAUSED)
             self._state_store.set_pause_snapshot(sandbox_id, entry.vm_dir)
 
-        # 7. Remove from in-memory dict (no active process to track)
+        # 6. Remove from in-memory dict (no active process to track)
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
 
@@ -179,7 +158,7 @@ class SandboxManager:
 
     def resume(self, sandbox_id: str) -> str:
         """Resume a paused sandbox from its snapshot."""
-        from ._firecracker import _fc_put, _fc_patch, _fc_status_ok, _wait_for_api_socket, _tcp_connect
+        from ._firecracker import _fc_put, _fc_patch, _fc_status_ok, _wait_for_api_socket, _wait_for_agent
         from ._netns import _popen_in_ns
         import subprocess as _subprocess
 
@@ -227,8 +206,8 @@ class SandboxManager:
             # 4. Resume VM
             _fc_patch(socket_path, "/vm", {"state": "Resumed"})
 
-            # 5. Reconnect TCP
-            tcp_sock = _tcp_connect(ns_name)
+            # 5. Wait for guest agent
+            agent_url = _wait_for_agent(ns_name)
         except Exception:
             process.kill()
             try:
@@ -246,8 +225,8 @@ class SandboxManager:
             socket_path=socket_path,
             ns_name=ns_name,
             guest_ip=GUEST_IP,
-            tcp_socket=tcp_sock,
-            tcp_connected=True,
+            agent_url=agent_url,
+            agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
         )
@@ -259,13 +238,6 @@ class SandboxManager:
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
             self._state_store.update_sandbox(sandbox_id, pid=process.pid, daemon_pid=os.getpid())
-
-        # 8. Start TCP output reader
-        threading.Thread(
-            target=_read_tcp_output,
-            args=(tcp_sock, entry.dispatch_output, lambda: self._on_disconnect(sandbox_id)),
-            daemon=True,
-        ).start()
 
         log.debug("[%s] resumed", sandbox_id[:8])
         return sandbox_id
@@ -291,7 +263,7 @@ class SandboxManager:
         return entry.to_dict()
 
     def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
-        """Return the raw entry for a VM (for subscribe/send_raw). None if not found."""
+        """Return the raw entry for a VM. None if not found."""
         with self._lock:
             return self._sandboxes.get(sandbox_id)
 
@@ -300,8 +272,17 @@ class SandboxManager:
         with self._lock:
             return list(self._sandboxes.keys())
 
-    def _on_disconnect(self, sandbox_id: str) -> None:
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-            if entry:
-                entry.tcp_connected = False
+    @staticmethod
+    def _agent_exec(ns_name: str, agent_url: str, cmd: list[str], timeout: float = 60) -> dict:
+        """Execute a command on the guest agent via HTTP, entering the namespace."""
+        body = json.dumps({"cmd": cmd, "timeout": int(timeout)}).encode()
+        url = f"{agent_url}/exec"
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+
+        orig_fd = _enter_netns(ns_name)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+                return json.loads(resp.read())
+        finally:
+            _restore_netns(orig_fd)

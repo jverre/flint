@@ -10,11 +10,9 @@ from dataclasses import dataclass, field
 
 from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID, DATA_DIR
 from ._netns import _ns_name, _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _setup_netns_subprocess
-from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _tcp_connect
+from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _wait_for_agent
 from ._pool import _claim_pool_entry
 from ._template_registry import get_template_dir
-
-import socket as _socket_mod
 
 
 @dataclass
@@ -24,7 +22,7 @@ class BootResult:
     socket_path: str
     ns_name: str
     process: subprocess.Popen
-    tcp_socket: _socket_mod.socket
+    agent_url: str
     timings: dict[str, float] = field(default_factory=dict)
     t_total: float = 0.0
 
@@ -82,7 +80,7 @@ def _boot_from_snapshot(
     use_pyroute2: bool = True,
     network_overrides: list[dict] | None = None,
 ) -> BootResult:
-    """Boot a VM from a template snapshot. Returns dict with VM info.
+    """Boot a VM from a template snapshot. Returns BootResult.
 
     On failure, cleans up all resources and raises.
     On success, caller owns the process/netns/dir and must clean up.
@@ -149,9 +147,9 @@ def _boot_from_snapshot(
         with _timed(timings, "api_resume_ms"):
             _fc_patch(socket_path, "/vm", {"state": "Resumed"})
 
-        # 8. TCP connect
-        with _timed(timings, "tcp_connect_ms"):
-            tcp_sock = _tcp_connect(ns_name)
+        # 8. Wait for guest agent
+        with _timed(timings, "agent_connect_ms"):
+            agent_url = _wait_for_agent(ns_name)
 
         total_ms = (time.monotonic() - t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in timings.items())
@@ -159,7 +157,7 @@ def _boot_from_snapshot(
 
         return BootResult(
             vm_id=vm_id, vm_dir=vm_dir, socket_path=socket_path,
-            ns_name=ns_name, process=process, tcp_socket=tcp_sock,
+            ns_name=ns_name, process=process, agent_url=agent_url,
             timings=timings, t_total=t_total,
         )
 

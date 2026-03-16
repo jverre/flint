@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import threading
 
-from .config import log, GUEST_IP, DEFAULT_TEMPLATE_ID
+from .config import log, GUEST_IP, AGENT_PORT, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
 from ._boot import _RecoveredProcess, _teardown_vm
 from ._netns import _delete_netns
-from ._firecracker import _fc_request, _tcp_connect
-from ._tcp import _read_tcp_output
+from ._firecracker import _fc_request, _wait_for_agent
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -98,14 +96,13 @@ class RecoveryEngine:
         vm_id = row["vm_id"]
         pid = row["pid"]
         ns_name = row["ns_name"]
-        socket_path = row["socket_path"]
         vm_dir = row["vm_dir"]
         sid = vm_id[:8]
 
         try:
-            tcp_sock = _tcp_connect(ns_name)
+            agent_url = _wait_for_agent(ns_name, retries=50)
         except Exception:
-            log.warning("[%s] reclaim: TCP connect failed, treating as dead", sid)
+            log.warning("[%s] reclaim: agent health check failed, treating as dead", sid)
             self._cleanup_dead(row)
             return
 
@@ -115,23 +112,17 @@ class RecoveryEngine:
             process=process_shim,
             pid=pid,
             vm_dir=vm_dir,
-            socket_path=socket_path,
+            socket_path=row["socket_path"],
             ns_name=ns_name,
             guest_ip=GUEST_IP,
-            tcp_socket=tcp_sock,
-            tcp_connected=True,
+            agent_url=agent_url,
+            agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
         )
 
         with self._manager._lock:
             self._manager._sandboxes[vm_id] = entry
-
-        threading.Thread(
-            target=_read_tcp_output,
-            args=(tcp_sock, entry.dispatch_output, lambda: self._manager._on_disconnect(vm_id)),
-            daemon=True,
-        ).start()
 
         self._store.update_sandbox(vm_id, daemon_pid=daemon_pid)
         log.info("[%s] reclaimed (pid=%d)", sid, pid)

@@ -7,8 +7,10 @@ import shutil
 import signal
 import threading
 import time
+import urllib.parse
+import urllib.request
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 import uvicorn
 
 from flint.core.config import (
@@ -19,7 +21,7 @@ from flint.core.config import (
 from flint.core.manager import SandboxManager
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
 from flint.core._pool import start_pool, stop_pool
-from flint.core._netns import _ensure_bridge
+from flint.core._netns import _ensure_bridge, _enter_netns, _restore_netns
 from flint.core._template_registry import (
     list_templates, get_template, register_template, delete_template as _delete_template,
     get_template_dir,
@@ -45,6 +47,15 @@ def _require_manager() -> SandboxManager:
     return daemon.manager
 
 
+def _require_entry(vm_id: str):
+    """Get a sandbox entry or raise 404."""
+    mgr = _require_manager()
+    entry = mgr.get_entry(vm_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="VM not found")
+    return entry
+
+
 def _write_state(daemon: FlintDaemon) -> None:
     """Atomically write daemon state to JSON file."""
     state = {
@@ -60,6 +71,34 @@ def _write_state(daemon: FlintDaemon) -> None:
     with open(tmp_path, "w") as f:
         json.dump(state, f)
     os.rename(tmp_path, DAEMON_STATE_PATH)
+
+
+def _agent_request(entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
+    """Make an HTTP request to the guest agent inside the VM's network namespace.
+
+    IMPORTANT: Uses setns which only affects the calling kernel thread.
+    Safe to call from worker threads but NOT from the async event loop thread directly.
+    For async endpoints, use _agent_request_async instead.
+    """
+    url = f"{entry.agent_url}{path}"
+    req = urllib.request.Request(url, data=body, method=method)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+
+    orig_fd = _enter_netns(entry.ns_name)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    finally:
+        _restore_netns(orig_fd)
+
+
+async def _agent_request_async(entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
+    """Async wrapper: runs _agent_request in a thread pool to avoid setns on the event loop thread."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _agent_request, entry, method, path, body, timeout)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -154,8 +193,116 @@ def patch_vm(vm_id: str, body: dict):
     return {"ok": True}
 
 
+# ── Guest agent proxy endpoints ───────────────────────────────────────────
+
+@app.post("/vms/{vm_id}/exec")
+async def exec_command(vm_id: str, request: Request):
+    """Proxy POST /exec to the guest agent."""
+    print(f"POST /vms/{vm_id[:8]}/exec")
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", "/exec", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.post("/vms/{vm_id}/processes")
+async def create_process(vm_id: str, request: Request):
+    """Proxy POST /processes to the guest agent."""
+    print(f"POST /vms/{vm_id[:8]}/processes")
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", "/processes", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.get("/vms/{vm_id}/processes")
+async def list_processes(vm_id: str):
+    """Proxy GET /processes to the guest agent."""
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "GET", "/processes")
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.post("/vms/{vm_id}/processes/{pid}/input")
+async def process_input(vm_id: str, pid: int, request: Request):
+    """Proxy stdin input to a guest process."""
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/input", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.post("/vms/{vm_id}/processes/{pid}/signal")
+async def process_signal(vm_id: str, pid: int, request: Request):
+    """Proxy signal to a guest process."""
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/signal", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.post("/vms/{vm_id}/processes/{pid}/resize")
+async def process_resize(vm_id: str, pid: int, request: Request):
+    """Proxy resize to a guest process."""
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/resize", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+# ── Filesystem proxy endpoints ───────────────────────────────────────────
+
+@app.get("/vms/{vm_id}/files")
+async def read_file(vm_id: str, path: str):
+    """Proxy GET /files to the guest agent."""
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "GET", f"/files?path={urllib.parse.quote(path, safe='/')}")
+    media = "application/octet-stream" if status == 200 else "application/json"
+    return Response(content=resp_body, status_code=status, media_type=media)
+
+
+@app.post("/vms/{vm_id}/files")
+async def write_file(vm_id: str, path: str, request: Request, mode: str = "0644"):
+    """Proxy POST /files to the guest agent."""
+    entry = _require_entry(vm_id)
+    body = await request.body()
+    status, resp_body = await _agent_request_async(entry, "POST", f"/files?path={urllib.parse.quote(path, safe='/')}&mode={mode}", body)
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.get("/vms/{vm_id}/files/stat")
+async def stat_file(vm_id: str, path: str):
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "GET", f"/files/stat?path={urllib.parse.quote(path, safe='/')}")
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.get("/vms/{vm_id}/files/list")
+async def list_files(vm_id: str, path: str):
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "GET", f"/files/list?path={urllib.parse.quote(path, safe='/')}")
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.post("/vms/{vm_id}/files/mkdir")
+async def mkdir(vm_id: str, path: str, parents: bool = True):
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "POST", f"/files/mkdir?path={urllib.parse.quote(path, safe='/')}&parents={'true' if parents else 'false'}")
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+@app.delete("/vms/{vm_id}/files")
+async def delete_file(vm_id: str, path: str, recursive: bool = False):
+    entry = _require_entry(vm_id)
+    status, resp_body = await _agent_request_async(entry, "DELETE", f"/files?path={urllib.parse.quote(path, safe='/')}&recursive={'true' if recursive else 'false'}")
+    return Response(content=resp_body, status_code=status, media_type="application/json")
+
+
+# ── Terminal WebSocket ────────────────────────────────────────────────────
+
 @app.websocket("/vms/{vm_id}/terminal")
 async def terminal_ws(websocket: WebSocket, vm_id: str):
+    """Interactive terminal: creates a PTY process on the guest and bridges I/O."""
     print(f"WS /vms/{vm_id[:8]}/terminal — connecting")
     daemon = _get_daemon()
     if not daemon.manager:
@@ -170,27 +317,87 @@ async def terminal_ws(websocket: WebSocket, vm_id: str):
     await websocket.accept()
     print(f"WS /vms/{vm_id[:8]}/terminal — accepted")
 
-    loop = asyncio.get_event_loop()
+    # Start a PTY process on the guest agent
+    try:
+        create_body = json.dumps({
+            "cmd": ["/bin/sh", "-i"],
+            "pty": True,
+            "cols": 120,
+            "rows": 40,
+        }).encode()
+        status, resp_body = await _agent_request_async(entry, "POST", "/processes", create_body)
+        if status != 201:
+            print(f"WS /vms/{vm_id[:8]}/terminal — PTY create failed: {resp_body}")
+            await websocket.close(code=1011, reason="Failed to create PTY process")
+            return
+        proc_info = json.loads(resp_body)
+        guest_pid = proc_info["pid"]
+    except Exception as e:
+        log.exception("Failed to create guest PTY process")
+        await websocket.close(code=1011, reason=str(e))
+        return
 
-    def on_output(data: bytes):
+    print(f"WS /vms/{vm_id[:8]}/terminal — guest PTY pid={guest_pid}")
+
+    # Connect to guest WebSocket for output streaming
+    import websockets.sync.client as ws_sync
+    import base64
+
+    loop = asyncio.get_event_loop()
+    closed = False
+
+    def _read_guest_ws():
+        """Background thread: read from guest WS, forward to host WS."""
+        nonlocal closed
         try:
-            asyncio.run_coroutine_threadsafe(
-                websocket.send_bytes(data), loop
-            )
+            orig_fd = _enter_netns(entry.ns_name)
+            try:
+                guest_ws_url = f"ws://{entry.guest_ip}:5000/processes/{guest_pid}/output"
+                guest_ws = ws_sync.connect(guest_ws_url)
+            finally:
+                _restore_netns(orig_fd)
+
+            for message in guest_ws:
+                if closed:
+                    break
+                try:
+                    ev = json.loads(message)
+                    if ev.get("type") in ("stdout", "stderr") and ev.get("data"):
+                        raw = base64.b64decode(ev["data"])
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_bytes(raw), loop
+                        )
+                    elif ev.get("type") == "exit":
+                        break
+                except Exception:
+                    pass
+            guest_ws.close()
         except Exception:
             pass
 
-    entry.subscribe_output(on_output)
+    reader_thread = threading.Thread(target=_read_guest_ws, daemon=True)
+    reader_thread.start()
+
     try:
         while True:
             data = await websocket.receive_bytes()
-            entry.send_raw(data)
+            # Forward input to guest process
+            try:
+                await _agent_request_async(entry, "POST", f"/processes/{guest_pid}/input", data, timeout=5)
+            except Exception:
+                pass
     except WebSocketDisconnect:
         print(f"WS /vms/{vm_id[:8]}/terminal — client disconnected")
     except Exception:
         log.exception("WS /vms/%s/terminal — error", vm_id[:8])
     finally:
-        entry.unsubscribe_output(on_output)
+        closed = True
+        # Kill the guest shell process
+        try:
+            await _agent_request_async(entry, "POST", f"/processes/{guest_pid}/signal",
+                          json.dumps({"signal": 9}).encode(), timeout=2)
+        except Exception:
+            pass
 
 
 # ── Template endpoints ──────────────────────────────────────────────────────
@@ -361,12 +568,6 @@ class FlintDaemon:
             # Detach from VMs without killing them — they'll be recovered on restart
             if self.manager:
                 with self.manager._lock:
-                    for entry in self.manager._sandboxes.values():
-                        if entry.tcp_socket:
-                            try:
-                                entry.tcp_socket.close()
-                            except OSError:
-                                pass
                     self.manager._sandboxes.clear()
             stop_pool()
             if self._state_store:

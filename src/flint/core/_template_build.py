@@ -46,32 +46,38 @@ def _generate_dockerfile(base_image: str, steps: list[dict], flint_injection: bo
         lines.append("")
         lines.append("# Flint injection (always last)")
         lines.append("RUN apt-get update && apt-get install -y iproute2 || apk add iproute2 || true")
-        lines.append("COPY tcp-relay /usr/local/bin/tcp-relay")
+        lines.append("COPY flintd /usr/local/bin/flintd")
         lines.append("COPY init-net.sh /etc/init-net.sh")
-        lines.append("RUN chmod +x /usr/local/bin/tcp-relay /etc/init-net.sh")
+        lines.append("RUN chmod +x /usr/local/bin/flintd /etc/init-net.sh")
 
     return "\n".join(lines) + "\n"
 
 
-def _compile_tcp_relay(output_path: str) -> None:
-    """Compile guest/tcp-relay.c with musl-gcc, or fall back to assets/ pre-built binary."""
+def _build_flintd(output_path: str) -> None:
+    """Build flintd Go binary, or fall back to assets/ pre-built binary."""
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    prebuilt = os.path.join(project_root, "assets", "tcp-relay")
+    prebuilt = os.path.join(project_root, "assets", "flintd")
     if os.path.exists(prebuilt):
         shutil.copy2(prebuilt, output_path)
-        log.info("Using pre-built tcp-relay from assets/")
+        log.info("Using pre-built flintd from assets/")
         return
 
-    source = os.path.join(project_root, "guest", "tcp-relay.c")
-    if not os.path.exists(source):
-        raise FileNotFoundError(f"tcp-relay source not found: {source}")
+    source_dir = os.path.join(project_root, "guest", "flintd")
+    if not os.path.isdir(source_dir):
+        raise FileNotFoundError(f"flintd source not found: {source_dir}")
 
+    env = os.environ.copy()
+    env["CGO_ENABLED"] = "0"
+    env["GOOS"] = "linux"
+    env["GOARCH"] = "amd64"
     subprocess.run(
-        ["musl-gcc", "-static", "-O2", "-o", output_path, source],
+        ["go", "build", "-ldflags=-s -w", "-o", output_path, "."],
+        cwd=source_dir,
         check=True,
         capture_output=True,
+        env=env,
     )
-    log.info("Compiled tcp-relay from %s", source)
+    log.info("Built flintd from %s", source_dir)
 
 
 def _find_init_net_sh() -> str:
@@ -161,8 +167,8 @@ def build_template(
         context_dir = f"/tmp/flint-build-{template_id}"
         os.makedirs(context_dir, exist_ok=True)
 
-        # Copy tcp-relay binary and init-net.sh into context
-        _compile_tcp_relay(os.path.join(context_dir, "tcp-relay"))
+        # Copy flintd binary and init-net.sh into context
+        _build_flintd(os.path.join(context_dir, "flintd"))
         init_net = _find_init_net_sh()
         shutil.copy2(init_net, os.path.join(context_dir, "init-net.sh"))
 

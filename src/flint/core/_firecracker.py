@@ -1,8 +1,9 @@
 import json
 import socket
 import time
+import urllib.request
 
-from .config import log, GUEST_IP, TCP_PORT
+from .config import log, GUEST_IP, AGENT_PORT
 from ._netns import _enter_netns, _restore_netns
 
 
@@ -59,8 +60,27 @@ def _wait_for_api_socket(socket_path: str, timeout: float = 5.0) -> None:
             s.close()
 
 
+def _wait_for_agent(ns_name: str, retries: int = 500) -> str:
+    """Wait for flintd guest agent to become healthy. Returns agent_url."""
+    agent_url = f"http://{GUEST_IP}:{AGENT_PORT}"
+    health_url = f"{agent_url}/health"
+    orig_fd = _enter_netns(ns_name)
+    try:
+        for _ in range(retries):
+            try:
+                req = urllib.request.Request(health_url, method="GET")
+                with urllib.request.urlopen(req, timeout=0.1) as resp:
+                    if resp.status == 200:
+                        return agent_url
+            except Exception:
+                time.sleep(0.001)
+        raise TimeoutError(f"Agent health check failed after {retries} attempts")
+    finally:
+        _restore_netns(orig_fd)
+
+
 def _tcp_connect(ns_name: str, retries: int = 500) -> socket.socket:
-    """Connect to guest TCP port inside the namespace. Raises on failure."""
+    """Legacy: Connect to guest TCP port inside the namespace. Raises on failure."""
     orig_fd = _enter_netns(ns_name)
     try:
         for _ in range(retries):
@@ -68,7 +88,7 @@ def _tcp_connect(ns_name: str, retries: int = 500) -> socket.socket:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 sock.settimeout(0.05)
-                sock.connect((GUEST_IP, TCP_PORT))
+                sock.connect((GUEST_IP, AGENT_PORT))
                 sock.settimeout(None)
                 return sock
             except (ConnectionRefusedError, TimeoutError, OSError):

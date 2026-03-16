@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import enum
 import subprocess
-import socket
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable
 
 
 class SandboxState(enum.Enum):
@@ -47,8 +44,8 @@ class _SandboxEntry:
     socket_path: str
     ns_name: str
     guest_ip: str
-    tcp_socket: socket.socket | None
-    tcp_connected: bool
+    agent_url: str
+    agent_healthy: bool
     state: SandboxState
     template_id: str = "default"
     screen_version: int = 0
@@ -59,41 +56,15 @@ class _SandboxEntry:
     created_at: float = field(default_factory=time.time)
     log_lines: deque = field(default_factory=lambda: deque(maxlen=100))
     line_count: int = 0
-    _output_callbacks: list[Callable[[bytes], None]] = field(default_factory=list)
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def send_raw(self, data: str | bytes) -> None:
-        if not self.tcp_connected or not self.tcp_socket:
-            return
-        if isinstance(data, str):
-            data = data.encode()
-        self.tcp_socket.sendall(data)
-
-    def subscribe_output(self, cb: Callable[[bytes], None]) -> None:
-        with self._lock:
-            self._output_callbacks.append(cb)
-
-    def unsubscribe_output(self, cb: Callable[[bytes], None]) -> None:
-        with self._lock:
-            try:
-                self._output_callbacks.remove(cb)
-            except ValueError:
-                pass
-
-    def dispatch_output(self, data: bytes) -> None:
-        with self._lock:
-            cbs = list(self._output_callbacks)
-        for cb in cbs:
-            cb(data)
 
     def to_dict(self) -> dict:
-        """Return JSON-serializable representation (excludes process, socket, lock, callbacks)."""
+        """Return JSON-serializable representation."""
         return {
             "vm_id": self.vm_id,
             "pid": self.pid,
             "state": _STATE_API_NAMES.get(self.state, str(self.state)),
             "template_id": self.template_id,
-            "tcp_connected": self.tcp_connected,
+            "agent_healthy": self.agent_healthy,
             "created_at": self.created_at,
             "boot_time_ms": self.boot_time_ms,
             "ready_time_ms": self.ready_time_ms,

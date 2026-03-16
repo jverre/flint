@@ -113,6 +113,89 @@ def test_pty_session(sandbox):
         pty.kill()
 
 
+# ── Concurrent execution ─────────────────────────────────────────────────────
+
+
+def test_concurrent_commands(sandbox):
+    """Run 5 commands in parallel on the same sandbox."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(sandbox.commands.run, f"echo {i}"): i for i in range(5)}
+        results = {}
+        for f in concurrent.futures.as_completed(futures):
+            i = futures[f]
+            results[i] = f.result()
+
+    for i in range(5):
+        assert results[i].exit_code == 0
+        assert str(i) in results[i].stdout
+
+
+def test_concurrent_commands_isolation(sandbox):
+    """Concurrent commands get independent stdout/stderr."""
+    import concurrent.futures
+
+    def slow_cmd(n):
+        # Use sleep 1 (busybox doesn't support fractional seconds)
+        return sandbox.commands.run(f"sleep 1 && echo result-{n}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(slow_cmd, i) for i in range(3)]
+        results = [f.result() for f in futures]
+
+    for i, r in enumerate(results):
+        assert r.exit_code == 0
+        assert f"result-{i}" in r.stdout
+
+
+def test_stderr_separate(sandbox):
+    """Verify stderr is captured separately from stdout."""
+    result = sandbox.commands.run("echo out && echo err >&2")
+    assert result.exit_code == 0
+    assert "out" in result.stdout
+    assert "err" in result.stderr
+
+
+# ── Filesystem operations ────────────────────────────────────────────────────
+
+
+def test_write_and_read_file(sandbox):
+    """Write a file via SDK, read it back."""
+    sandbox.write_file("/tmp/test.txt", "hello flintd")
+    data = sandbox.read_file("/tmp/test.txt")
+    assert data == b"hello flintd"
+
+
+def test_list_files(sandbox):
+    """List files in a directory."""
+    sandbox.commands.run("touch /tmp/a.txt /tmp/b.txt")
+    entries = sandbox.list_files("/tmp")
+    names = [e["name"] for e in entries]
+    assert "a.txt" in names
+    assert "b.txt" in names
+
+
+# ── run_command / run_code ───────────────────────────────────────────────────
+
+
+def test_run_command(sandbox):
+    """Test the high-level run_command method."""
+    result = sandbox.run_command("echo hi")
+    assert result.exit_code == 0
+    assert "hi" in result.stdout
+
+
+def test_run_code_python(sandbox):
+    """Test run_code with Python — returns error if runtime unavailable."""
+    result = sandbox.run_code("print(1 + 2)", runtime="python3")
+    if result.exit_code == 0:
+        assert "3" in result.stdout
+    else:
+        # python3 not installed in Alpine base image — should get 127 (not found)
+        assert result.exit_code == 127
+
+
 # ── Multiple sandboxes ───────────────────────────────────────────────────────
 
 
