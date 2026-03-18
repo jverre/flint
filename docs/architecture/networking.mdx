@@ -1,0 +1,51 @@
+---
+title: "Networking"
+description: "How sandboxes connect to the host and the internet."
+---
+
+Each sandbox gets its own network namespace. This provides isolation - sandboxes can't talk to each other directly - while still allowing internet access through NAT on the host.
+
+## The network stack
+
+```
+Internet
+    |
+  Host eth0 (NAT via iptables)
+    |
+  br-flint bridge (10.0.0.1/24)
+    |
+  ┌──────────────────────────────────┐
+  │ Network namespace: fc-{vm_id}    │
+  │                                  │
+  │  veth-host (10.0.0.X)            │
+  │        │                         │
+  │  TAP device (tap0)               │
+  │        │                         │
+  │  VM eth0 (172.16.0.2)            │
+  │  guest agent on 172.16.0.2:5000  │
+  └──────────────────────────────────┘
+```
+
+A few things worth explaining here:
+
+- **`br-flint`** is a Linux bridge on the host. Think of it as a virtual switch. All sandbox network namespaces connect to it.
+- Each sandbox gets a **veth pair** - one end inside its network namespace, one end attached to the bridge.
+- Inside the namespace there's a **TAP device** that the VM uses for its network interface.
+- The VM's guest IP is `172.16.0.2`. The host-side address inside the namespace is `172.16.0.1`.
+- VMs get an address in the `10.0.0.0/24` range for their outbound traffic.
+
+## How the daemon reaches flintd
+
+When the daemon needs to call `flintd` (to run a command, read a file, etc.), it enters the sandbox's network namespace using `nsenter` or `ip netns exec`. From inside the namespace it can reach the VM at `172.16.0.2:5000`.
+
+This is why the guest agent is not directly accessible from outside the Flint daemon - it's only reachable from within the network namespace.
+
+## Internet access
+
+If `allow_internet_access=True` (the default), the daemon sets up iptables NAT rules so traffic from the VM can reach the internet through the host's default route.
+
+If you set `allow_internet_access=False`, the VM is fully isolated - no inbound or outbound internet.
+
+## Implementation
+
+Networking is set up in `src/flint/core/_netns.py`. By default Flint uses [pyroute2](https://pyroute2.org/) to create and configure the namespace, but you can fall back to shell commands with `use_pyroute2=False` if pyroute2 isn't available.

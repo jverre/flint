@@ -47,6 +47,7 @@ class _SandboxEntry:
     agent_url: str
     agent_healthy: bool
     state: SandboxState
+    chroot_base: str = ""
     template_id: str = "default"
     screen_version: int = 0
     t_instance_start: float = 0.0

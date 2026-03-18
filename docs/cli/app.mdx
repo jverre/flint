@@ -1,0 +1,40 @@
+---
+title: "flint app"
+description: "Open the interactive TUI."
+---
+
+`flint app` opens Flint's terminal UI - a split-pane interface where you can manage sandboxes and interact with their terminals directly.
+
+The TUI requires a running daemon (`flint start`).
+
+## Usage
+
+```bash
+flint app
+```
+
+## Layout
+
+The TUI has two panes:
+
+- **Sidebar** (left) - list of running sandboxes with their state and age
+- **Terminal** (right) - interactive terminal connected to the selected sandbox
+
+Use `Tab` to move focus between the two panes.
+
+## Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `s` | Start a new sandbox |
+| `Del` | Kill the selected sandbox |
+| `Tab` | Toggle focus between sidebar and terminal |
+| `b` | Run the benchmark suite |
+
+## Terminal
+
+When a sandbox is selected in the sidebar, the right pane connects to its PTY over WebSocket. You get a full interactive shell - you can run commands, use interactive programs, etc.
+
+## Benchmark
+
+Pressing `b` runs a benchmark that measures how long it takes to boot sandboxes and execute commands. Results are displayed in a grid overlay. Useful for checking that your setup is performing as expected.

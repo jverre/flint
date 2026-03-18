@@ -1,0 +1,90 @@
+---
+title: "Templates"
+description: "Build and manage custom sandbox environments."
+---
+
+## Build a template
+
+`POST /templates/build`
+
+Starts a template build in the background and returns immediately. Poll `GET /templates/{template_id}` to check when it's ready.
+
+**Request body**
+
+```json
+{
+  "name": "my-python-env",
+  "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
+  "rootfs_size_mb": 500
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | required | Human-readable name |
+| `dockerfile` | string | required | Full Dockerfile contents |
+| `rootfs_size_mb` | int | `500` | Rootfs image size in MB |
+
+**Response** `200`
+
+```json
+{
+  "template_id": "tpl_abc123",
+  "status": "building"
+}
+```
+
+---
+
+## List templates
+
+`GET /templates`
+
+**Response** `200`
+
+```json
+{
+  "templates": [
+    {"template_id": "default",   "name": "Default",        "status": "ready"},
+    {"template_id": "tpl_abc123","name": "my-python-env",  "status": "ready"}
+  ]
+}
+```
+
+---
+
+## Get template
+
+`GET /templates/{template_id}`
+
+**Response** `200` or `404`
+
+```json
+{
+  "template": {
+    "template_id": "tpl_abc123",
+    "name": "my-python-env",
+    "status": "ready"
+  }
+}
+```
+
+Status values: `"building"`, `"ready"`, `"failed"`
+
+---
+
+## Delete a template
+
+`DELETE /templates/{template_id}`
+
+You can't delete the `"default"` template.
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+**Response** `400` - if you try to delete `"default"`
+
+**Response** `404` - template not found

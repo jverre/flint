@@ -1,0 +1,339 @@
+---
+title: "Sandbox"
+description: "The main interface for creating and managing microVMs."
+---
+
+`Sandbox` is the primary class in the Flint SDK. It represents a single running microVM and gives you access to command execution, file operations, PTY sessions, and lifecycle management.
+
+## Creating a sandbox
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    from flint import Sandbox
+
+    sandbox = Sandbox()
+    ```
+
+    <ParamField path="vm_id" type="str | None" default="None">
+      Pass a VM ID to connect to an existing sandbox. `None` creates a new one.
+    </ParamField>
+
+    <ParamField path="template_id" type="str" default='"default"'>
+      Which template to boot. Use a template ID from `Template.build()` for custom environments.
+    </ParamField>
+
+    <ParamField path="allow_internet_access" type="bool" default="True">
+      Whether the VM can reach the internet.
+    </ParamField>
+
+    <ParamField path="use_pool" type="bool" default="True">
+      Use the pre-copied rootfs pool for faster startup.
+    </ParamField>
+
+    <ParamField path="use_pyroute2" type="bool" default="True">
+      Use pyroute2 for network namespace setup.
+    </ParamField>
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms`
+
+    ```bash
+    curl -X POST "http://localhost:9100/vms?template_id=default"
+    ```
+
+    <ParamField query="template_id" type="string" default='"default"'>
+      Template to boot.
+    </ParamField>
+
+    <ParamField query="allow_internet_access" type="boolean" default="true">
+      Whether the VM can reach the internet.
+    </ParamField>
+
+    <ParamField query="use_pool" type="boolean" default="true">
+      Use pre-copied rootfs pool.
+    </ParamField>
+
+    **Response** `201`
+
+    ```json
+    {
+      "vm": {
+        "vm_id": "3f2a1b4c-...",
+        "pid": 12345,
+        "state": "Running",
+        "template_id": "default",
+        "created_at": 1710000000.0,
+        "ready_time_ms": 87.4,
+        "timings": {
+          "rootfs_copy_ms": 12.4,
+          "netns_setup_ms": 8.1,
+          "snapshot_load_ms": 45.6,
+          "vm_resume_ms": 18.3,
+          "exec_command_ms": 3.0
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Properties
+
+```python
+sandbox.id            # str - UUID of this VM
+sandbox.state         # str - current state
+sandbox.pid           # int - host PID of the Firecracker process
+sandbox.created_at    # float - creation timestamp (unix time)
+sandbox.ready_time_ms # float | None - total boot time in ms
+sandbox.timings       # dict[str, float] - per-step timing breakdown
+```
+
+**States:** `"Starting"`, `"Running"`, `"Paused"`, `"Error"`, `"Dead"`
+
+The `timings` dict breaks down boot time by step:
+
+```python
+print(sandbox.timings)
+# {
+#   "rootfs_copy_ms": 12.4,
+#   "netns_setup_ms": 8.1,
+#   "snapshot_load_ms": 45.6,
+#   "vm_resume_ms": 18.3,
+#   "exec_command_ms": 3.0,
+#   ...
+# }
+```
+
+## kill
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    sandbox.kill()
+    ```
+  </Tab>
+  <Tab title="REST API">
+    `DELETE /vms/{vm_id}`
+
+    ```bash
+    curl -X DELETE http://localhost:9100/vms/{vm_id}
+    ```
+
+    **Response** `200`
+    ```json
+    {"ok": true}
+    ```
+  </Tab>
+</Tabs>
+
+## pause
+
+Snapshot the VM state to disk. The Firecracker process is stopped but all memory and filesystem state is preserved.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    sandbox.pause()
+    ```
+
+    <Warning>
+    Only works when the sandbox is in the `"Running"` state.
+    </Warning>
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms/{vm_id}/pause`
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/pause
+    ```
+
+    **Response** `200`
+    ```json
+    {"ok": true}
+    ```
+  </Tab>
+</Tabs>
+
+## resume
+
+Restore a paused sandbox from its snapshot.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    sandbox.resume()
+    ```
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms/{vm_id}/resume`
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/resume
+    ```
+
+    **Response** `200`
+    ```json
+    {"vm": {"vm_id": "...", "state": "Running", ...}}
+    ```
+  </Tab>
+</Tabs>
+
+## set_timeout
+
+Set an auto-cleanup timeout. Useful for making sure sandboxes don't run indefinitely.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    sandbox.set_timeout(300, policy="kill")   # kill after 5 minutes
+    sandbox.set_timeout(300, policy="pause")  # pause instead
+    ```
+
+    <ParamField path="timeout_seconds" type="float" required>
+      Seconds until the sandbox is cleaned up.
+    </ParamField>
+
+    <ParamField path="policy" type="str" default='"kill"'>
+      `"kill"` or `"pause"`.
+    </ParamField>
+  </Tab>
+  <Tab title="REST API">
+    `PATCH /vms/{vm_id}`
+
+    ```bash
+    curl -X PATCH http://localhost:9100/vms/{vm_id} \
+      -H "Content-Type: application/json" \
+      -d '{"timeout_seconds": 300, "timeout_policy": "kill"}'
+    ```
+
+    **Response** `200`
+    ```json
+    {"ok": true}
+    ```
+  </Tab>
+</Tabs>
+
+## Listing and connecting
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    # List all running sandboxes
+    sandboxes = Sandbox.list()
+
+    # Connect to an existing sandbox
+    sandbox = Sandbox.connect("vm-uuid-here")
+    # or equivalently
+    sandbox = Sandbox(vm_id="vm-uuid-here")
+
+    # Check if the daemon is running
+    Sandbox.is_daemon_running()  # bool
+    ```
+  </Tab>
+  <Tab title="REST API">
+    **List all sandboxes** - `GET /vms`
+
+    ```bash
+    curl http://localhost:9100/vms
+    ```
+
+    **Get a specific sandbox** - `GET /vms/{vm_id}`
+
+    ```bash
+    curl http://localhost:9100/vms/{vm_id}
+    ```
+
+    **Daemon health** - `GET /health`
+
+    ```bash
+    curl http://localhost:9100/health
+    ```
+  </Tab>
+</Tabs>
+
+## File operations
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    # Read a file
+    content = sandbox.read_file("/etc/hostname")  # bytes
+
+    # Write a file
+    sandbox.write_file("/tmp/data.txt", "hello world")
+    sandbox.write_file("/tmp/script.py", b"print('hi')", mode="0755")
+
+    # List a directory
+    entries = sandbox.list_files("/tmp")
+    # [{"name": "data.txt", "size": 11, "is_dir": False, "mode": "0644"}, ...]
+    ```
+  </Tab>
+  <Tab title="REST API">
+    See the [Files API reference](/api-reference/files) for full details.
+
+    ```bash
+    # Read
+    curl "http://localhost:9100/vms/{vm_id}/files?path=/etc/hostname"
+
+    # Write
+    echo "hello world" | curl -X POST \
+      "http://localhost:9100/vms/{vm_id}/files?path=/tmp/data.txt" \
+      --data-binary @-
+
+    # List
+    curl "http://localhost:9100/vms/{vm_id}/files/list?path=/tmp"
+    ```
+  </Tab>
+</Tabs>
+
+## run_code
+
+A convenience method for executing code strings directly.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    result = sandbox.run_code("print('hello')")           # defaults to python3
+    result = sandbox.run_code("console.log('hi')", runtime="node")
+    ```
+
+    <ParamField path="code" type="str" required>
+      Code to execute.
+    </ParamField>
+
+    <ParamField path="runtime" type="str | None" default="None">
+      Runtime to use (`"python3"`, `"node"`, etc). Defaults to `"python3"`.
+    </ParamField>
+
+    <ParamField path="timeout" type="float" default="60">
+      Timeout in seconds.
+    </ParamField>
+  </Tab>
+  <Tab title="REST API">
+    Use the exec endpoint and pass the runtime as the first arg:
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/exec \
+      -H "Content-Type: application/json" \
+      -d '{"cmd": ["python3", "-c", "print(\"hello\")"]}'
+    ```
+  </Tab>
+</Tabs>
+
+## Pause and resume example
+
+```python
+sandbox = Sandbox()
+sandbox.commands.run("touch /tmp/my-file.txt")
+
+sandbox.pause()     # snapshot to disk
+
+# some time later...
+sandbox.resume()    # restore
+
+result = sandbox.commands.run("ls /tmp/my-file.txt")
+assert result.exit_code == 0
+
+sandbox.kill()
+```

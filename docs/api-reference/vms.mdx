@@ -1,0 +1,160 @@
+---
+title: "Sandboxes"
+description: "Create, list, inspect, and kill sandboxes."
+---
+
+## Create a sandbox
+
+`POST /vms`
+
+Boots a new microVM from the specified template.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `template_id` | string | `"default"` | Template to boot |
+| `allow_internet_access` | boolean | `true` | Whether the VM can reach the internet |
+| `use_pool` | boolean | `true` | Use pre-copied rootfs pool |
+| `use_pyroute2` | boolean | `true` | Use pyroute2 for network namespace setup |
+
+**Response** `201`
+
+```json
+{
+  "vm": {
+    "vm_id": "3f2a1b4c-8e9d-4a2b-b1c3-d4e5f6a7b8c9",
+    "pid": 12345,
+    "state": "Running",
+    "template_id": "default",
+    "created_at": 1710000000.0,
+    "ready_time_ms": 87.4,
+    "timings": {
+      "rootfs_copy_ms": 12.4,
+      "netns_setup_ms": 8.1,
+      "snapshot_load_ms": 45.6,
+      "vm_resume_ms": 18.3,
+      "exec_command_ms": 3.0
+    }
+  }
+}
+```
+
+**Example**
+
+```bash
+curl -X POST "http://localhost:9100/vms?template_id=default"
+```
+
+---
+
+## List sandboxes
+
+`GET /vms`
+
+**Response** `200`
+
+```json
+{
+  "vms": [
+    { "vm_id": "...", "state": "Running", ... },
+    { "vm_id": "...", "state": "Paused", ... }
+  ]
+}
+```
+
+---
+
+## Get sandbox
+
+`GET /vms/{vm_id}`
+
+**Response** `200` or `404`
+
+```json
+{
+  "vm": {
+    "vm_id": "3f2a1b4c-...",
+    "state": "Running",
+    ...
+  }
+}
+```
+
+---
+
+## Kill sandbox
+
+`DELETE /vms/{vm_id}`
+
+Terminates the Firecracker process and cleans up all resources.
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+---
+
+## Pause sandbox
+
+`POST /vms/{vm_id}/pause`
+
+Snapshots the VM state to disk and stops the Firecracker process. All memory and filesystem state is preserved.
+
+Only works when the sandbox is in the `Running` state.
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+---
+
+## Resume sandbox
+
+`POST /vms/{vm_id}/resume`
+
+Restores a paused sandbox from its snapshot.
+
+**Response** `200`
+
+```json
+{
+  "vm": {
+    "vm_id": "...",
+    "state": "Running",
+    ...
+  }
+}
+```
+
+---
+
+## Set timeout
+
+`PATCH /vms/{vm_id}`
+
+Set an auto-cleanup timeout on a sandbox.
+
+**Request body**
+
+```json
+{
+  "timeout_seconds": 300,
+  "timeout_policy": "kill"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timeout_seconds` | float | Seconds until the sandbox is cleaned up |
+| `timeout_policy` | string | `"kill"` or `"pause"` |
+
+**Response** `200`
+
+```json
+{"ok": true}
+```

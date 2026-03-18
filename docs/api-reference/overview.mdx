@@ -1,0 +1,61 @@
+---
+title: "REST API overview"
+description: "HTTP API for the Flint daemon."
+---
+
+The Flint daemon exposes a REST API on `http://localhost:9100`. The Python SDK is a thin wrapper over this API, so anything you can do with the SDK you can do directly with HTTP.
+
+## Base URL
+
+```
+http://localhost:9100
+```
+
+## Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Daemon health check |
+| `POST /vms` | Create a sandbox |
+| `GET /vms` | List all sandboxes |
+| `GET /vms/{vm_id}` | Get sandbox info |
+| `DELETE /vms/{vm_id}` | Kill a sandbox |
+| `POST /vms/{vm_id}/pause` | Pause a sandbox |
+| `POST /vms/{vm_id}/resume` | Resume a paused sandbox |
+| `PATCH /vms/{vm_id}` | Set timeout |
+| `POST /vms/{vm_id}/exec` | Run a command |
+| `POST /vms/{vm_id}/processes` | Start a process |
+| `GET /vms/{vm_id}/processes` | List processes |
+| `GET /vms/{vm_id}/processes/{pid}` | Get process info |
+| `POST /vms/{vm_id}/processes/{pid}/input` | Send stdin |
+| `POST /vms/{vm_id}/processes/{pid}/signal` | Send signal |
+| `POST /vms/{vm_id}/processes/{pid}/resize` | Resize PTY |
+| `GET /vms/{vm_id}/files` | Read file |
+| `POST /vms/{vm_id}/files` | Write file |
+| `GET /vms/{vm_id}/files/stat` | Stat a file |
+| `GET /vms/{vm_id}/files/list` | List directory |
+| `POST /vms/{vm_id}/files/mkdir` | Create directory |
+| `DELETE /vms/{vm_id}/files` | Delete file |
+| `WS /vms/{vm_id}/terminal` | WebSocket terminal |
+| `POST /templates/build` | Build a template |
+| `GET /templates` | List templates |
+| `GET /templates/{template_id}` | Get template info |
+| `DELETE /templates/{template_id}` | Delete a template |
+
+## Error responses
+
+The API returns standard HTTP status codes. On errors, the response body is:
+
+```json
+{"detail": "error message here"}
+```
+
+Common status codes:
+
+| Code | Meaning |
+|------|---------|
+| `200` | Success |
+| `201` | Created |
+| `400` | Bad request (e.g. trying to delete the default template) |
+| `404` | Sandbox or template not found |
+| `503` | Guest agent unreachable |

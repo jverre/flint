@@ -235,61 +235,52 @@ src/flint/
 
 ## 🔧 Host Setup
 
-Flint expects a Linux host with Firecracker, a kernel, and a rootfs image. Follow these steps to set everything up.
+Flint expects a Linux host with Firecracker, a kernel, and a rootfs image.
 
-### 1. Install Firecracker
+### 1. Install Firecracker, jailer, and kernel
 
-Download the latest release from GitHub:
+If Flint is already installed:
 
 ```bash
-ARCH="$(uname -m)"
-release_url="https://github.com/firecracker-microvm/firecracker/releases"
-latest=$(basename $(curl -fsSLI -o /dev/null -w %{url_effective} ${release_url}/latest))
-curl -L ${release_url}/download/${latest}/firecracker-${latest}-${ARCH}.tgz | tar -xz
-
-sudo mv release-${latest}-${ARCH}/firecracker-${latest}-${ARCH} /usr/local/bin/firecracker
-rm -rf release-${latest}-${ARCH}
-
-firecracker --version
+sudo flint install-deps
 ```
 
-### 2. Get a Linux kernel
-
-Firecracker needs an uncompressed `vmlinux` kernel. You can grab one from the Firecracker CI builds:
+Or without Flint installed yet:
 
 ```bash
-sudo mkdir -p /root/firecracker-vm
-KERNEL_VERSION="6.1"
-ARCH="$(uname -m)"
-curl -fsSL -o /root/firecracker-vm/vmlinux \
-  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v${KERNEL_VERSION}/${ARCH}/vmlinux-5.10.217"
+curl -fsSL https://raw.githubusercontent.com/jacquesverre/flint/main/scripts/install-deps.sh | sudo sh
 ```
 
-> **Note:** Check the [Firecracker docs](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) for the latest recommended kernel version.
-
-### 3. Build the rootfs image
-
-Flint uses an Alpine-based rootfs with a static C TCP-to-PTY relay for the in-guest shell server. The `setup-rootfs.sh` script builds it:
+To pin a specific version:
 
 ```bash
-# Download Alpine minirootfs
-curl -fsSL -o /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz \
-  "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz"
+FC_VERSION=v1.10.1 curl -fsSL https://raw.githubusercontent.com/jacquesverre/flint/main/scripts/install-deps.sh | sudo sh
+```
 
-# Build the rootfs (requires root)
+To verify what is installed:
+
+```bash
+sudo flint install-deps --check
+```
+
+### 2. Build the rootfs image
+
+Flint uses an Alpine-based rootfs with the `flintd` guest agent. The `setup-rootfs.sh` script builds it:
+
+```bash
 sudo ./setup-rootfs.sh
 ```
 
-This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4` containing Alpine with a pre-spawned shell relay and a network init script that listens on TCP port 5000.
+This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4`.
 
-### 4. Verify
+### 3. Verify
 
-You should have two files:
+You should have:
 
 ```
 /root/firecracker-vm/
 ├── vmlinux        # Uncompressed Linux kernel
-└── rootfs.ext4    # Alpine rootfs with tcp-relay + init script
+└── rootfs.ext4    # Alpine rootfs with flintd guest agent
 ```
 
 Once these are in place, `flint start` will create the golden snapshot automatically on first run.

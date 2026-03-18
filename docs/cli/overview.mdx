@@ -1,0 +1,29 @@
+---
+title: "CLI overview"
+description: "Manage Flint from the command line."
+---
+
+The `flint` CLI has four commands. Most of the time you'll just need `flint start` to get the daemon running and `flint app` to open the TUI.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| [`flint start`](/cli/start) | Start the daemon |
+| [`flint app`](/cli/app) | Open the interactive TUI |
+| [`flint list`](/cli/list) | List running sandboxes |
+| [`flint stop <vm_id>`](/cli/stop) | Kill a sandbox |
+
+## Configuration
+
+The daemon reads configuration from environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_PORT` | `9100` | Port the daemon listens on |
+| `FLINT_DATA_DIR` | `/microvms` | Where VM rootfs images and snapshots are stored |
+| `FLINT_STATE_DIR` | `/tmp/flint` | Where the daemon keeps its state (SQLite db, pid file, logs) |
+
+```bash
+FLINT_PORT=9200 flint start
+```

@@ -212,3 +212,33 @@ def test_multiple_sandboxes():
     finally:
         sb1.kill()
         sb2.kill()
+
+
+# ── Jailer isolation ──────────────────────────────────────────────────────────
+
+
+def test_jailer_chroot_cleanup(sandbox):
+    """Verify the jailer chroot dir and cgroups are removed after kill."""
+    import os
+    from flint.core._jailer import JailSpec
+
+    vm_id = sandbox.id
+    spec = JailSpec(vm_id=vm_id, ns_name=f"fc-{vm_id[:8]}")
+    chroot_base = spec.chroot_base
+
+    assert os.path.isdir(chroot_base), "Chroot should exist while VM is running"
+    sandbox.kill()
+    time.sleep(0.5)
+    assert not os.path.exists(chroot_base), "Chroot should be fully removed after kill"
+
+
+def test_jailer_chroot_structure(sandbox):
+    """Verify expected files exist inside the chroot while VM is running."""
+    import os
+    from flint.core._jailer import JailSpec
+
+    vm_id = sandbox.id
+    spec = JailSpec(vm_id=vm_id, ns_name=f"fc-{vm_id[:8]}")
+
+    assert os.path.isfile(f"{spec.chroot_root}/rootfs.ext4"), "rootfs should be staged in chroot"
+    assert os.path.exists(f"{spec.chroot_root}/firecracker.sock"), "API socket should exist"

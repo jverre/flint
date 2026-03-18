@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     timings_json   TEXT,
     pause_snapshot_dir TEXT,
     daemon_pid     INTEGER,
-    error_message  TEXT
+    error_message  TEXT,
+    chroot_base    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_log (
@@ -52,7 +53,12 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        # Migrate existing databases
+        try:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN chroot_base TEXT")
+            self._conn.commit()
+        except Exception:
+            pass  # Column already exists
 
     def insert_sandbox(
         self,
@@ -66,17 +72,18 @@ class StateStore:
         template_id: str = "default",
         boot_time_ms: float | None = None,
         timings_json: dict | None = None,
+        chroot_base: str | None = None,
     ) -> None:
         now = time.time()
         self._conn.execute(
             """INSERT OR REPLACE INTO sandboxes
                (vm_id, pid, vm_dir, socket_path, ns_name, state, template_id,
-                created_at, updated_at, boot_time_ms, timings_json, daemon_pid)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, updated_at, boot_time_ms, timings_json, daemon_pid, chroot_base)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (vm_id, pid, vm_dir, socket_path, ns_name, state.value, template_id,
              now, now, boot_time_ms,
              json.dumps(timings_json) if timings_json else None,
-             daemon_pid),
+             daemon_pid, chroot_base),
         )
         self._conn.execute(
             "INSERT INTO state_log (vm_id, from_state, to_state, timestamp, daemon_pid) VALUES (?, ?, ?, ?, ?)",

@@ -66,6 +66,7 @@ class SandboxManager:
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=template_id,
+            chroot_base=boot.chroot_base,
             t_instance_start=boot.t_total,
             ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
             timings=boot.timings,
@@ -87,6 +88,7 @@ class SandboxManager:
                 template_id=template_id,
                 boot_time_ms=entry.ready_time_ms,
                 timings_json=boot.timings,
+                chroot_base=boot.chroot_base,
             )
 
         total_ms = (time.monotonic() - boot.t_total) * 1000
@@ -101,7 +103,7 @@ class SandboxManager:
         if not entry:
             return
 
-        _teardown_vm(entry.process, entry.ns_name, entry.vm_dir)
+        _teardown_vm(entry.process, entry.ns_name, entry.chroot_base, entry.vm_id)
 
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
@@ -120,11 +122,11 @@ class SandboxManager:
         # 1. Pause vCPU
         _fc_patch(entry.socket_path, "/vm", {"state": "Paused"})
 
-        # 2. Create pause snapshot
+        # 2. Create pause snapshot (paths are chroot-relative)
         snapshot_body = {
             "snapshot_type": "Full",
-            "snapshot_path": f"{entry.vm_dir}/pause-vmstate",
-            "mem_file_path": f"{entry.vm_dir}/pause-mem",
+            "snapshot_path": "pause-vmstate",
+            "mem_file_path": "pause-mem",
         }
         resp = _fc_put(entry.socket_path, "/snapshot/create", snapshot_body)
         if not _fc_status_ok(resp):
@@ -159,7 +161,7 @@ class SandboxManager:
     def resume(self, sandbox_id: str) -> str:
         """Resume a paused sandbox from its snapshot."""
         from ._firecracker import _fc_put, _fc_patch, _fc_status_ok, _wait_for_api_socket, _wait_for_agent
-        from ._netns import _popen_in_ns
+        from ._jailer import JailSpec, build_jailer_command
         import subprocess as _subprocess
 
         if not self._state_store:
@@ -173,14 +175,22 @@ class SandboxManager:
 
         vm_dir = row["vm_dir"]
         ns_name = row["ns_name"]
-        socket_path = row["socket_path"]
+        chroot_base = row["chroot_base"]
 
-        # 1. Start new Firecracker in existing netns
+        spec = JailSpec(vm_id=sandbox_id, ns_name=ns_name)
+        socket_path = spec.socket_path_on_host
+
+        # Remove stale socket from previous run
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+
+        # 1. Start new jailer in existing netns
         log_path = f"{vm_dir}/firecracker.log"
         with open(log_path, "w") as log_fd:
-            process = _popen_in_ns(
-                ns_name,
-                ["firecracker", "--api-sock", socket_path, "--id", sandbox_id],
+            process = _subprocess.Popen(
+                build_jailer_command(spec),
                 stdin=_subprocess.DEVNULL, stdout=log_fd, stderr=_subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -188,10 +198,10 @@ class SandboxManager:
         try:
             _wait_for_api_socket(socket_path)
 
-            # 2. Load pause snapshot (not golden)
+            # 2. Load pause snapshot (chroot-relative paths)
             snapshot_body = {
-                "snapshot_path": f"{vm_dir}/pause-vmstate",
-                "mem_backend": {"backend_type": "File", "backend_path": f"{vm_dir}/pause-mem"},
+                "snapshot_path": "pause-vmstate",
+                "mem_backend": {"backend_type": "File", "backend_path": "pause-mem"},
                 "enable_diff_snapshots": False,
                 "resume_vm": False,
             }
@@ -199,9 +209,8 @@ class SandboxManager:
             if not _fc_status_ok(resp):
                 raise RuntimeError(f"snapshot/load failed: {resp}")
 
-            # 3. Patch drives
-            rootfs_path = f"{vm_dir}/rootfs.ext4"
-            _fc_patch(socket_path, "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": rootfs_path})
+            # 3. Patch drives (chroot-relative)
+            _fc_patch(socket_path, "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "rootfs.ext4"})
 
             # 4. Resume VM
             _fc_patch(socket_path, "/vm", {"state": "Resumed"})
@@ -229,6 +238,7 @@ class SandboxManager:
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
+            chroot_base=chroot_base,
         )
 
         with self._lock:

@@ -1,0 +1,165 @@
+---
+title: "PTY"
+description: "Interactive terminal sessions inside a sandbox."
+---
+
+The `Pty` interface creates interactive PTY (pseudo-terminal) sessions inside a sandbox. This is useful when you need a full terminal - for example, running a REPL, an interactive program, or capturing terminal output that changes over time.
+
+For simple command execution, `sandbox.commands.run()` is easier. PTY is for when you need interactivity.
+
+## create
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    output = []
+
+    session = sandbox.pty.create(
+        cols=120,
+        rows=40,
+        on_data=lambda data: output.append(data)
+    )
+    ```
+
+    <ParamField path="cols" type="int" default="120">
+      Terminal width in columns.
+    </ParamField>
+
+    <ParamField path="rows" type="int" default="40">
+      Terminal height in rows.
+    </ParamField>
+
+    <ParamField path="on_data" type="Callable[[bytes], None]">
+      Callback that receives raw binary output from the terminal.
+    </ParamField>
+
+    Returns a `PtySession`.
+  </Tab>
+  <Tab title="REST API">
+    Start a process with `pty: true`:
+
+    `POST /vms/{vm_id}/processes`
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/processes \
+      -H "Content-Type: application/json" \
+      -d '{"cmd": ["/bin/sh"], "pty": true, "cols": 120, "rows": 40}'
+    ```
+
+    <ParamField body="cmd" type="string[]" required>
+      Command to run in the PTY.
+    </ParamField>
+
+    <ParamField body="pty" type="bool" default="false">
+      Set to `true` to allocate a PTY.
+    </ParamField>
+
+    <ParamField body="cols" type="int" default="120">
+      Terminal columns.
+    </ParamField>
+
+    <ParamField body="rows" type="int" default="40">
+      Terminal rows.
+    </ParamField>
+
+    **Response** `201`
+    ```json
+    {"pid": 42}
+    ```
+
+    Then stream output via WebSocket at `GET /vms/{vm_id}/processes/42/output` and send input via `POST /vms/{vm_id}/processes/42/input`.
+  </Tab>
+</Tabs>
+
+## PtySession
+
+### send_input
+
+Send keyboard input to the terminal. Accepts either a string or raw bytes.
+
+```python
+session.send_input("ls\n")      # regular input
+session.send_input("\x03")      # Ctrl-C
+session.send_input("\x04")      # Ctrl-D (EOF)
+```
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    session.send_input("ls -la\n")
+    ```
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms/{vm_id}/processes/{pid}/input`
+
+    ```bash
+    printf "ls -la\n" | curl -X POST \
+      http://localhost:9100/vms/{vm_id}/processes/42/input \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary @-
+    ```
+  </Tab>
+</Tabs>
+
+### kill
+
+Close the PTY session and terminate the underlying process.
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    session.kill()
+    ```
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms/{vm_id}/processes/{pid}/signal`
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/processes/42/signal \
+      -H "Content-Type: application/json" \
+      -d '{"signal": 9}'
+    ```
+  </Tab>
+</Tabs>
+
+## Capturing output
+
+The `on_data` callback receives raw binary data including ANSI escape sequences. If you're building a terminal emulator on top of this, feed the output through [pyte](https://github.com/selectel/pyte):
+
+```python
+import pyte
+
+screen = pyte.Screen(120, 40)
+stream = pyte.ByteStream(screen)
+
+session = sandbox.pty.create(on_data=lambda data: stream.feed(data))
+session.send_input("ls /\n")
+
+# ... wait for output ...
+
+for line in screen.display:
+    if line.strip():
+        print(line)
+```
+
+## WebSocket terminal
+
+For browser-based terminals, the daemon exposes a WebSocket endpoint at `/vms/{vm_id}/terminal` that wraps a PTY session transparently. See the [terminal API reference](/api-reference/terminal) for details.
+
+## Running an interactive program
+
+```python
+import time
+
+output = []
+session = sandbox.pty.create(on_data=lambda d: output.append(d))
+
+session.send_input("python3\n")
+time.sleep(0.5)
+
+session.send_input("print(1 + 1)\n")
+time.sleep(0.2)
+
+session.send_input("exit()\n")
+session.kill()
+```

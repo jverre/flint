@@ -54,6 +54,14 @@ DAEMON_STATE_PATH = f"{STATE_DIR}/state.json"
 DAEMON_PID_PATH = f"{STATE_DIR}/flintd.pid"
 DAEMON_DB_PATH = f"{STATE_DIR}/flint.db"
 
+# ── Jailer ───────────────────────────────────────────────────────────────────
+JAILER_BINARY      = os.environ.get("FLINT_JAILER_BINARY", "jailer")
+FIRECRACKER_BINARY = os.environ.get("FLINT_FIRECRACKER_BINARY", "/usr/local/bin/firecracker")
+JAILER_BASE_DIR    = os.environ.get("FLINT_JAILER_BASE_DIR", "/srv/jailer")
+JAILER_UID         = int(os.environ.get("FLINT_JAILER_UID", "1000"))
+JAILER_GID         = int(os.environ.get("FLINT_JAILER_GID", "1000"))
+JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
+
 # ── State management ─────────────────────────────────────────────────────
 HEALTH_CHECK_INTERVAL = 5.0         # seconds between health probes
 DEFAULT_SANDBOX_TIMEOUT = 300       # seconds before auto-cleanup (5 min)

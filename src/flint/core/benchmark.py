@@ -36,4 +36,4 @@ def benchmark_vm(*, use_pool: bool = False, use_pyroute2: bool = False) -> dict:
 
     finally:
         if boot:
-            _teardown_vm(boot.process, boot.ns_name, boot.vm_dir)
+            _teardown_vm(boot.process, boot.ns_name, boot.chroot_base, boot.vm_id)

@@ -1,0 +1,54 @@
+---
+title: "WebSocket terminal"
+description: "Interactive terminal session over WebSocket."
+---
+
+`WS /vms/{vm_id}/terminal`
+
+Opens an interactive terminal session connected to a PTY inside the sandbox. This is what the TUI uses under the hood.
+
+## Protocol
+
+1. Open a WebSocket connection to `ws://localhost:9100/vms/{vm_id}/terminal`
+2. The daemon creates a PTY process on the guest agent
+3. Send raw binary frames to send keyboard input
+4. Receive raw binary frames containing terminal output
+5. Closing the connection kills the PTY process
+
+There's no framing or encoding - just raw bytes in both directions.
+
+## Example
+
+```python
+import websocket
+import threading
+
+def on_message(ws, message):
+    print(message.decode(), end="", flush=True)
+
+ws = websocket.WebSocketApp(
+    "ws://localhost:9100/vms/3f2a1b4c-.../terminal",
+    on_message=on_message
+)
+
+thread = threading.Thread(target=ws.run_forever)
+thread.daemon = True
+thread.start()
+
+# Send input
+import time
+time.sleep(0.5)
+ws.send(b"ls /\n")
+time.sleep(0.5)
+ws.close()
+```
+
+## Terminal size
+
+The default terminal size is 120 columns by 40 rows. To resize, use the [process resize endpoint](/api-reference/processes#resize-pty) with the PTY's PID (the daemon creates a process internally when you connect).
+
+## Notes
+
+- The terminal output includes ANSI escape sequences. Feed it through a terminal emulator like [pyte](https://github.com/selectel/pyte) if you need to interpret it.
+- Only one WebSocket terminal session per sandbox is supported at a time.
+- If the sandbox is killed while a terminal is connected, the WebSocket connection will be closed.

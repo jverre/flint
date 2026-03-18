@@ -4,7 +4,7 @@ import subprocess
 import threading
 import uuid
 
-from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID, DATA_DIR
+from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID
 from ._snapshot import golden_snapshot_exists
 
 _pool_lock = threading.Lock()
@@ -74,7 +74,8 @@ def _pool_refill_loop():
             _pool_stop_event.wait(1.0)
 
 
-def _claim_pool_entry(template_id: str, vm_id: str) -> str | None:
+def _claim_pool_entry(template_id: str) -> str | None:
+    """Claim a pool entry. Returns pool entry dir path, or None on miss. Caller owns cleanup."""
     with _pool_lock:
         match = next((e for e in _pool_entries if e["state"] == "ready" and e["template_id"] == template_id), None)
         if not match:
@@ -84,16 +85,8 @@ def _claim_pool_entry(template_id: str, vm_id: str) -> str | None:
             return None
         _pool_entries.remove(match)
         remaining = sum(1 for e in _pool_entries if e["state"] == "ready" and e["template_id"] == template_id)
-    log.debug("pool: claimed %s for %s (%d remaining)", match["id"][:8], vm_id[:8], remaining)
-
-    vm_dir = f"{DATA_DIR}/{vm_id}"
-    try:
-        os.rename(match["dir_path"], vm_dir)
-        return vm_dir
-    except OSError:
-        log.exception("pool: rename %s -> %s failed", match["dir_path"], vm_dir)
-        shutil.rmtree(match["dir_path"], ignore_errors=True)
-        return None
+    log.debug("pool: claimed %s (%d remaining)", match["id"][:8], remaining)
+    return match["dir_path"]
 
 
 def start_pool():

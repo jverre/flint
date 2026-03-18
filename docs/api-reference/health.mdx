@@ -1,0 +1,34 @@
+---
+title: "Health"
+description: "Check if the daemon is running and ready."
+---
+
+## Health check
+
+`GET /health`
+
+A quick check to see if the daemon is up and whether the golden snapshot has been built.
+
+**Response** `200`
+
+```json
+{
+  "status": "ok",
+  "golden_snapshot_ready": true
+}
+```
+
+If `golden_snapshot_ready` is `false`, the daemon is still initializing. Wait for it to finish before creating sandboxes.
+
+**Example**
+
+```bash
+curl http://localhost:9100/health
+```
+
+The Python SDK uses this endpoint in `Sandbox.is_daemon_running()`:
+
+```python
+if not Sandbox.is_daemon_running():
+    print("daemon isn't up yet")
+```

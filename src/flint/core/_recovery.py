@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-import shutil
 
 from .config import log, GUEST_IP, AGENT_PORT, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
-from ._boot import _RecoveredProcess, _teardown_vm
+from ._boot import _RecoveredProcess
 from ._netns import _delete_netns
 from ._firecracker import _fc_request, _wait_for_agent
+from ._jailer import cleanup_jailer
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -119,6 +119,7 @@ class RecoveryEngine:
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
+            chroot_base=row.get("chroot_base") or "",
         )
 
         with self._manager._lock:
@@ -132,7 +133,7 @@ class RecoveryEngine:
         vm_id = row["vm_id"]
         pid = row["pid"]
         ns_name = row["ns_name"]
-        vm_dir = row["vm_dir"]
+        chroot_base = row.get("chroot_base") or ""
         sid = vm_id[:8]
 
         # Kill zombie process if still exists
@@ -147,9 +148,9 @@ class RecoveryEngine:
         except Exception:
             pass
 
-        # Clean up VM directory
-        if vm_dir and os.path.isdir(vm_dir):
-            shutil.rmtree(vm_dir, ignore_errors=True)
+        # Clean up jailer chroot and cgroups
+        if chroot_base:
+            cleanup_jailer(chroot_base, vm_id)
 
         self._store.transition_state(vm_id, SandboxState.DEAD, detail="cleaned up during recovery")
-        log.info("[%s] dead — cleaned up", sid)
+        log.info("[%s] dead - cleaned up", sid)

@@ -1,0 +1,41 @@
+---
+title: "Introduction"
+description: "Firecracker microVMs that start in milliseconds."
+---
+
+Flint is a microVM manager built on top of [Firecracker](https://firecracker-microvm.github.io/). It spins up isolated VMs in under 100ms by loading a pre-booted golden snapshot rather than booting from scratch every time.
+
+The core idea is simple: boot a VM once, snapshot it, and clone that snapshot for every new sandbox. You get real VM-level isolation without paying the boot cost each time.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Start a sandbox and run your first command in under 5 minutes.
+  </Card>
+  <Card title="Python SDK" icon="python" href="/sdk/sandbox">
+    The `Sandbox` class and everything it can do.
+  </Card>
+  <Card title="CLI" icon="terminal" href="/cli/overview">
+    Manage sandboxes from the command line or the interactive TUI.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    How golden snapshots, networking, and the guest agent fit together.
+  </Card>
+</CardGroup>
+
+## What you can do with Flint
+
+- Run sandboxes and execute arbitrary code or shell commands
+- Create custom sandbox environments from Docker images using the `Template` builder
+- Pause a running sandbox to disk and resume it later - state is fully preserved
+- Manage sandboxes via Python SDK, REST API, CLI, or the interactive TUI
+- Set auto-cleanup timeouts so sandboxes don't run forever
+
+## How it works
+
+Flint runs a daemon (`flint start`) that manages the full VM lifecycle. When you create a sandbox, the daemon copies a rootfs from a pre-warmed pool, sets up a network namespace, and loads the golden snapshot into a new Firecracker process. The whole thing takes under 100ms.
+
+Inside each VM, a small Go HTTP server called `flintd` handles command execution, file operations, and PTY sessions. The daemon proxies your SDK calls through to `flintd` over the VM's private network.
+
+<Info>
+Flint requires Linux with KVM support. It won't run on macOS or Windows.
+</Info>

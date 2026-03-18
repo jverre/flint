@@ -1,0 +1,174 @@
+---
+title: "Processes"
+description: "Start and manage long-running processes inside a sandbox."
+---
+
+The processes API lets you start processes asynchronously, stream their output over WebSocket, and send input. This is the right choice for interactive programs, PTY sessions, or anything that runs longer than a simple command.
+
+## Start a process
+
+`POST /vms/{vm_id}/processes`
+
+**Request body**
+
+```json
+{
+  "cmd": ["/bin/bash"],
+  "pty": true,
+  "cols": 120,
+  "rows": 40,
+  "env": {"MY_VAR": "hello"},
+  "cwd": "/tmp"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cmd` | string[] | required | Command and arguments |
+| `pty` | bool | `false` | Allocate a PTY for interactive use |
+| `cols` | int | `120` | Terminal columns (only used if `pty: true`) |
+| `rows` | int | `40` | Terminal rows (only used if `pty: true`) |
+| `env` | object | `{}` | Extra environment variables |
+| `cwd` | string | `null` | Working directory |
+
+**Response** `201`
+
+```json
+{"pid": 42}
+```
+
+The process starts immediately. Use the `pid` to interact with it.
+
+---
+
+## List processes
+
+`GET /vms/{vm_id}/processes`
+
+**Response** `200`
+
+```json
+{
+  "processes": [
+    {
+      "pid": 42,
+      "cmd": ["/bin/bash"],
+      "pty": true,
+      "state": "running",
+      "exit_code": null
+    }
+  ]
+}
+```
+
+---
+
+## Get process
+
+`GET /vms/{vm_id}/processes/{pid}`
+
+**Response** `200` or `404`
+
+---
+
+## Send input
+
+`POST /vms/{vm_id}/processes/{pid}/input`
+
+Send raw binary data to the process stdin (or PTY input if `pty: true`).
+
+**Request body:** raw bytes
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+**Example** (sending a keypress)
+
+```bash
+printf "ls\n" | curl -X POST \
+  http://localhost:9100/vms/.../processes/42/input \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @-
+```
+
+---
+
+## Send signal
+
+`POST /vms/{vm_id}/processes/{pid}/signal`
+
+**Request body**
+
+```json
+{"signal": 9}
+```
+
+Common signals: `2` (SIGINT / Ctrl-C), `9` (SIGKILL), `15` (SIGTERM).
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+---
+
+## Resize PTY
+
+`POST /vms/{vm_id}/processes/{pid}/resize`
+
+Only applies to processes started with `pty: true`.
+
+**Request body**
+
+```json
+{"cols": 200, "rows": 50}
+```
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+---
+
+## Stream output
+
+`GET /vms/{vm_id}/processes/{pid}/output` (WebSocket)
+
+Upgrade to WebSocket to receive process output in real time.
+
+**Messages from server** (JSON)
+
+```json
+{"type": "stdout", "data": "aGVsbG8gd29ybGQK"}
+```
+
+```json
+{"type": "stderr", "data": "ZXJyb3IK"}
+```
+
+```json
+{"type": "exit", "code": 0}
+```
+
+The `data` field is base64-encoded. Decode it to get the raw bytes.
+
+**Example**
+
+```python
+import websocket, base64, json
+
+ws = websocket.WebSocket()
+ws.connect("ws://localhost:9100/vms/.../processes/42/output")
+
+while True:
+    msg = json.loads(ws.recv())
+    if msg["type"] == "exit":
+        break
+    print(base64.b64decode(msg["data"]).decode())
+```

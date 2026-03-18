@@ -1,0 +1,96 @@
+---
+title: "Quickstart"
+description: "Start a sandbox and run your first command."
+---
+
+## Prerequisites
+
+- Linux with KVM enabled (`/dev/kvm` must exist)
+- Python 3.11+
+- Root access (for installing binaries and managing VMs)
+
+## Installation
+
+<Steps>
+  <Step title="Install Flint">
+    ```bash
+    pip install flint
+    ```
+
+    Or install from source:
+
+    ```bash
+    git clone https://github.com/jverre/flint
+    cd flint
+    pip install -e .
+    ```
+  </Step>
+
+  <Step title="Install Firecracker, jailer, and kernel">
+    This downloads and installs the Firecracker binaries and vmlinux kernel. You only need to do this once.
+
+    ```bash
+    sudo flint install-deps
+    ```
+
+    To pin a specific Firecracker version:
+
+    ```bash
+    sudo flint install-deps --version v1.10.1
+    ```
+
+    To verify what is installed:
+
+    ```bash
+    sudo flint install-deps --check
+    ```
+  </Step>
+
+  <Step title="Build the base rootfs">
+    This builds the Alpine Linux rootfs with the `flintd` guest agent. You only need to do this once.
+
+    ```bash
+    sudo bash setup-rootfs.sh
+    ```
+  </Step>
+
+  <Step title="Start the daemon">
+    The daemon manages all VM lifecycle in the background. It listens on `localhost:9100` by default.
+
+    ```bash
+    sudo flint start
+    ```
+
+    You should see it print `Golden snapshot ready` when it's good to go.
+  </Step>
+
+  <Step title="Run your first sandbox">
+    In a new terminal:
+
+    ```python
+    from flint import Sandbox
+
+    sandbox = Sandbox()
+    result = sandbox.commands.run("echo hello from a microVM")
+    print(result.stdout)  # hello from a microVM
+    sandbox.kill()
+    ```
+  </Step>
+</Steps>
+
+## What just happened
+
+When you called `Sandbox()`, the daemon:
+
+1. Grabbed a pre-copied rootfs from the pool
+2. Set up a network namespace with a TAP device
+3. Loaded the golden snapshot into a new Firecracker process
+4. Waited for the guest agent (`flintd`) to be healthy
+
+The whole thing took somewhere between 50-150ms depending on your machine. The `commands.run()` call then proxied your shell command through `flintd` inside the VM.
+
+## Next steps
+
+- [Python SDK](/sdk/sandbox) - everything the `Sandbox` class can do
+- [Templates](/sdk/templates) - create custom sandbox environments from Docker images
+- [TUI](/cli/app) - manage sandboxes interactively

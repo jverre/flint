@@ -1,0 +1,52 @@
+---
+title: "Guest agent (flintd)"
+description: "The Go HTTP server running inside each sandbox."
+---
+
+`flintd` is a small Go HTTP server that runs inside every Flint sandbox. It's the interface between the outside world and the VM - every command you run, file you read, or PTY session you open goes through it.
+
+It listens on `127.0.0.1:5000` inside the VM (reachable as `172.16.0.2:5000` from the host's network namespace).
+
+## What it does
+
+`flintd` exposes three main capabilities:
+
+- **Command execution** - run a command and wait for it to finish (`POST /exec`)
+- **Process management** - start long-running processes, stream their output over WebSocket, send input and signals
+- **File operations** - read, write, list, stat, mkdir, delete
+
+The Flint daemon proxies all SDK calls to these endpoints.
+
+## Synchronous vs async execution
+
+There are two ways to run code inside a sandbox:
+
+**Synchronous (`/exec`)** - blocks until the command finishes, returns stdout/stderr/exit_code. Simple and easy. Use this for most things.
+
+**Async processes (`/processes`)** - starts a process and returns a PID immediately. Output is streamed over WebSocket. Use this for interactive programs, PTY sessions, or anything long-running.
+
+## PTY support
+
+When you start a process with `pty: true`, `flintd` allocates a pseudo-terminal for it. This lets you run interactive programs that expect a real terminal - readline-based REPLs, curses apps, etc.
+
+The PTY is connected to the process's stdin/stdout. Input you send to `/processes/{pid}/input` goes to the PTY, and output you receive from the `/processes/{pid}/output` WebSocket comes from the PTY.
+
+## Building flintd
+
+`flintd` is a Go binary that gets compiled and baked into the rootfs at build time. The source lives in `guest/flintd/`. It's built for Linux/amd64 (since Firecracker VMs only run on x86_64) and compiled with static linking so it has no runtime dependencies inside the Alpine image.
+
+```bash
+cd guest/flintd
+GOOS=linux GOARCH=amd64 go build -o flintd .
+```
+
+The `setup-rootfs.sh` script does this automatically when building the base rootfs.
+
+## Health check
+
+The daemon polls `flintd`'s health endpoint (`GET /health`) every 5 seconds to detect dead VMs. If the health check fails, the sandbox transitions to the `Error` state and gets cleaned up after a short delay.
+
+```json
+GET /health
+{"status": "ok", "uptime_ms": 12345, "processes": 2}
+```

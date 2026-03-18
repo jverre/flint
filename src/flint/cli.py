@@ -47,6 +47,28 @@ def stop(vm_id):
     click.echo(f"Stopped VM: {vm_id}")
 
 
+@cli.command("install-deps")
+@click.option("--version", "fc_version", default="latest", help="Firecracker version to install (default: latest)")
+@click.option("--install-dir", default="/usr/local/bin", help="Directory to install binaries (default: /usr/local/bin)")
+@click.option("--kernel-dir", default="/root/firecracker-vm", help="Directory to store vmlinux (default: /root/firecracker-vm)")
+@click.option("--kernel-version", default="6.1", help="Kernel major version for S3 URL (default: 6.1)")
+@click.option("--skip-kernel", is_flag=True, default=False, help="Skip vmlinux download")
+@click.option("--check", is_flag=True, default=False, help="Print installed versions and exit")
+def install_deps(fc_version, install_dir, kernel_dir, kernel_version, skip_kernel, check):
+    """Install firecracker, jailer, and vmlinux kernel."""
+    from flint.core._install import check_deps, install_deps as _install_deps
+    if check:
+        all_present = check_deps(install_dir=install_dir, kernel_dir=kernel_dir)
+        raise SystemExit(0 if all_present else 1)
+    _install_deps(
+        fc_version=fc_version,
+        install_dir=install_dir,
+        kernel_dir=kernel_dir,
+        kernel_version=kernel_version,
+        skip_kernel=skip_kernel,
+    )
+
+
 @cli.command(name="list")
 def list_vms():
     """List all VMs."""

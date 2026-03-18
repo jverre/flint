@@ -1,0 +1,138 @@
+---
+title: "Commands"
+description: "Run shell commands inside a sandbox."
+---
+
+`Commands` is the interface for executing shell commands inside a sandbox. You access it via `sandbox.commands`.
+
+## run
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    result = sandbox.commands.run(
+        "echo hello",
+        timeout=60
+    )
+
+    print(result.stdout)     # "hello\n"
+    print(result.stderr)     # ""
+    print(result.exit_code)  # 0
+    ```
+
+    **Parameters**
+
+    <ParamField path="cmd" type="str" required>
+      Shell command to execute.
+    </ParamField>
+
+    <ParamField path="on_stdout" type="Callable[[str], None]">
+      Optional callback called once per output line as the command runs.
+    </ParamField>
+
+    <ParamField path="timeout" type="float" default="60">
+      Seconds before the command times out.
+    </ParamField>
+
+    **Returns** a `CommandResult`:
+
+    <ResponseField name="stdout" type="str">
+      Full stdout output.
+    </ResponseField>
+
+    <ResponseField name="stderr" type="str">
+      Full stderr output.
+    </ResponseField>
+
+    <ResponseField name="exit_code" type="int">
+      Exit code. `0` means success. `-1` means timeout or error.
+    </ResponseField>
+  </Tab>
+  <Tab title="REST API">
+    `POST /vms/{vm_id}/exec`
+
+    ```bash
+    curl -X POST http://localhost:9100/vms/{vm_id}/exec \
+      -H "Content-Type: application/json" \
+      -d '{"cmd": ["/bin/sh", "-c", "echo hello"], "timeout": 60}'
+    ```
+
+    **Request body**
+
+    <ParamField body="cmd" type="string[]" required>
+      Command and arguments as an array. To use shell features like pipes, wrap in `/bin/sh -c`.
+    </ParamField>
+
+    <ParamField body="timeout" type="int" default="60">
+      Timeout in seconds.
+    </ParamField>
+
+    **Response** `200`
+
+    ```json
+    {
+      "stdout": "hello\n",
+      "stderr": "",
+      "exit_code": 0
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Streaming output
+
+If you want output as it arrives rather than waiting for the command to finish, pass an `on_stdout` callback:
+
+```python
+def print_line(line):
+    print(f"> {line}", end="")
+
+result = sandbox.commands.run(
+    "for i in 1 2 3; do echo $i; sleep 0.5; done",
+    on_stdout=print_line
+)
+```
+
+The callback receives one line at a time. This works via the SDK only - the `/exec` REST endpoint always waits for the full output.
+
+## Checking exit codes
+
+```python
+result = sandbox.commands.run("ls /nonexistent")
+if result.exit_code != 0:
+    print(f"Command failed: {result.stderr}")
+```
+
+## Multi-line commands
+
+```python
+result = sandbox.commands.run("""
+set -e
+cd /tmp
+echo "step 1" > out.txt
+echo "step 2" >> out.txt
+cat out.txt
+""")
+print(result.stdout)
+# step 1
+# step 2
+```
+
+## Timeouts
+
+Commands that exceed the timeout return with `exit_code` of `-1`.
+
+```python
+result = sandbox.commands.run("sleep 10", timeout=2)
+print(result.exit_code)  # -1
+```
+
+## Shorthand
+
+`Sandbox` exposes `run_command` as a direct alias:
+
+```python
+# These are equivalent
+result = sandbox.commands.run("echo hi")
+result = sandbox.run_command("echo hi")
+```

@@ -1,0 +1,58 @@
+---
+title: "Command execution"
+description: "Run commands inside a sandbox synchronously."
+---
+
+## Execute a command
+
+`POST /vms/{vm_id}/exec`
+
+Runs a command inside the sandbox and waits for it to finish. This is the synchronous path - it blocks until the command completes or times out.
+
+For long-running processes or interactive sessions, use the [processes API](/api-reference/processes) instead.
+
+**Request body**
+
+```json
+{
+  "cmd": ["/bin/sh", "-c", "echo hello"],
+  "timeout": 60
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cmd` | string[] | required | Command and arguments as an array |
+| `timeout` | int | `60` | Timeout in seconds |
+
+**Response** `200`
+
+```json
+{
+  "stdout": "hello\n",
+  "stderr": "",
+  "exit_code": 0
+}
+```
+
+**Response** `404` - sandbox not found
+
+**Response** `503` - guest agent unreachable
+
+**Example**
+
+```bash
+curl -X POST http://localhost:9100/vms/3f2a1b4c-.../exec \
+  -H "Content-Type: application/json" \
+  -d '{"cmd": ["/bin/sh", "-c", "echo hello"], "timeout": 30}'
+```
+
+## Notes
+
+The `cmd` field takes an array, not a shell string. To use shell features like pipes and redirects, wrap in `/bin/sh -c`:
+
+```json
+{"cmd": ["/bin/sh", "-c", "ls /tmp | wc -l"]}
+```
+
+Exit code `-1` means the command timed out or the guest agent returned an error.

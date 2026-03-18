@@ -1,0 +1,45 @@
+---
+title: "flint start"
+description: "Start the Flint daemon."
+---
+
+`flint start` launches the daemon process. The daemon manages all VM lifecycle - creating, killing, pausing, and resuming sandboxes - and exposes a REST API on `localhost:9100`.
+
+You need the daemon running before you can use the Python SDK or any other `flint` commands.
+
+## Usage
+
+```bash
+flint start [OPTIONS]
+```
+
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port` | `9100` | Port to listen on |
+| `--data-dir` | `/microvms` | Directory for VM data (rootfs images, snapshots) |
+| `--state-dir` | `/tmp/flint` | Directory for daemon state (db, pid file, logs) |
+
+These can also be set via environment variables: `FLINT_PORT`, `FLINT_DATA_DIR`, `FLINT_STATE_DIR`.
+
+## Example
+
+```bash
+sudo flint start
+```
+
+On startup you'll see the daemon initialize the rootfs pool and build (or load) the golden snapshot. Once it prints `Golden snapshot ready`, the daemon is ready to accept requests.
+
+## Running as a background process
+
+```bash
+sudo flint start &
+```
+
+The daemon will write its PID to `$FLINT_STATE_DIR/flintd.pid` so you can find it later.
+
+## Notes
+
+- The daemon needs to run as root (or with `CAP_NET_ADMIN` and access to `/dev/kvm`) because it creates network namespaces and TAP devices.
+- If the daemon crashes and restarts, it will attempt to recover any sandboxes that were running at the time using its SQLite state store.

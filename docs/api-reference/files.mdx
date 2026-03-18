@@ -1,0 +1,119 @@
+---
+title: "Files"
+description: "Read, write, and manage files inside a sandbox."
+---
+
+## Read a file
+
+`GET /vms/{vm_id}/files?path=/path/to/file`
+
+Returns the raw file contents as bytes.
+
+**Response** `200` - `application/octet-stream`
+
+**Example**
+
+```bash
+curl "http://localhost:9100/vms/.../files?path=/etc/hostname"
+# flint-vm
+```
+
+---
+
+## Write a file
+
+`POST /vms/{vm_id}/files?path=/path/to/file&mode=0644`
+
+Write raw bytes to a file. Parent directories are created automatically.
+
+**Request body:** raw bytes
+
+**Query parameters**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | required | Absolute path inside the VM |
+| `mode` | `0644` | Octal file permissions |
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+**Example**
+
+```bash
+echo "hello world" | curl -X POST \
+  "http://localhost:9100/vms/.../files?path=/tmp/hello.txt" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @-
+```
+
+---
+
+## Stat a file
+
+`GET /vms/{vm_id}/files/stat?path=/path`
+
+**Response** `200`
+
+```json
+{
+  "path": "/tmp/hello.txt",
+  "size": 12,
+  "is_dir": false,
+  "mode": "0644"
+}
+```
+
+---
+
+## List a directory
+
+`GET /vms/{vm_id}/files/list?path=/path`
+
+**Response** `200`
+
+```json
+{
+  "entries": [
+    {"name": "hello.txt", "size": 12, "is_dir": false, "mode": "0644"},
+    {"name": "subdir",    "size": 0,  "is_dir": true,  "mode": "0755"}
+  ]
+}
+```
+
+---
+
+## Create a directory
+
+`POST /vms/{vm_id}/files/mkdir?path=/new/dir&parents=true`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | required | Directory path to create |
+| `parents` | `true` | Create parent directories if they don't exist |
+
+**Response** `200`
+
+```json
+{"ok": true}
+```
+
+---
+
+## Delete a file
+
+`DELETE /vms/{vm_id}/files?path=/path&recursive=false`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | required | Path to delete |
+| `recursive` | `false` | Delete directories recursively |
+
+**Response** `200`
+
+```json
+{"ok": true}
+```

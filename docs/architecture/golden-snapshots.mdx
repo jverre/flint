@@ -1,0 +1,56 @@
+---
+title: "Golden snapshots"
+description: "How Flint achieves sub-100ms boot times."
+---
+
+The core trick behind Flint's fast startup is the golden snapshot. Instead of booting a VM from scratch every time - which takes seconds - Flint boots a VM once, snapshots it at the point where it's fully ready, and then loads that snapshot for every new sandbox.
+
+Loading a snapshot is much faster than booting because the kernel and init process have already done all their work. The VM just resumes from a known-good state.
+
+## How it works
+
+When you run `setup-rootfs.sh` or start the daemon for the first time, Flint:
+
+1. Boots a Firecracker VM with the Alpine rootfs and kernel
+2. Waits for `flintd` (the guest agent) to become healthy
+3. Pauses the VM and saves the full memory state to disk - this is the golden snapshot
+4. All future sandboxes load from this snapshot instead of booting fresh
+
+The snapshot lives at `/microvms/.golden/`. It includes:
+
+- `vmstate` - Firecracker VM state (registers, device state)
+- `mem` - full VM memory image
+
+## The rootfs pool
+
+Even with snapshot loading, there's still a step that takes time: copying the rootfs image for each new sandbox. The rootfs is an ext4 disk image, and copying a few hundred MB takes time.
+
+To fix this, Flint maintains a pool of pre-copied rootfs images at `/microvms/.pool/`. The pool refills in the background whenever you're not using it. When you create a sandbox, it just claims a pre-copied rootfs from the pool rather than copying it on demand.
+
+By default the pool keeps 8 images ready (`POOL_TARGET_SIZE = 8`) with 4 background workers copying them in parallel.
+
+## Templates
+
+Custom templates work the same way. When you call `Template.build()`, Flint:
+
+1. Builds a Docker image from your Dockerfile
+2. Extracts the filesystem from the image
+3. Boots a VM with that filesystem
+4. Waits for `flintd` to be healthy
+5. Takes a snapshot - this becomes the template's golden snapshot
+
+After that, `Sandbox(template_id=...)` is just as fast as the default template.
+
+Templates are stored in `/microvms/.templates/{template_id}/`.
+
+## Pause and resume
+
+Sandbox pause/resume uses the same mechanism. When you call `sandbox.pause()`, Flint:
+
+1. Sends a pause command to the Firecracker API
+2. Saves the VM state and memory to disk in the sandbox's own directory
+3. Kills the Firecracker process
+
+When you call `sandbox.resume()`, it loads that sandbox-specific snapshot back into a new Firecracker process - same as creating a new sandbox, but using the sandbox's own saved state instead of the golden template.
+
+This means a resumed sandbox has exactly the same state it had when you paused it - same processes, same files, same memory.

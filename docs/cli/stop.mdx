@@ -1,0 +1,25 @@
+---
+title: "flint stop"
+description: "Kill a sandbox by ID."
+---
+
+`flint stop` terminates a sandbox and cleans up its resources (rootfs, network namespace, Firecracker process).
+
+## Usage
+
+```bash
+flint stop <vm_id>
+```
+
+## Example
+
+```bash
+flint stop 3f2a1b4c-8e9d-4a2b-b1c3-d4e5f6a7b8c9
+```
+
+You can get the VM ID from `flint list`.
+
+## Notes
+
+- Stopping a sandbox is permanent. If you want to preserve state, use `sandbox.pause()` instead.
+- Stopping a sandbox that doesn't exist will print an error but exit cleanly.

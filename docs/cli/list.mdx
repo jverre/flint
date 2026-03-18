@@ -1,0 +1,28 @@
+---
+title: "flint list"
+description: "List all running sandboxes."
+---
+
+`flint list` prints a table of all sandboxes the daemon is tracking.
+
+## Usage
+
+```bash
+flint list
+```
+
+## Output
+
+```
+ID                                    PID     STATE     AGE
+--------------------                  ------  --------  -----
+3f2a1b4c-...                          12345   Running   42s
+9e8d7c6b-...                          12400   Paused    5m
+```
+
+Each row shows:
+
+- **ID** - the full UUID of the sandbox
+- **PID** - host PID of the Firecracker process (`-1` if paused or dead)
+- **STATE** - current state (`Running`, `Paused`, `Error`, `Dead`)
+- **AGE** - how long ago the sandbox was created

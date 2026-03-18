@@ -1,0 +1,173 @@
+---
+title: "Templates"
+description: "Build custom sandbox environments from Docker images."
+---
+
+By default, sandboxes use a minimal Alpine Linux rootfs. If you need Python packages, system libraries, or a specific runtime pre-installed, you can build a custom template.
+
+Templates work by building a Docker image, extracting the filesystem, and creating a new golden snapshot from it. Once built, you can create sandboxes from your template just like the default one - with the same fast startup time.
+
+## Building a template
+
+<Tabs>
+  <Tab title="Python SDK">
+    ```python
+    from flint import Template, Sandbox
+
+    template = (Template("my-python-env")
+        .from_python_image("3.11-slim")
+        .pip_install("numpy", "pandas", "scikit-learn")
+        .build())
+
+    sandbox = Sandbox(template_id=template.template_id)
+    result = sandbox.run_code("import numpy; print(numpy.__version__)")
+    ```
+
+    The `Template` class uses a fluent builder - each method returns `self` so you can chain calls.
+
+    **Constructor**
+
+    <ParamField path="name" type="str" required>
+      Human-readable name for this template.
+    </ParamField>
+
+    <ParamField path="rootfs_size_mb" type="int" default="500">
+      Size of the rootfs image in MB. Increase this if you're installing large packages.
+    </ParamField>
+  </Tab>
+  <Tab title="REST API">
+    `POST /templates/build`
+
+    ```bash
+    curl -X POST http://localhost:9100/templates/build \
+      -H "Content-Type: application/json" \
+      -d '{
+        "name": "my-python-env",
+        "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
+        "rootfs_size_mb": 500
+      }'
+    ```
+
+    <ParamField body="name" type="string" required>
+      Human-readable name.
+    </ParamField>
+
+    <ParamField body="dockerfile" type="string" required>
+      Full Dockerfile contents.
+    </ParamField>
+
+    <ParamField body="rootfs_size_mb" type="int" default="500">
+      Rootfs image size in MB.
+    </ParamField>
+
+    **Response** `200` - returns immediately, build happens in background
+
+    ```json
+    {"template_id": "tpl_abc123", "status": "building"}
+    ```
+
+    Poll `GET /templates/{template_id}` until `status` is `"ready"`.
+  </Tab>
+</Tabs>
+
+## Base image methods
+
+Pick one:
+
+```python
+.from_ubuntu_image("22.04")
+.from_python_image("3.11-slim")
+.from_node_image("20-slim")
+.from_alpine_image("3.19")
+.from_image("myregistry/myimage:tag")       # any Docker image
+.from_dockerfile("FROM ubuntu:22.04\n...")  # raw Dockerfile
+```
+
+## Installing packages
+
+```python
+.apt_install("git", "curl", "build-essential")
+.pip_install("numpy", "pandas")
+.npm_install("typescript", "ts-node")
+```
+
+## Other operations
+
+```python
+.run_cmd("curl -fsSL https://example.com/install.sh | sh")
+.copy("./local-file.txt", "/app/file.txt")
+.set_workdir("/app")
+.set_envs(NODE_ENV="production", DEBUG="false")
+.git_clone("https://github.com/example/repo", "/app/repo")
+```
+
+## TemplateInfo
+
+`build()` blocks until the template is ready and returns a `TemplateInfo`:
+
+```python
+info.template_id  # "tpl_abc123" - use with Sandbox(template_id=...)
+info.name         # "my-python-env"
+info.status       # "ready"
+```
+
+## Listing templates
+
+<Tabs>
+  <Tab title="REST API">
+    `GET /templates`
+
+    ```bash
+    curl http://localhost:9100/templates
+    ```
+
+    ```json
+    {
+      "templates": [
+        {"template_id": "default",    "name": "Default",       "status": "ready"},
+        {"template_id": "tpl_abc123", "name": "my-python-env", "status": "ready"}
+      ]
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Deleting a template
+
+<Tabs>
+  <Tab title="REST API">
+    `DELETE /templates/{template_id}`
+
+    ```bash
+    curl -X DELETE http://localhost:9100/templates/tpl_abc123
+    ```
+
+    You can't delete the `"default"` template.
+  </Tab>
+</Tabs>
+
+## Full example - Node.js environment
+
+```python
+from flint import Template, Sandbox
+
+template = (Template("node-app", rootfs_size_mb=800)
+    .from_node_image("20-slim")
+    .apt_install("git")
+    .npm_install("express", "axios")
+    .set_workdir("/app")
+    .set_envs(NODE_ENV="production")
+    .build())
+
+sandbox = Sandbox(template_id=template.template_id)
+result = sandbox.run_code(
+    "const express = require('express'); console.log('express loaded')",
+    runtime="node"
+)
+print(result.stdout)  # express loaded
+sandbox.kill()
+```
+
+## A note on build time
+
+Building a template can take anywhere from 30 seconds to a few minutes depending on what you're installing. The `build()` call blocks until it's done. Templates are cached after that though, so `Sandbox(template_id=...)` is just as fast as the default template.
