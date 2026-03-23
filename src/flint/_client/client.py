@@ -61,8 +61,15 @@ class DaemonClient:
         self._terminals.clear()
         self._http.close()
 
-    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True) -> dict:
-        resp = self._http.post("/vms", params={"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2})
+    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> dict:
+        body = None
+        if network_policy is not None:
+            body = {"network_policy": network_policy}
+        resp = self._http.post(
+            "/vms",
+            params={"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2},
+            json=body,
+        )
         resp.raise_for_status()
         return resp.json()["vm"]
 
@@ -145,6 +152,19 @@ class DaemonClient:
         resp = self._http.get(f"/vms/{vm_id}/files/list", params={"path": path})
         resp.raise_for_status()
         return resp.json()["entries"]
+
+    # ── Network policy ─────────────────────────────────────────────────
+
+    def update_network_policy(self, vm_id: str, policy: dict) -> None:
+        """Update the network policy (credential injection rules) for a sandbox."""
+        resp = self._http.put(f"/vms/{vm_id}/network-policy", json=policy)
+        resp.raise_for_status()
+
+    def get_network_policy(self, vm_id: str) -> dict | None:
+        """Get the current network policy for a sandbox."""
+        resp = self._http.get(f"/vms/{vm_id}/network-policy")
+        resp.raise_for_status()
+        return resp.json().get("network_policy")
 
     # ── Sandbox lifecycle ────────────────────────────────────────────────
 

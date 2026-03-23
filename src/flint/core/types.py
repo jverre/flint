@@ -57,6 +57,7 @@ class _SandboxEntry:
     created_at: float = field(default_factory=time.time)
     log_lines: deque = field(default_factory=lambda: deque(maxlen=100))
     line_count: int = 0
+    network_policy: dict | None = None
 
     def to_dict(self) -> dict:
         """Return JSON-serializable representation."""
@@ -72,4 +73,5 @@ class _SandboxEntry:
             "timings": dict(self.timings),
             "log_lines": list(self.log_lines),
             "line_count": self.line_count,
+            "network_policy": self.network_policy,
         }

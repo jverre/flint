@@ -62,6 +62,10 @@ JAILER_UID         = int(os.environ.get("FLINT_JAILER_UID", "1000"))
 JAILER_GID         = int(os.environ.get("FLINT_JAILER_GID", "1000"))
 JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
 
+# ── Credential proxy ─────────────────────────────────────────────────────
+PROXY_PORT = 8080
+PROXY_CA_DIR = f"{STATE_DIR}/proxy-ca"
+
 # ── State management ─────────────────────────────────────────────────────
 HEALTH_CHECK_INTERVAL = 5.0         # seconds between health probes
 DEFAULT_SANDBOX_TIMEOUT = 300       # seconds before auto-cleanup (5 min)

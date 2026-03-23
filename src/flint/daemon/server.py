@@ -111,13 +111,22 @@ def health():
 
 
 @app.post("/vms")
-def create_vm(template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
+async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
     print(f"POST /vms — creating VM (template={template_id}, internet={allow_internet_access})...")
     daemon = _get_daemon()
     mgr = _require_manager()
     if template_id == DEFAULT_TEMPLATE_ID and not daemon.golden_ready:
         raise HTTPException(status_code=503, detail="Golden snapshot not ready")
-    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
+    # Parse optional network_policy from request body
+    network_policy = None
+    try:
+        body = await request.body()
+        if body:
+            data = json.loads(body)
+            network_policy = data.get("network_policy")
+    except Exception:
+        pass
+    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)
     print(f"POST /vms — created {vm_id[:8]}")
@@ -191,6 +200,28 @@ def patch_vm(vm_id: str, body: dict):
     if timeout is not None:
         mgr.set_timeout(vm_id, float(timeout), policy)
     return {"ok": True}
+
+
+# ── Network policy endpoints ──────────────────────────────────────────────
+
+@app.put("/vms/{vm_id}/network-policy")
+async def update_network_policy(vm_id: str, request: Request):
+    """Update the network policy (credential injection rules) for a sandbox."""
+    print(f"PUT /vms/{vm_id[:8]}/network-policy")
+    mgr = _require_manager()
+    entry = _require_entry(vm_id)
+    body = json.loads(await request.body())
+    mgr.update_network_policy(vm_id, body)
+    print(f"PUT /vms/{vm_id[:8]}/network-policy — updated")
+    return {"ok": True}
+
+
+@app.get("/vms/{vm_id}/network-policy")
+def get_network_policy(vm_id: str):
+    """Get the current network policy for a sandbox."""
+    mgr = _require_manager()
+    entry = _require_entry(vm_id)
+    return {"network_policy": entry.network_policy}
 
 
 # ── Guest agent proxy endpoints ───────────────────────────────────────────

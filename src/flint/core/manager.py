@@ -18,6 +18,33 @@ if TYPE_CHECKING:
     from ._state_store import StateStore
 
 
+def _policy_has_transforms(policy: dict) -> bool:
+    """Check if a network policy contains any transform rules."""
+    allow = policy.get("allow", {})
+    for domain_rules in allow.values():
+        for rule in domain_rules:
+            if rule.get("transform"):
+                return True
+    return False
+
+
+def _extract_transform_rules(policy: dict) -> dict:
+    """Extract domain -> headers mapping from a network policy.
+
+    Returns a dict like: {"api.openai.com": {"Authorization": "Bearer sk-..."}, ...}
+    """
+    rules: dict[str, dict[str, str]] = {}
+    allow = policy.get("allow", {})
+    for domain, domain_rules in allow.items():
+        merged_headers: dict[str, str] = {}
+        for rule in domain_rules:
+            for transform in rule.get("transform", []):
+                merged_headers.update(transform.get("headers", {}))
+        if merged_headers:
+            rules[domain] = merged_headers
+    return rules
+
+
 class SandboxManager:
     """Owns all sandbox state and lifecycle. No TUI dependencies."""
 
@@ -26,7 +53,7 @@ class SandboxManager:
         self._lock = threading.Lock()
         self._state_store = state_store
 
-    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True) -> str:
+    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> str:
         """Start an interactive VM from a template snapshot. Returns the vm_id."""
         if template_id == DEFAULT_TEMPLATE_ID:
             if not golden_snapshot_exists():
@@ -70,6 +97,7 @@ class SandboxManager:
             t_instance_start=boot.t_total,
             ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
             timings=boot.timings,
+            network_policy=network_policy,
         )
 
         with self._lock:
@@ -90,6 +118,14 @@ class SandboxManager:
                 timings_json=boot.timings,
                 chroot_base=boot.chroot_base,
             )
+
+        # Persist network policy if provided
+        if network_policy and self._state_store:
+            self._state_store.set_network_policy(vm_id, json.dumps(network_policy))
+
+        # Start credential proxy if network policy has transforms
+        if network_policy:
+            self._apply_network_policy(entry, network_policy)
 
         total_ms = (time.monotonic() - boot.t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
@@ -281,6 +317,52 @@ class SandboxManager:
         """Return list of all VM IDs."""
         with self._lock:
             return list(self._sandboxes.keys())
+
+    def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
+        """Update the network policy (credential injection rules) for a sandbox."""
+        with self._lock:
+            entry = self._sandboxes.get(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+
+        entry.network_policy = policy
+
+        if self._state_store:
+            self._state_store.set_network_policy(sandbox_id, json.dumps(policy))
+
+        self._apply_network_policy(entry, policy)
+
+    def get_network_policy(self, sandbox_id: str) -> dict | None:
+        """Get the current network policy for a sandbox."""
+        with self._lock:
+            entry = self._sandboxes.get(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        return entry.network_policy
+
+    def _apply_network_policy(self, entry: _SandboxEntry, policy: dict) -> None:
+        """Start, update, or stop the credential proxy based on the policy."""
+        from ._proxy import CredentialProxy
+        from ._netns import _setup_proxy_redirect, _remove_proxy_redirect
+
+        has_transforms = _policy_has_transforms(policy)
+
+        proxy = getattr(entry, '_proxy', None)
+
+        if has_transforms:
+            rules = _extract_transform_rules(policy)
+            if proxy:
+                proxy.update_rules(rules)
+            else:
+                proxy = CredentialProxy(entry.ns_name)
+                proxy.start(rules)
+                entry._proxy = proxy  # type: ignore[attr-defined]
+                _setup_proxy_redirect(entry.ns_name)
+        else:
+            if proxy:
+                proxy.stop()
+                entry._proxy = None  # type: ignore[attr-defined]
+                _remove_proxy_redirect(entry.ns_name)
 
     @staticmethod
     def _agent_exec(ns_name: str, agent_url: str, cmd: list[str], timeout: float = 60) -> dict:

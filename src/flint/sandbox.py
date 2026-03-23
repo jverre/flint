@@ -112,10 +112,11 @@ class Sandbox:
         allow_internet_access: bool = True,
         use_pool: bool = True,
         use_pyroute2: bool = True,
+        network_policy: dict | None = None,
     ) -> None:
         client = _get_client()
         if vm_id is None:
-            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
+            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
             self._id = vm["vm_id"]
             self._timings: dict[str, float] = vm.get("timings", {})
             self._ready_time_ms: float | None = vm.get("ready_time_ms")
@@ -195,6 +196,26 @@ class Sandbox:
         """Execute code with auto-detected runtime (python/node)."""
         resp = _get_client().run_code(self._id, code, runtime=runtime, timeout=timeout)
         return CommandResult.from_response(resp)
+
+    # ── Network policy methods ─────────────────────────────────────────────
+
+    def update_network_policy(self, policy: dict) -> None:
+        """Update network policy with credential injection rules.
+
+        Example::
+
+            sandbox.update_network_policy({
+                "allow": {
+                    "api.openai.com": [{"transform": [{"headers": {"Authorization": "Bearer sk-..."}}]}],
+                    "*.anthropic.com": [{"transform": [{"headers": {"x-api-key": "sk-ant-..."}}]}],
+                }
+            })
+        """
+        _get_client().update_network_policy(self._id, policy)
+
+    def get_network_policy(self) -> dict | None:
+        """Get the current network policy for this sandbox."""
+        return _get_client().get_network_policy(self._id)
 
     # ── Filesystem methods ──────────────────────────────────────────────────
 
