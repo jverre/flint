@@ -9,7 +9,7 @@ from pyroute2 import IPRoute, NetNS
 
 from .config import (
     HOST_TAP_MAC, HOST_IP, GUEST_IP, GUEST_MAC,
-    BRIDGE_NAME, BRIDGE_IP, BRIDGE_CIDR, VETH_SUBNET, log,
+    BRIDGE_NAME, BRIDGE_IP, BRIDGE_CIDR, VETH_SUBNET, PROXY_PORT, log,
 )
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -206,3 +206,43 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
     run_in_ns(["ip", "route", "add", "default", "via", BRIDGE_IP])
     run_in_ns(["sysctl", "-w", "net.ipv4.ip_forward=1"])
     run_in_ns(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/30", "-o", veth_ns, "-j", "MASQUERADE"])
+
+
+def _setup_proxy_redirect(ns_name: str) -> None:
+    """Add iptables REDIRECT rules to send outbound HTTP/HTTPS from the guest to the credential proxy.
+
+    Idempotent: checks whether each rule already exists before appending.
+    """
+    run_in_ns = lambda cmd: subprocess.run(
+        ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
+
+    for dport in ("80", "443"):
+        rule = [
+            "iptables", "-t", "nat",
+            "-s", "172.16.0.0/30", "-p", "tcp", "--dport", dport,
+            "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
+        ]
+        # Check first, append only if missing
+        check = run_in_ns(["iptables", "-t", "nat", "-C", "PREROUTING"] + rule[3:])
+        if check.returncode != 0:
+            run_in_ns(["iptables", "-t", "nat", "-A", "PREROUTING"] + rule[3:])
+
+    log.info("Proxy redirect rules added for %s (port %d)", ns_name, PROXY_PORT)
+
+
+def _remove_proxy_redirect(ns_name: str) -> None:
+    """Remove iptables REDIRECT rules for the credential proxy."""
+    run_in_ns = lambda cmd: subprocess.run(
+        ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
+
+    run_in_ns([
+        "iptables", "-t", "nat", "-D", "PREROUTING",
+        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "80",
+        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
+    ])
+    run_in_ns([
+        "iptables", "-t", "nat", "-D", "PREROUTING",
+        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "443",
+        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
+    ])
+    log.info("Proxy redirect rules removed for %s", ns_name)

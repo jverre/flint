@@ -56,6 +56,34 @@ def _require_entry(vm_id: str):
     return entry
 
 
+def _validate_network_policy(policy: object) -> None:
+    """Basic schema validation for a network policy dict. Raises HTTPException on invalid input."""
+    if not isinstance(policy, dict):
+        raise HTTPException(status_code=400, detail="Network policy must be a JSON object")
+    allow = policy.get("allow")
+    if allow is not None:
+        if not isinstance(allow, dict):
+            raise HTTPException(status_code=400, detail="'allow' must be a JSON object mapping domains to rule lists")
+        for domain, rules in allow.items():
+            if not isinstance(domain, str):
+                raise HTTPException(status_code=400, detail=f"Domain key must be a string, got {type(domain).__name__}")
+            if not isinstance(rules, list):
+                raise HTTPException(status_code=400, detail=f"Rules for domain '{domain}' must be a list")
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    raise HTTPException(status_code=400, detail=f"Each rule for domain '{domain}' must be a JSON object")
+                for transform in rule.get("transform", []):
+                    if not isinstance(transform, dict):
+                        raise HTTPException(status_code=400, detail=f"Each transform for domain '{domain}' must be a JSON object")
+                    headers = transform.get("headers")
+                    if headers is not None and not isinstance(headers, dict):
+                        raise HTTPException(status_code=400, detail=f"Transform headers for domain '{domain}' must be a JSON object")
+                    if isinstance(headers, dict):
+                        for k, v in headers.items():
+                            if not isinstance(k, str) or not isinstance(v, str):
+                                raise HTTPException(status_code=400, detail=f"Header names and values must be strings (domain '{domain}')")
+
+
 def _write_state(daemon: FlintDaemon) -> None:
     """Atomically write daemon state to JSON file."""
     state = {
@@ -111,13 +139,24 @@ def health():
 
 
 @app.post("/vms")
-def create_vm(template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
+async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
     print(f"POST /vms — creating VM (template={template_id}, internet={allow_internet_access})...")
     daemon = _get_daemon()
     mgr = _require_manager()
     if template_id == DEFAULT_TEMPLATE_ID and not daemon.golden_ready:
         raise HTTPException(status_code=503, detail="Golden snapshot not ready")
-    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2)
+    # Parse optional network_policy from request body
+    network_policy = None
+    body = await request.body()
+    if body:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+        network_policy = data.get("network_policy")
+        if network_policy is not None:
+            _validate_network_policy(network_policy)
+    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)
     print(f"POST /vms — created {vm_id[:8]}")
@@ -191,6 +230,32 @@ def patch_vm(vm_id: str, body: dict):
     if timeout is not None:
         mgr.set_timeout(vm_id, float(timeout), policy)
     return {"ok": True}
+
+
+# ── Network policy endpoints ──────────────────────────────────────────────
+
+@app.put("/vms/{vm_id}/network-policy")
+async def update_network_policy(vm_id: str, request: Request):
+    """Update the network policy (credential injection rules) for a sandbox."""
+    print(f"PUT /vms/{vm_id[:8]}/network-policy")
+    mgr = _require_manager()
+    _require_entry(vm_id)
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+    _validate_network_policy(body)
+    mgr.update_network_policy(vm_id, body)
+    print(f"PUT /vms/{vm_id[:8]}/network-policy — updated")
+    return {"ok": True}
+
+
+@app.get("/vms/{vm_id}/network-policy")
+def get_network_policy(vm_id: str):
+    """Get the current network policy for a sandbox."""
+    mgr = _require_manager()
+    _require_entry(vm_id)
+    return {"network_policy": mgr.get_network_policy(vm_id)}
 
 
 # ── Guest agent proxy endpoints ───────────────────────────────────────────

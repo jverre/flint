@@ -59,6 +59,11 @@ class StateStore:
             self._conn.commit()
         except Exception:
             pass  # Column already exists
+        try:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN network_policy_json TEXT")
+            self._conn.commit()
+        except Exception:
+            pass  # Column already exists
 
     def insert_sandbox(
         self,
@@ -151,6 +156,20 @@ class StateStore:
             (snapshot_dir, now, vm_id),
         )
         self._conn.commit()
+
+    def set_network_policy(self, vm_id: str, policy_json: str) -> None:
+        now = time.time()
+        self._conn.execute(
+            "UPDATE sandboxes SET network_policy_json = ?, updated_at = ? WHERE vm_id = ?",
+            (policy_json, now, vm_id),
+        )
+        self._conn.commit()
+
+    def get_network_policy(self, vm_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT network_policy_json FROM sandboxes WHERE vm_id = ?", (vm_id,)
+        ).fetchone()
+        return row["network_policy_json"] if row else None
 
     def get_sandbox(self, vm_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM sandboxes WHERE vm_id = ?", (vm_id,)).fetchone()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import enum
+import re
 import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 
 class SandboxState(enum.Enum):
@@ -57,6 +59,8 @@ class _SandboxEntry:
     created_at: float = field(default_factory=time.time)
     log_lines: deque = field(default_factory=lambda: deque(maxlen=100))
     line_count: int = 0
+    network_policy: dict | None = None
+    proxy: Any = None  # CredentialProxy instance, if active
 
     def to_dict(self) -> dict:
         """Return JSON-serializable representation."""
@@ -72,4 +76,39 @@ class _SandboxEntry:
             "timings": dict(self.timings),
             "log_lines": list(self.log_lines),
             "line_count": self.line_count,
+            "network_policy": _redact_policy(self.network_policy),
         }
+
+
+_REDACT_RE = re.compile(r"^(.{4}).+(.{4})$")
+
+
+def _redact_policy(policy: dict | None) -> dict | None:
+    """Return a copy of the network policy with credential values redacted."""
+    if policy is None:
+        return None
+    allow = policy.get("allow")
+    if not isinstance(allow, dict):
+        return policy
+    redacted_allow: dict = {}
+    for domain, rules in allow.items():
+        redacted_rules = []
+        for rule in rules:
+            transforms = rule.get("transform")
+            if not transforms:
+                redacted_rules.append(rule)
+                continue
+            redacted_transforms = []
+            for t in transforms:
+                headers = t.get("headers")
+                if not headers:
+                    redacted_transforms.append(t)
+                    continue
+                redacted_headers = {}
+                for k, v in headers.items():
+                    m = _REDACT_RE.match(v)
+                    redacted_headers[k] = f"{m.group(1)}***{m.group(2)}" if m else "***"
+                redacted_transforms.append({**t, "headers": redacted_headers})
+            redacted_rules.append({**rule, "transform": redacted_transforms})
+        redacted_allow[domain] = redacted_rules
+    return {**policy, "allow": redacted_allow}
