@@ -16,7 +16,7 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "httpx>=0.28",
     "websockets>=14.0",
-    "cryptography>=43.0",
+    "mitmproxy>=10.0",
 ]
 
 [project.scripts]
