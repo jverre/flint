@@ -139,6 +139,13 @@ class SandboxManager:
         if not entry:
             return
 
+        # Stop credential proxy before tearing down the VM
+        if entry.proxy:
+            try:
+                entry.proxy.stop()
+            except Exception:
+                pass
+
         _teardown_vm(entry.process, entry.ns_name, entry.chroot_base, entry.vm_id)
 
         if self._state_store:
@@ -361,21 +368,19 @@ class SandboxManager:
 
         has_transforms = _policy_has_transforms(policy)
 
-        proxy = getattr(entry, '_proxy', None)
-
         if has_transforms:
             rules = _extract_transform_rules(policy)
-            if proxy:
-                proxy.update_rules(rules)
+            if entry.proxy:
+                entry.proxy.update_rules(rules)
             else:
                 proxy = CredentialProxy(entry.ns_name)
                 proxy.start(rules)
-                entry._proxy = proxy  # type: ignore[attr-defined]
+                entry.proxy = proxy
                 _setup_proxy_redirect(entry.ns_name)
         else:
-            if proxy:
-                proxy.stop()
-                entry._proxy = None  # type: ignore[attr-defined]
+            if entry.proxy:
+                entry.proxy.stop()
+                entry.proxy = None
                 _remove_proxy_redirect(entry.ns_name)
 
     @staticmethod

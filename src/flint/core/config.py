@@ -63,7 +63,7 @@ JAILER_GID         = int(os.environ.get("FLINT_JAILER_GID", "1000"))
 JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
 
 # ── Credential proxy ─────────────────────────────────────────────────────
-PROXY_PORT = 8080
+PROXY_PORT = int(os.environ.get("FLINT_PROXY_PORT", "8080"))
 PROXY_CA_DIR = f"{STATE_DIR}/proxy-ca"
 
 # ── State management ─────────────────────────────────────────────────────

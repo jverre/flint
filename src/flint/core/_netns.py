@@ -209,22 +209,24 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
 
 
 def _setup_proxy_redirect(ns_name: str) -> None:
-    """Add iptables REDIRECT rules to send outbound HTTP/HTTPS from the guest to the credential proxy."""
+    """Add iptables REDIRECT rules to send outbound HTTP/HTTPS from the guest to the credential proxy.
+
+    Idempotent: checks whether each rule already exists before appending.
+    """
     run_in_ns = lambda cmd: subprocess.run(
         ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
 
-    # Redirect outbound port 80 (HTTP) from the guest to the proxy
-    run_in_ns([
-        "iptables", "-t", "nat", "-A", "PREROUTING",
-        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "80",
-        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
-    ])
-    # Redirect outbound port 443 (HTTPS) from the guest to the proxy
-    run_in_ns([
-        "iptables", "-t", "nat", "-A", "PREROUTING",
-        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "443",
-        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
-    ])
+    for dport in ("80", "443"):
+        rule = [
+            "iptables", "-t", "nat",
+            "-s", "172.16.0.0/30", "-p", "tcp", "--dport", dport,
+            "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
+        ]
+        # Check first, append only if missing
+        check = run_in_ns(["iptables", "-t", "nat", "-C", "PREROUTING"] + rule[3:])
+        if check.returncode != 0:
+            run_in_ns(["iptables", "-t", "nat", "-A", "PREROUTING"] + rule[3:])
+
     log.info("Proxy redirect rules added for %s (port %d)", ns_name, PROXY_PORT)
 
 
