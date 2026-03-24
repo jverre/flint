@@ -261,7 +261,16 @@ class SandboxManager:
                 pass
             raise
 
-        # 6. Create entry and insert into in-memory dict
+        # 6. Restore network policy from SQLite
+        network_policy = None
+        policy_json = self._state_store.get_network_policy(sandbox_id)
+        if policy_json:
+            try:
+                network_policy = json.loads(policy_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 7. Create entry and insert into in-memory dict
         entry = _SandboxEntry(
             vm_id=sandbox_id,
             process=process,
@@ -275,15 +284,20 @@ class SandboxManager:
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
             chroot_base=chroot_base,
+            network_policy=network_policy,
         )
 
         with self._lock:
             self._sandboxes[sandbox_id] = entry
 
-        # 7. Persist
+        # 8. Persist state transition
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
             self._state_store.update_sandbox(sandbox_id, pid=process.pid, daemon_pid=os.getpid())
+
+        # 9. Re-apply credential injection proxy if policy has transforms
+        if network_policy:
+            self._apply_network_policy(entry, network_policy)
 
         log.debug("[%s] resumed", sandbox_id[:8])
         return sandbox_id
