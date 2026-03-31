@@ -43,13 +43,9 @@ class Sidebar(Container):
     #sidebar-brand {
         height: 3;
         padding: 1 2;
-        color: $text;
-    }
-
-    #sidebar-brand-text {
         text-style: bold;
         color: $primary;
-        width: 1fr;
+        content-align-vertical: middle;
     }
 
     /* ── Section header ───────────────────────────── */
@@ -117,8 +113,7 @@ class Sidebar(Container):
     vm_count = reactive(0)
 
     def compose(self) -> ComposeResult:
-        with Container(id="sidebar-brand"):
-            yield Static("Flint", id="sidebar-brand-text")
+        yield Static("Flint", id="sidebar-brand")
         with Horizontal(id="section-header"):
             yield Static("Virtual Machines", id="section-title")
             yield Static(" + ", id="btn-new-vm")
