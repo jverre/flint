@@ -1,12 +1,22 @@
 import logging
 import os
+import platform
 
 log = logging.getLogger(__name__)
 
+
+def _default_dirs() -> tuple[str, str]:
+    system = platform.system()
+    if system == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support/flint")
+        return f"{base}/data", f"{base}/state"
+    return "/microvms", "/tmp/flint"
+
 # ── Env-var-driven directories ────────────────────────────────────────────
+_DEFAULT_DATA_DIR, _DEFAULT_STATE_DIR = _default_dirs()
 DAEMON_PORT = int(os.environ.get("FLINT_PORT", "9100"))
-DATA_DIR = os.environ.get("FLINT_DATA_DIR", "/microvms")
-STATE_DIR = os.environ.get("FLINT_STATE_DIR", "/tmp/flint")
+DATA_DIR = os.environ.get("FLINT_DATA_DIR", _DEFAULT_DATA_DIR)
+STATE_DIR = os.environ.get("FLINT_STATE_DIR", _DEFAULT_STATE_DIR)
 
 # Debug log to file
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -70,3 +80,12 @@ PROXY_CA_DIR = f"{STATE_DIR}/proxy-ca"
 HEALTH_CHECK_INTERVAL = 5.0         # seconds between health probes
 DEFAULT_SANDBOX_TIMEOUT = 300       # seconds before auto-cleanup (5 min)
 ERROR_CLEANUP_DELAY = 60            # seconds to keep error-state sandboxes before cleanup
+
+# ── macOS Virtualization.framework backend ───────────────────────────────
+VZ_KERNEL_PATH = os.environ.get("FLINT_VZ_KERNEL_PATH", os.path.join(DATA_DIR, "vz", "vmlinux"))
+VZ_ROOTFS_PATH = os.environ.get("FLINT_VZ_ROOTFS_PATH", os.path.join(DATA_DIR, "vz", "rootfs.img"))
+VZ_INITRD_PATH = os.environ.get("FLINT_VZ_INITRD_PATH", "")
+VZ_BOOT_ARGS = os.environ.get("FLINT_VZ_BOOT_ARGS", "console=hvc0 root=/dev/vda rw init=/etc/init-net.sh net.ifnames=0")
+VZ_CPU_COUNT = int(os.environ.get("FLINT_VZ_CPU_COUNT", "2"))
+VZ_MEMORY_BYTES = int(os.environ.get("FLINT_VZ_MEMORY_BYTES", str(2 * 1024 * 1024 * 1024)))
+VZ_READY_TIMEOUT = float(os.environ.get("FLINT_VZ_READY_TIMEOUT", "60"))

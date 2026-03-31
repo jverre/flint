@@ -52,7 +52,7 @@ class DaemonClient:
     def __init__(self, base_url: str = DEFAULT_URL) -> None:
         self._base_url = base_url
         self._ws_base_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
-        self._http = httpx.Client(base_url=base_url, timeout=30.0)
+        self._http = httpx.Client(base_url=base_url, timeout=120.0)
         self._terminals: dict[str, _TerminalConnection] = {}
 
     def close(self) -> None:
