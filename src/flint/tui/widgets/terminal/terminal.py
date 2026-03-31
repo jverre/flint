@@ -42,7 +42,6 @@ class Terminal(Vertical):
 
     #status-bar {
         height: 1;
-        background: $surface;
         color: $text-muted;
         padding: 0 1;
         text-style: dim;

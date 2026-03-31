@@ -2,8 +2,9 @@ import logging
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.widgets import Footer, Input, ListView
+from textual.widgets import Button, Input, ListView, Static
 
 from flint.sandbox import Sandbox
 from flint.tui.widgets.sidebar import Sidebar
@@ -19,7 +20,6 @@ class HomeScreen(Screen):
 
     BINDINGS = [
         Binding("tab", "toggle_panel", "Toggle Panel", priority=True),
-        Binding("s", "start_vm", "Start VM"),
         Binding("backspace", "delete_vm", "Delete VM"),
         Binding("delete", "delete_vm", "Delete VM"),
         Binding("b", "benchmark", "Benchmark"),
@@ -28,12 +28,20 @@ class HomeScreen(Screen):
     _pending_auto_focus: bool = False
 
     def compose(self) -> ComposeResult:
+        yield Static("Flint", id="brand-header")
+        with Horizontal(id="section-header"):
+            yield Static("Virtual Machines (0)", id="section-title")
+            yield Button("+", id="new-vm-btn", variant="default")
         yield Sidebar()
         yield ContentArea()
-        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#vm-list", ListView).focus()
+        self.query_one(ContentArea).display = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "new-vm-btn":
+            self.run_worker(self._start_vm_in_thread, thread=True)
 
     def _sidebar_has_focus(self) -> bool:
         focused = self.app.focused
@@ -43,17 +51,16 @@ class HomeScreen(Screen):
         return focused is sidebar or sidebar in focused.ancestors
 
     def action_toggle_panel(self) -> None:
+        content = self.query_one(ContentArea)
+        if not content.display:
+            if self._sidebar_has_focus():
+                return
         if self._sidebar_has_focus():
             terminal = self.query_one(Terminal)
             if terminal.query_one(PromptRow).display:
                 terminal.query_one("#vm-input", Input).focus()
         else:
             self.query_one("#vm-list", ListView).focus()
-
-    def action_start_vm(self) -> None:
-        if not self._sidebar_has_focus():
-            return
-        self.run_worker(self._start_vm_in_thread, thread=True)
 
     def _start_vm_in_thread(self) -> None:
         try:
@@ -65,7 +72,9 @@ class HomeScreen(Screen):
 
     def _on_vm_started(self) -> None:
         sidebar = self.query_one(Sidebar)
-        sidebar.vm_count = len(Sandbox.list())
+        vms = Sandbox.list()
+        sidebar.vm_count = len(vms)
+        self._update_section_title(len(vms))
         vm_list = self.query_one("#vm-list", ListView)
         vm_list.index = len(vm_list) - 1
         self._pending_auto_focus = True
@@ -82,7 +91,11 @@ class HomeScreen(Screen):
         content = self.query_one(ContentArea)
         content.evict_vm(vm_id)
         sidebar = self.query_one(Sidebar)
-        sidebar.vm_count = len(Sandbox.list())
+        vms = Sandbox.list()
+        sidebar.vm_count = len(vms)
+        self._update_section_title(len(vms))
+        if not vms:
+            content.display = False
 
     def on_terminal_prompt_ready(self, event: Terminal.PromptReady) -> None:
         if self._pending_auto_focus:
@@ -97,4 +110,10 @@ class HomeScreen(Screen):
         if event.item is not None:
             vm_id = event.item.vm_id
             content = self.query_one(ContentArea)
+            content.display = True
             content.show_vm_logs(vm_id)
+
+    def _update_section_title(self, count: int) -> None:
+        self.query_one("#section-title", Static).update(
+            f"Virtual Machines ({count})"
+        )
