@@ -1,13 +1,93 @@
-"""Install firecracker, jailer, and vmlinux kernel."""
+"""Install host runtime dependencies and guest assets."""
 
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
+
+import sys
+
+from .config import VZ_KERNEL_PATH, VZ_ROOTFS_PATH
+
+
+# ── macOS Virtualization.framework entitlement signing ──────────────────────
+
+_VZ_ENTITLEMENTS_PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>"""
+
+
+def _python_has_vz_entitlement(binary: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["codesign", "-d", "--entitlements", "-", binary],
+            capture_output=True, text=True,
+        )
+        return "com.apple.security.virtualization" in result.stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+def ensure_vz_entitlement() -> None:
+    """Ensure the running Python binary has the macOS virtualization entitlement.
+
+    On macOS arm64, Apple's Virtualization.framework requires the process to
+    carry ``com.apple.security.virtualization``.  If the current binary lacks
+    it this function:
+
+    1. Replaces the venv ``python`` symlink with a real copy of the binary.
+    2. Ad-hoc signs it with the required entitlement.
+    3. ``os.execv``\\s so the rest of the daemon runs inside the entitled process.
+
+    No-op on non-macOS, non-arm64, or when already entitled.
+    """
+    if platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"):
+        return
+
+    real_exe = os.path.realpath(sys.executable)
+    if _python_has_vz_entitlement(real_exe):
+        return
+
+    # Locate the venv's ``python`` — it's the file the other symlinks resolve through.
+    venv_bin = os.path.dirname(os.path.abspath(sys.executable))
+    venv_python = os.path.join(venv_bin, "python")
+
+    if not os.path.exists(venv_python):
+        _error(f"Cannot locate venv python at {venv_python} — skipping entitlement signing")
+        return
+
+    # If it's still a symlink, replace with a copy of the real binary.
+    if os.path.islink(venv_python):
+        real = os.path.realpath(venv_python)
+        os.remove(venv_python)
+        shutil.copy2(real, venv_python)
+
+    # Write the entitlements plist once.
+    plist_path = os.path.join(tempfile.gettempdir(), "flint-vz-entitlements.plist")
+    with open(plist_path, "w") as f:
+        f.write(_VZ_ENTITLEMENTS_PLIST)
+
+    _info("Signing Python binary with macOS virtualization entitlement…")
+    subprocess.run(
+        ["codesign", "--entitlements", plist_path, "--force", "-s", "-", venv_python],
+        check=True,
+    )
+    _info("Signed — re-executing under entitled binary")
+
+    # Re-exec: the current process is replaced; PID stays the same.
+    os.execv(venv_python, [venv_python] + sys.argv)
 
 
 def _info(msg: str) -> None:
@@ -38,7 +118,6 @@ def _resolve_version(fc_version: str) -> str:
 
 
 def _detect_arch() -> str:
-    import platform
     arch = platform.machine()
     if arch not in ("x86_64", "aarch64"):
         raise RuntimeError(f"Unsupported architecture: {arch}")
@@ -48,6 +127,243 @@ def _detect_arch() -> str:
 def _download(url: str, dest: Path) -> None:
     with urllib.request.urlopen(url) as resp, open(dest, "wb") as f:
         shutil.copyfileobj(resp, f)
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _require_command(cmd: str, *, install_hint: str | None = None) -> None:
+    if shutil.which(cmd):
+        return
+    hint = f" Install {install_hint} and try again." if install_hint else ""
+    raise RuntimeError(f"Required command not found: {cmd}.{hint}")
+
+
+def _require_docker() -> None:
+    _require_command("docker", install_hint="Docker Desktop")
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Docker is installed but not available. Start Docker Desktop and try again."
+        ) from exc
+
+
+def _require_macos_arm64() -> None:
+    system = platform.system()
+    arch = platform.machine().lower()
+    if system != "Darwin" or arch not in ("arm64", "aarch64"):
+        raise RuntimeError("This command only supports macOS on Apple Silicon.")
+
+
+def _resolve_vz_paths(vz_dir: str | None = None) -> tuple[Path, Path]:
+    if vz_dir:
+        base = Path(vz_dir).expanduser()
+        return base / "vmlinux", base / "rootfs.img"
+    return Path(VZ_KERNEL_PATH).expanduser(), Path(VZ_ROOTFS_PATH).expanduser()
+
+
+def _copy_atomic(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dest)
+
+
+def _download_macos_kernel(dest: Path, kernel_release: str, kernel_build: str) -> None:
+    url = (
+        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/"
+        f"v{kernel_release}/aarch64/vmlinux-{kernel_build}"
+    )
+    _info(f"Downloading Linux arm64 kernel to {dest}...")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _download(url, dest)
+    size_mb = dest.stat().st_size // (1024 * 1024)
+    _info(f"Kernel installed at {dest} ({size_mb}M)")
+
+
+def _build_flintd_linux_arm64(output_path: Path) -> None:
+    source_dir = _project_root() / "guest" / "flintd"
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"flintd source not found: {source_dir}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _info("Building flintd guest agent for linux/arm64...")
+    local_go = shutil.which("go")
+    if local_go:
+        env = os.environ.copy()
+        env["CGO_ENABLED"] = "0"
+        env["GOOS"] = "linux"
+        env["GOARCH"] = "arm64"
+        subprocess.run(
+            [local_go, "build", "-buildvcs=false", "-ldflags=-s -w", "-o", str(output_path), "."],
+            cwd=source_dir,
+            check=True,
+            env=env,
+        )
+    else:
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{source_dir}:/src",
+                "-v",
+                f"{output_path.parent}:/out",
+                "-w",
+                "/src",
+                "golang:1.24-alpine",
+                "sh",
+                "-lc",
+                "CGO_ENABLED=0 GOOS=linux GOARCH=arm64 /usr/local/go/bin/go build -buildvcs=false -ldflags='-s -w' -o /out/flintd .",
+            ],
+            check=True,
+        )
+    output_path.chmod(0o755)
+    _info(f"Built flintd at {output_path}")
+
+
+def _prepare_macos_rootfs_tree(rootfs_dir: Path, alpine_tarball: Path, flintd_path: Path) -> None:
+    with tarfile.open(alpine_tarball, "r:gz") as tf:
+        tf.extractall(rootfs_dir)
+
+    init_script = _project_root() / "assets" / "init-vz.sh"
+    if not init_script.exists():
+        raise FileNotFoundError(f"Missing macOS init script: {init_script}")
+
+    (rootfs_dir / "usr" / "local" / "bin").mkdir(parents=True, exist_ok=True)
+    (rootfs_dir / "var" / "log").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(flintd_path, rootfs_dir / "usr" / "local" / "bin" / "flintd")
+    shutil.copy2(init_script, rootfs_dir / "etc" / "init-net.sh")
+    os.chmod(rootfs_dir / "usr" / "local" / "bin" / "flintd", 0o755)
+    os.chmod(rootfs_dir / "etc" / "init-net.sh", 0o755)
+
+
+def _build_ext4_image_with_docker(rootfs_dir: Path, dest: Path, size_mb: int) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = dest.parent
+    out_name = "rootfs.img"
+    _info(f"Building ext4 rootfs image ({size_mb} MB) at {dest}...")
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{rootfs_dir}:/rootfs:ro",
+            "-v",
+            f"{work_dir}:/out",
+            "alpine:3.21",
+            "sh",
+            "-lc",
+            (
+                "set -eu; "
+                "apk add --no-cache e2fsprogs >/dev/null; "
+                "mkdir -p /tmp/rootfs; "
+                "cp -a /rootfs/. /tmp/rootfs/; "
+                "chown -R 0:0 /tmp/rootfs; "
+                f"rm -f /out/{out_name}; "
+                f"truncate -s {size_mb}M /out/{out_name}; "
+                f"mke2fs -q -d /tmp/rootfs -t ext4 -F /out/{out_name}"
+            ),
+        ],
+        check=True,
+    )
+    _info(f"Rootfs image installed at {dest}")
+
+
+def check_macos_vz_assets(vz_dir: str | None = None) -> bool:
+    """Print macOS guest asset status. Returns True if both assets are present."""
+    kernel_path, rootfs_path = _resolve_vz_paths(vz_dir)
+    all_present = True
+
+    if kernel_path.exists():
+        size_mb = kernel_path.stat().st_size // (1024 * 1024)
+        print(f"  vz kernel    {kernel_path} ({size_mb}M)")
+    else:
+        print(f"  vz kernel    NOT FOUND (expected at {kernel_path})")
+        all_present = False
+
+    if rootfs_path.exists():
+        size_mb = rootfs_path.stat().st_size // (1024 * 1024)
+        print(f"  vz rootfs    {rootfs_path} ({size_mb}M)")
+    else:
+        print(f"  vz rootfs    NOT FOUND (expected at {rootfs_path})")
+        all_present = False
+
+    return all_present
+
+
+def setup_macos_vz(
+    *,
+    vz_dir: str | None = None,
+    alpine_version: str = "3.21.3",
+    kernel_version: str = "1.12",
+    kernel_patch: str = "6.1.128",
+    rootfs_size_mb: int = 1024,
+    force: bool = False,
+) -> None:
+    """Prepare macOS Virtualization.framework guest assets for Flint."""
+    _require_macos_arm64()
+    _require_docker()
+
+    kernel_path, rootfs_path = _resolve_vz_paths(vz_dir)
+    asset_dir = kernel_path.parent
+    if rootfs_path.parent != asset_dir:
+        rootfs_path.parent.mkdir(parents=True, exist_ok=True)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
+    if check_macos_vz_assets(vz_dir=vz_dir) and not force:
+        _skip("macOS guest assets already exist - skipping (use --force to rebuild)")
+        print("\n  Done.")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="flint-vz-setup-") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        alpine_tarball = tmpdir / f"alpine-minirootfs-{alpine_version}-aarch64.tar.gz"
+        flintd_path = tmpdir / "flintd"
+        rootfs_dir = tmpdir / "rootfs"
+        rootfs_image = tmpdir / "rootfs.img"
+
+        if force:
+            for path in (kernel_path, rootfs_path):
+                if path.exists():
+                    _skip(f"Removing existing asset {path}")
+                    path.unlink()
+
+        if not kernel_path.exists():
+            _download_macos_kernel(kernel_path, kernel_version, kernel_patch)
+        else:
+            _skip(f"Kernel already exists at {kernel_path} - skipping")
+
+        if not rootfs_path.exists():
+            alpine_url = (
+                "https://dl-cdn.alpinelinux.org/alpine/"
+                f"v{'.'.join(alpine_version.split('.')[:2])}/releases/aarch64/"
+                f"alpine-minirootfs-{alpine_version}-aarch64.tar.gz"
+            )
+            _info(f"Downloading Alpine minirootfs {alpine_version}...")
+            _download(alpine_url, alpine_tarball)
+            _build_flintd_linux_arm64(flintd_path)
+            rootfs_dir.mkdir(parents=True, exist_ok=True)
+            _prepare_macos_rootfs_tree(rootfs_dir, alpine_tarball, flintd_path)
+            _build_ext4_image_with_docker(rootfs_dir, rootfs_image, rootfs_size_mb)
+            _copy_atomic(rootfs_image, rootfs_path)
+        else:
+            _skip(f"Rootfs image already exists at {rootfs_path} - skipping")
+
+    print("")
+    print("  macOS guest assets are ready.")
+    print(f"  kernel: {kernel_path}")
+    print(f"  rootfs: {rootfs_path}")
+    print("  Next: run 'uv run flint start'")
 
 
 def _verify_checksum(tarball: Path, checksum_file: Path) -> None:

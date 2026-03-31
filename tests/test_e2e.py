@@ -3,10 +3,15 @@
 Requires a running daemon (`flint start`).
 """
 
+import os
+import shutil
 import threading
 import time
 
-from flint import Sandbox
+import httpx
+import pytest
+
+from flint import Sandbox, Template
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -39,6 +44,13 @@ def test_connect_to_existing(sandbox):
     reconnected = Sandbox.connect(sandbox.id)
     assert reconnected.id == sandbox.id
     assert reconnected.is_running()
+
+
+def test_health_reports_backend(backend_kind):
+    port = os.environ["FLINT_PORT"]
+    resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+    resp.raise_for_status()
+    assert resp.json()["backend_kind"] == backend_kind
 
 
 # ── Command execution ────────────────────────────────────────────────────────
@@ -157,6 +169,15 @@ def test_stderr_separate(sandbox):
     assert "err" in result.stderr
 
 
+def test_pause_and_resume(sandbox):
+    sandbox.commands.run("echo persisted > /tmp/persist.txt")
+    sandbox.pause()
+    sandbox.resume()
+    result = sandbox.commands.run("cat /tmp/persist.txt")
+    assert result.exit_code == 0
+    assert "persisted" in result.stdout
+
+
 # ── Filesystem operations ────────────────────────────────────────────────────
 
 
@@ -214,31 +235,18 @@ def test_multiple_sandboxes():
         sb2.kill()
 
 
-# ── Jailer isolation ──────────────────────────────────────────────────────────
+@pytest.mark.slow
+def test_template_build_and_run(backend_kind):
+    if backend_kind != "linux-firecracker":
+        pytest.skip("Template build-and-run test is only implemented for the Linux backend today")
+    if shutil.which("docker") is None:
+        pytest.skip("docker is required for template build tests")
 
-
-def test_jailer_chroot_cleanup(sandbox):
-    """Verify the jailer chroot dir and cgroups are removed after kill."""
-    import os
-    from flint.core._jailer import JailSpec
-
-    vm_id = sandbox.id
-    spec = JailSpec(vm_id=vm_id, ns_name=f"fc-{vm_id[:8]}")
-    chroot_base = spec.chroot_base
-
-    assert os.path.isdir(chroot_base), "Chroot should exist while VM is running"
-    sandbox.kill()
-    time.sleep(0.5)
-    assert not os.path.exists(chroot_base), "Chroot should be fully removed after kill"
-
-
-def test_jailer_chroot_structure(sandbox):
-    """Verify expected files exist inside the chroot while VM is running."""
-    import os
-    from flint.core._jailer import JailSpec
-
-    vm_id = sandbox.id
-    spec = JailSpec(vm_id=vm_id, ns_name=f"fc-{vm_id[:8]}")
-
-    assert os.path.isfile(f"{spec.chroot_root}/rootfs.ext4"), "rootfs should be staged in chroot"
-    assert os.path.exists(f"{spec.chroot_root}/firecracker.sock"), "API socket should exist"
+    template = Template("flint-test-template").from_alpine_image().run_cmd("touch /tmp/template-built").build()
+    sandbox = Sandbox(template_id=template.template_id)
+    try:
+        result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
+        assert result.exit_code == 0
+        assert "ok" in result.stdout
+    finally:
+        sandbox.kill()

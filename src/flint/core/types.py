@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 import re
-import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -40,7 +39,7 @@ class CommandResult:
 @dataclass
 class _SandboxEntry:
     vm_id: str
-    process: subprocess.Popen | None
+    process: Any | None
     pid: int
     vm_dir: str
     socket_path: str
@@ -51,6 +50,13 @@ class _SandboxEntry:
     state: SandboxState
     chroot_base: str = ""
     template_id: str = "default"
+    backend_kind: str = "linux-firecracker"
+    backend_vm_ref: str = ""
+    runtime_dir: str = ""
+    guest_arch: str = ""
+    transport_ref: str = ""
+    pause_state_ref: str = ""
+    backend_metadata: dict[str, Any] = field(default_factory=dict)
     screen_version: int = 0
     t_instance_start: float = 0.0
     boot_time_ms: float | None = None
@@ -69,6 +75,7 @@ class _SandboxEntry:
             "pid": self.pid,
             "state": _STATE_API_NAMES.get(self.state, str(self.state)),
             "template_id": self.template_id,
+            "backend_kind": self.backend_kind,
             "agent_healthy": self.agent_healthy,
             "created_at": self.created_at,
             "boot_time_ms": self.boot_time_ms,

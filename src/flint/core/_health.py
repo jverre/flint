@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 
@@ -56,23 +55,16 @@ class HealthMonitor:
             if entry.state != SandboxState.RUNNING:
                 continue
 
-            pid = entry.pid
-            alive = True
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                alive = False
-            except PermissionError:
-                pass  # alive but different user
+            alive, detail = self._manager._backend.check_entry_alive(entry)
 
             if alive:
                 if self._store:
                     self._store.update_health(vm_id, now)
             else:
-                log.warning("[%s] process %d dead — transitioning to error", vm_id[:8], pid)
+                log.warning("[%s] sandbox unhealthy — transitioning to error", vm_id[:8])
                 entry.state = SandboxState.ERROR
                 if self._store:
                     self._store.transition_state(
                         vm_id, SandboxState.ERROR,
-                        detail=f"process {pid} not found",
+                        detail=detail or "sandbox unhealthy",
                     )

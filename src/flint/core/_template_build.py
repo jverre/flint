@@ -9,7 +9,7 @@ import subprocess
 
 from .config import log, TEMPLATES_DIR, KERNEL_PATH, BOOT_ARGS, GUEST_MAC
 from ._snapshot import create_golden_snapshot
-from ._template_registry import register_template, update_template_status
+from ._template_registry import register_template_artifact, update_template_artifact_status
 
 
 def _slugify(name: str) -> str:
@@ -160,7 +160,14 @@ def build_template(
     os.makedirs(template_dir, exist_ok=True)
 
     # Register as "building"
-    register_template(template_id, name, template_dir, status="building", rootfs_size_mb=rootfs_size_mb)
+    register_template_artifact(
+        template_id,
+        name,
+        "linux-firecracker",
+        template_dir,
+        status="building",
+        rootfs_size_mb=rootfs_size_mb,
+    )
 
     try:
         # Prepare build context directory
@@ -194,7 +201,7 @@ def build_template(
         )
 
         # Update status
-        update_template_status(template_id, "ready")
+        update_template_artifact_status(template_id, "linux-firecracker", "ready")
 
         # Cleanup
         subprocess.run(["docker", "rmi", image_tag], capture_output=True)
@@ -204,5 +211,5 @@ def build_template(
         return template_id
 
     except Exception:
-        update_template_status(template_id, "failed")
+        update_template_artifact_status(template_id, "linux-firecracker", "failed")
         raise

@@ -30,7 +30,14 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     pause_snapshot_dir TEXT,
     daemon_pid     INTEGER,
     error_message  TEXT,
-    chroot_base    TEXT
+    chroot_base    TEXT,
+    backend_kind   TEXT NOT NULL DEFAULT 'linux-firecracker',
+    backend_vm_ref TEXT,
+    runtime_dir    TEXT,
+    guest_arch     TEXT,
+    transport_ref  TEXT,
+    pause_state_ref TEXT,
+    backend_meta_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_log (
@@ -64,6 +71,20 @@ class StateStore:
             self._conn.commit()
         except Exception:
             pass  # Column already exists
+        for column_def in (
+            "backend_kind TEXT NOT NULL DEFAULT 'linux-firecracker'",
+            "backend_vm_ref TEXT",
+            "runtime_dir TEXT",
+            "guest_arch TEXT",
+            "transport_ref TEXT",
+            "pause_state_ref TEXT",
+            "backend_meta_json TEXT",
+        ):
+            try:
+                self._conn.execute(f"ALTER TABLE sandboxes ADD COLUMN {column_def}")
+                self._conn.commit()
+            except Exception:
+                pass
 
     def insert_sandbox(
         self,
@@ -78,17 +99,28 @@ class StateStore:
         boot_time_ms: float | None = None,
         timings_json: dict | None = None,
         chroot_base: str | None = None,
+        backend_kind: str = "linux-firecracker",
+        backend_vm_ref: str | None = None,
+        runtime_dir: str | None = None,
+        guest_arch: str | None = None,
+        transport_ref: str | None = None,
+        pause_state_ref: str | None = None,
+        backend_meta_json: dict | None = None,
     ) -> None:
         now = time.time()
         self._conn.execute(
             """INSERT OR REPLACE INTO sandboxes
                (vm_id, pid, vm_dir, socket_path, ns_name, state, template_id,
-                created_at, updated_at, boot_time_ms, timings_json, daemon_pid, chroot_base)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, updated_at, boot_time_ms, timings_json, daemon_pid, chroot_base,
+                backend_kind, backend_vm_ref, runtime_dir, guest_arch, transport_ref,
+                pause_state_ref, backend_meta_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (vm_id, pid, vm_dir, socket_path, ns_name, state.value, template_id,
              now, now, boot_time_ms,
              json.dumps(timings_json) if timings_json else None,
-             daemon_pid, chroot_base),
+             daemon_pid, chroot_base, backend_kind, backend_vm_ref, runtime_dir,
+             guest_arch, transport_ref, pause_state_ref,
+             json.dumps(backend_meta_json) if backend_meta_json else None),
         )
         self._conn.execute(
             "INSERT INTO state_log (vm_id, from_state, to_state, timestamp, daemon_pid) VALUES (?, ?, ?, ?, ?)",
@@ -152,8 +184,8 @@ class StateStore:
     def set_pause_snapshot(self, vm_id: str, snapshot_dir: str) -> None:
         now = time.time()
         self._conn.execute(
-            "UPDATE sandboxes SET pause_snapshot_dir = ?, updated_at = ? WHERE vm_id = ?",
-            (snapshot_dir, now, vm_id),
+            "UPDATE sandboxes SET pause_snapshot_dir = ?, pause_state_ref = ?, updated_at = ? WHERE vm_id = ?",
+            (snapshot_dir, snapshot_dir, now, vm_id),
         )
         self._conn.commit()
 

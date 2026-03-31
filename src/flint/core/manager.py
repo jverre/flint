@@ -4,15 +4,11 @@ import json
 import os
 import threading
 import time
-import urllib.request
 from typing import TYPE_CHECKING
 
-from .config import log, GOLDEN_DIR, GOLDEN_TAP, GUEST_IP, DEFAULT_TEMPLATE_ID
+from .backends.base import HostBackend
+from .config import log, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
-from ._boot import _boot_from_snapshot, _teardown_vm, BootResult
-from ._netns import _enter_netns, _restore_netns
-from ._snapshot import golden_snapshot_exists
-from ._template_registry import template_snapshot_exists as _template_snapshot_exists
 
 if TYPE_CHECKING:
     from ._state_store import StateStore
@@ -48,57 +44,57 @@ def _extract_transform_rules(policy: dict) -> dict:
 class SandboxManager:
     """Owns all sandbox state and lifecycle. No TUI dependencies."""
 
-    def __init__(self, state_store: StateStore | None = None) -> None:
+    def __init__(self, backend: HostBackend, state_store: StateStore | None = None) -> None:
+        self._backend = backend
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
         self._state_store = state_store
 
     def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> str:
         """Start an interactive VM from a template snapshot. Returns the vm_id."""
-        if template_id == DEFAULT_TEMPLATE_ID:
-            if not golden_snapshot_exists():
-                raise RuntimeError(f"Golden snapshot not found in {GOLDEN_DIR}")
-        else:
-            if not _template_snapshot_exists(template_id):
-                raise RuntimeError(f"Template snapshot not found: {template_id}")
-
-        boot = _boot_from_snapshot(
+        boot = self._backend.create(
             template_id=template_id,
             allow_internet_access=allow_internet_access,
             use_pool=use_pool,
             use_pyroute2=use_pyroute2,
-            network_overrides=[{"iface_id": "eth0", "host_dev_name": GOLDEN_TAP}],
         )
 
-        vm_id = boot.vm_id
+        vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
         agent_url = boot.agent_url
-
-        # Warmup: send a quick exec to measure time-to-interactive
-        t0 = time.monotonic()
-        try:
-            self._agent_exec(boot.ns_name, agent_url, ["echo", "benchmark"], timeout=5)
-        except Exception:
-            pass
-        boot.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
 
         entry = _SandboxEntry(
             vm_id=vm_id,
             process=boot.process,
-            pid=boot.process.pid,
+            pid=boot.pid,
             vm_dir=boot.vm_dir,
             socket_path=boot.socket_path,
             ns_name=boot.ns_name,
-            guest_ip=GUEST_IP,
+            guest_ip=boot.guest_ip,
             agent_url=agent_url,
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=template_id,
             chroot_base=boot.chroot_base,
+            backend_kind=self._backend.kind,
+            backend_vm_ref=boot.backend_vm_ref or vm_id,
+            runtime_dir=boot.runtime_dir or boot.vm_dir,
+            guest_arch=boot.guest_arch,
+            transport_ref=boot.transport_ref,
+            backend_metadata=dict(boot.backend_metadata),
             t_instance_start=boot.t_total,
             ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
             timings=boot.timings,
             network_policy=network_policy,
         )
+
+        # Warmup: send a quick exec to measure time-to-interactive.
+        t0 = time.monotonic()
+        try:
+            body = json.dumps({"cmd": ["echo", "benchmark"], "timeout": 5}).encode()
+            self._backend.proxy_guest_request(entry, "POST", "/exec", body, timeout=10)
+        except Exception:
+            pass
+        entry.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
 
         with self._lock:
             self._sandboxes[vm_id] = entry
@@ -115,8 +111,14 @@ class SandboxManager:
                 daemon_pid=os.getpid(),
                 template_id=template_id,
                 boot_time_ms=entry.ready_time_ms,
-                timings_json=boot.timings,
+                timings_json=entry.timings,
                 chroot_base=boot.chroot_base,
+                backend_kind=entry.backend_kind,
+                backend_vm_ref=entry.backend_vm_ref,
+                runtime_dir=entry.runtime_dir,
+                guest_arch=entry.guest_arch,
+                transport_ref=entry.transport_ref,
+                backend_meta_json=entry.backend_metadata,
             )
 
         # Persist network policy if provided
@@ -146,7 +148,7 @@ class SandboxManager:
             except Exception:
                 pass
 
-        _teardown_vm(entry.process, entry.ns_name, entry.chroot_base, entry.vm_id)
+        self._backend.kill(entry)
 
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
@@ -162,40 +164,8 @@ class SandboxManager:
         if entry.state != SandboxState.RUNNING:
             raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
 
-        # 1. Pause vCPU
-        _fc_patch(entry.socket_path, "/vm", {"state": "Paused"})
+        self._backend.pause(entry, self._state_store)
 
-        # 2. Create pause snapshot (paths are chroot-relative)
-        snapshot_body = {
-            "snapshot_type": "Full",
-            "snapshot_path": "pause-vmstate",
-            "mem_file_path": "pause-mem",
-        }
-        resp = _fc_put(entry.socket_path, "/snapshot/create", snapshot_body)
-        if not _fc_status_ok(resp):
-            # Resume VM on failure
-            _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
-            raise RuntimeError(f"Snapshot create failed: {resp}")
-
-        # 3. Kill Firecracker process (snapshot is on disk)
-        if entry.process:
-            entry.process.kill()
-            try:
-                entry.process.wait(timeout=2)
-            except Exception:
-                pass
-
-        # 4. Update state
-        entry.state = SandboxState.PAUSED
-        entry.agent_healthy = False
-        entry.process = None
-
-        # 5. Persist
-        if self._state_store:
-            self._state_store.transition_state(sandbox_id, SandboxState.PAUSED)
-            self._state_store.set_pause_snapshot(sandbox_id, entry.vm_dir)
-
-        # 6. Remove from in-memory dict (no active process to track)
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
 
@@ -203,10 +173,6 @@ class SandboxManager:
 
     def resume(self, sandbox_id: str) -> str:
         """Resume a paused sandbox from its snapshot."""
-        from ._firecracker import _fc_put, _fc_patch, _fc_status_ok, _wait_for_api_socket, _wait_for_agent
-        from ._jailer import JailSpec, build_jailer_command
-        import subprocess as _subprocess
-
         if not self._state_store:
             raise RuntimeError("StateStore required for resume")
 
@@ -216,57 +182,7 @@ class SandboxManager:
         if row["state"] != SandboxState.PAUSED.value:
             raise RuntimeError(f"Sandbox {sandbox_id} is not paused (state={row['state']})")
 
-        vm_dir = row["vm_dir"]
-        ns_name = row["ns_name"]
-        chroot_base = row["chroot_base"]
-
-        spec = JailSpec(vm_id=sandbox_id, ns_name=ns_name)
-        socket_path = spec.socket_path_on_host
-
-        # Remove stale socket from previous run
-        try:
-            os.unlink(socket_path)
-        except FileNotFoundError:
-            pass
-
-        # 1. Start new jailer in existing netns
-        log_path = f"{vm_dir}/firecracker.log"
-        with open(log_path, "w") as log_fd:
-            process = _subprocess.Popen(
-                build_jailer_command(spec),
-                stdin=_subprocess.DEVNULL, stdout=log_fd, stderr=_subprocess.STDOUT,
-                start_new_session=True,
-            )
-
-        try:
-            _wait_for_api_socket(socket_path)
-
-            # 2. Load pause snapshot (chroot-relative paths)
-            snapshot_body = {
-                "snapshot_path": "pause-vmstate",
-                "mem_backend": {"backend_type": "File", "backend_path": "pause-mem"},
-                "enable_diff_snapshots": False,
-                "resume_vm": False,
-            }
-            resp = _fc_put(socket_path, "/snapshot/load", snapshot_body)
-            if not _fc_status_ok(resp):
-                raise RuntimeError(f"snapshot/load failed: {resp}")
-
-            # 3. Patch drives (chroot-relative)
-            _fc_patch(socket_path, "/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "rootfs.ext4"})
-
-            # 4. Resume VM
-            _fc_patch(socket_path, "/vm", {"state": "Resumed"})
-
-            # 5. Wait for guest agent
-            agent_url = _wait_for_agent(ns_name)
-        except Exception:
-            process.kill()
-            try:
-                process.wait(timeout=2)
-            except Exception:
-                pass
-            raise
+        boot = self._backend.resume(row)
 
         # 6. Restore network policy from SQLite
         network_policy = None
@@ -280,18 +196,24 @@ class SandboxManager:
         # 7. Create entry and insert into in-memory dict
         entry = _SandboxEntry(
             vm_id=sandbox_id,
-            process=process,
-            pid=process.pid,
-            vm_dir=vm_dir,
-            socket_path=socket_path,
-            ns_name=ns_name,
-            guest_ip=GUEST_IP,
-            agent_url=agent_url,
+            process=boot.process,
+            pid=boot.pid,
+            vm_dir=boot.vm_dir,
+            socket_path=boot.socket_path,
+            ns_name=boot.ns_name,
+            guest_ip=boot.guest_ip,
+            agent_url=boot.agent_url,
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
-            chroot_base=chroot_base,
+            chroot_base=boot.chroot_base,
             network_policy=network_policy,
+            backend_kind=row.get("backend_kind") or self._backend.kind,
+            backend_vm_ref=boot.backend_vm_ref or sandbox_id,
+            runtime_dir=boot.runtime_dir or boot.vm_dir,
+            guest_arch=boot.guest_arch or row.get("guest_arch") or "",
+            transport_ref=boot.transport_ref or row.get("transport_ref") or "",
+            backend_metadata=dict(boot.backend_metadata),
         )
 
         with self._lock:
@@ -300,7 +222,15 @@ class SandboxManager:
         # 8. Persist state transition
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
-            self._state_store.update_sandbox(sandbox_id, pid=process.pid, daemon_pid=os.getpid())
+            self._state_store.update_sandbox(
+                sandbox_id,
+                pid=boot.pid,
+                daemon_pid=os.getpid(),
+                runtime_dir=entry.runtime_dir,
+                guest_arch=entry.guest_arch,
+                transport_ref=entry.transport_ref,
+                backend_meta_json=json.dumps(entry.backend_metadata),
+            )
 
         # 9. Re-apply credential injection proxy if policy has transforms
         if network_policy:
@@ -383,17 +313,25 @@ class SandboxManager:
                 entry.proxy = None
                 _remove_proxy_redirect(entry.ns_name)
 
-    @staticmethod
-    def _agent_exec(ns_name: str, agent_url: str, cmd: list[str], timeout: float = 60) -> dict:
-        """Execute a command on the guest agent via HTTP, entering the namespace."""
-        body = json.dumps({"cmd": cmd, "timeout": int(timeout)}).encode()
-        url = f"{agent_url}/exec"
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
+    @property
+    def backend_kind(self) -> str:
+        return self._backend.kind
 
-        orig_fd = _enter_netns(ns_name)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
-                return json.loads(resp.read())
-        finally:
-            _restore_netns(orig_fd)
+    def agent_request(
+        self,
+        sandbox_id: str,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        timeout: float = 65,
+    ) -> tuple[int, bytes]:
+        entry = self.get_entry(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        return self._backend.proxy_guest_request(entry, method, path, body, timeout)
+
+    async def bridge_terminal(self, sandbox_id: str, websocket) -> None:
+        entry = self.get_entry(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        await self._backend.bridge_terminal(entry, websocket)

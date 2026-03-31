@@ -22,6 +22,12 @@ def start(port, data_dir, state_dir):
         os.environ["FLINT_DATA_DIR"] = data_dir
     if state_dir is not None:
         os.environ["FLINT_STATE_DIR"] = state_dir
+    # On macOS, ensure the Python binary has the virtualization entitlement.
+    # This may os.execv() — the call never returns in that case.
+    import platform
+    if platform.system() == "Darwin":
+        from flint.core._install import ensure_vz_entitlement
+        ensure_vz_entitlement()
     from flint.daemon.server import FlintDaemon
     FlintDaemon().run()
 
@@ -66,6 +72,30 @@ def install_deps(fc_version, install_dir, kernel_dir, kernel_version, skip_kerne
         kernel_dir=kernel_dir,
         kernel_version=kernel_version,
         skip_kernel=skip_kernel,
+    )
+
+
+@cli.command("setup-macos")
+@click.option("--vz-dir", default=None, type=str, help="Directory to store macOS VZ assets (default: Flint data dir)")
+@click.option("--alpine-version", default="3.21.3", help="Alpine minirootfs version to use (default: 3.21.3)")
+@click.option("--kernel-version", default="1.12", help="Firecracker CI kernel release prefix (default: 1.12)")
+@click.option("--kernel-patch", default="6.1.128", help="Kernel build suffix for Firecracker CI download (default: 6.1.128)")
+@click.option("--rootfs-size-mb", default=1024, type=int, help="Size of the macOS guest rootfs image in MB (default: 1024)")
+@click.option("--force", is_flag=True, default=False, help="Rebuild assets even if they already exist")
+@click.option("--check", is_flag=True, default=False, help="Print macOS guest asset status and exit")
+def setup_macos(vz_dir, alpine_version, kernel_version, kernel_patch, rootfs_size_mb, force, check):
+    """Prepare macOS Virtualization.framework guest assets for Flint."""
+    from flint.core._install import check_macos_vz_assets, setup_macos_vz
+    if check:
+        all_present = check_macos_vz_assets(vz_dir=vz_dir)
+        raise SystemExit(0 if all_present else 1)
+    setup_macos_vz(
+        vz_dir=vz_dir,
+        alpine_version=alpine_version,
+        kernel_version=kernel_version,
+        kernel_patch=kernel_patch,
+        rootfs_size_mb=rootfs_size_mb,
+        force=force,
     )
 
 

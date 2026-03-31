@@ -17,6 +17,9 @@ dependencies = [
     "httpx>=0.28",
     "websockets>=14.0",
     "mitmproxy>=10.0",
+    "pyobjc-core>=11.1; platform_system == 'Darwin'",
+    "pyobjc-framework-Cocoa>=11.1; platform_system == 'Darwin'",
+    "pyobjc-framework-Virtualization>=11.1; platform_system == 'Darwin'",
 ]
 
 [project.scripts]

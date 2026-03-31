@@ -8,25 +8,20 @@ import signal
 import threading
 import time
 import urllib.parse
-import urllib.request
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
 import uvicorn
 
+from flint.core.backends import get_host_backend
 from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
-    GOLDEN_DIR, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
-    DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, DEFAULT_SANDBOX_TIMEOUT, ERROR_CLEANUP_DELAY,
+    TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
+    DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, ERROR_CLEANUP_DELAY,
 )
 from flint.core.manager import SandboxManager
-from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
-from flint.core._pool import start_pool, stop_pool
-from flint.core._netns import _ensure_bridge, _enter_netns, _restore_netns
 from flint.core._template_registry import (
-    list_templates, get_template, register_template, delete_template as _delete_template,
-    get_template_dir,
+    list_templates, get_template, delete_template as _delete_template,
 )
-from flint.core._template_build import build_template as _build_template
 
 app = FastAPI()
 
@@ -101,32 +96,12 @@ def _write_state(daemon: FlintDaemon) -> None:
     os.rename(tmp_path, DAEMON_STATE_PATH)
 
 
-def _agent_request(entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
-    """Make an HTTP request to the guest agent inside the VM's network namespace.
-
-    IMPORTANT: Uses setns which only affects the calling kernel thread.
-    Safe to call from worker threads but NOT from the async event loop thread directly.
-    For async endpoints, use _agent_request_async instead.
-    """
-    url = f"{entry.agent_url}{path}"
-    req = urllib.request.Request(url, data=body, method=method)
-    if body is not None:
-        req.add_header("Content-Type", "application/json")
-
-    orig_fd = _enter_netns(entry.ns_name)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-    finally:
-        _restore_netns(orig_fd)
-
-
-async def _agent_request_async(entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
-    """Async wrapper: runs _agent_request in a thread pool to avoid setns on the event loop thread."""
+async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
+    """Async wrapper: runs backend transport in a worker thread."""
+    mgr = _require_manager()
+    _require_entry(vm_id)
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _agent_request, entry, method, path, body, timeout)
+    return await loop.run_in_executor(None, mgr.agent_request, vm_id, method, path, body, timeout)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -135,7 +110,7 @@ async def _agent_request_async(entry, method: str, path: str, body: bytes | None
 def health():
     print("GET /health")
     daemon = _get_daemon()
-    return {"status": "ok", "golden_snapshot_ready": daemon.golden_ready}
+    return {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind}
 
 
 @app.post("/vms")
@@ -264,9 +239,8 @@ def get_network_policy(vm_id: str):
 async def exec_command(vm_id: str, request: Request):
     """Proxy POST /exec to the guest agent."""
     print(f"POST /vms/{vm_id[:8]}/exec")
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", "/exec", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", "/exec", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
@@ -274,44 +248,39 @@ async def exec_command(vm_id: str, request: Request):
 async def create_process(vm_id: str, request: Request):
     """Proxy POST /processes to the guest agent."""
     print(f"POST /vms/{vm_id[:8]}/processes")
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", "/processes", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", "/processes", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.get("/vms/{vm_id}/processes")
 async def list_processes(vm_id: str):
     """Proxy GET /processes to the guest agent."""
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "GET", "/processes")
+    status, resp_body = await _agent_request_async(vm_id, "GET", "/processes")
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/input")
 async def process_input(vm_id: str, pid: int, request: Request):
     """Proxy stdin input to a guest process."""
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/input", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/input", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/signal")
 async def process_signal(vm_id: str, pid: int, request: Request):
     """Proxy signal to a guest process."""
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/signal", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/signal", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/resize")
 async def process_resize(vm_id: str, pid: int, request: Request):
     """Proxy resize to a guest process."""
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", f"/processes/{pid}/resize", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/resize", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
@@ -320,8 +289,7 @@ async def process_resize(vm_id: str, pid: int, request: Request):
 @app.get("/vms/{vm_id}/files")
 async def read_file(vm_id: str, path: str):
     """Proxy GET /files to the guest agent."""
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "GET", f"/files?path={urllib.parse.quote(path, safe='/')}")
+    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files?path={urllib.parse.quote(path, safe='/')}")
     media = "application/octet-stream" if status == 200 else "application/json"
     return Response(content=resp_body, status_code=status, media_type=media)
 
@@ -329,37 +297,32 @@ async def read_file(vm_id: str, path: str):
 @app.post("/vms/{vm_id}/files")
 async def write_file(vm_id: str, path: str, request: Request, mode: str = "0644"):
     """Proxy POST /files to the guest agent."""
-    entry = _require_entry(vm_id)
     body = await request.body()
-    status, resp_body = await _agent_request_async(entry, "POST", f"/files?path={urllib.parse.quote(path, safe='/')}&mode={mode}", body)
+    status, resp_body = await _agent_request_async(vm_id, "POST", f"/files?path={urllib.parse.quote(path, safe='/')}&mode={mode}", body)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.get("/vms/{vm_id}/files/stat")
 async def stat_file(vm_id: str, path: str):
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "GET", f"/files/stat?path={urllib.parse.quote(path, safe='/')}")
+    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files/stat?path={urllib.parse.quote(path, safe='/')}")
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.get("/vms/{vm_id}/files/list")
 async def list_files(vm_id: str, path: str):
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "GET", f"/files/list?path={urllib.parse.quote(path, safe='/')}")
+    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files/list?path={urllib.parse.quote(path, safe='/')}")
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.post("/vms/{vm_id}/files/mkdir")
 async def mkdir(vm_id: str, path: str, parents: bool = True):
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "POST", f"/files/mkdir?path={urllib.parse.quote(path, safe='/')}&parents={'true' if parents else 'false'}")
+    status, resp_body = await _agent_request_async(vm_id, "POST", f"/files/mkdir?path={urllib.parse.quote(path, safe='/')}&parents={'true' if parents else 'false'}")
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
 @app.delete("/vms/{vm_id}/files")
 async def delete_file(vm_id: str, path: str, recursive: bool = False):
-    entry = _require_entry(vm_id)
-    status, resp_body = await _agent_request_async(entry, "DELETE", f"/files?path={urllib.parse.quote(path, safe='/')}&recursive={'true' if recursive else 'false'}")
+    status, resp_body = await _agent_request_async(vm_id, "DELETE", f"/files?path={urllib.parse.quote(path, safe='/')}&recursive={'true' if recursive else 'false'}")
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
@@ -367,102 +330,21 @@ async def delete_file(vm_id: str, path: str, recursive: bool = False):
 
 @app.websocket("/vms/{vm_id}/terminal")
 async def terminal_ws(websocket: WebSocket, vm_id: str):
-    """Interactive terminal: creates a PTY process on the guest and bridges I/O."""
+    """Interactive terminal: delegated to the active backend."""
     print(f"WS /vms/{vm_id[:8]}/terminal — connecting")
     daemon = _get_daemon()
     if not daemon.manager:
         await websocket.close(code=1011, reason="Manager not initialized")
         return
-    entry = daemon.manager.get_entry(vm_id)
-    if not entry:
+    try:
+        await daemon.manager.bridge_terminal(vm_id, websocket)
+    except RuntimeError:
         print(f"WS /vms/{vm_id[:8]}/terminal — VM not found")
         await websocket.close(code=1011, reason="VM not found")
-        return
-
-    await websocket.accept()
-    print(f"WS /vms/{vm_id[:8]}/terminal — accepted")
-
-    # Start a PTY process on the guest agent
-    try:
-        create_body = json.dumps({
-            "cmd": ["/bin/sh", "-i"],
-            "pty": True,
-            "cols": 120,
-            "rows": 40,
-        }).encode()
-        status, resp_body = await _agent_request_async(entry, "POST", "/processes", create_body)
-        if status != 201:
-            print(f"WS /vms/{vm_id[:8]}/terminal — PTY create failed: {resp_body}")
-            await websocket.close(code=1011, reason="Failed to create PTY process")
-            return
-        proc_info = json.loads(resp_body)
-        guest_pid = proc_info["pid"]
-    except Exception as e:
-        log.exception("Failed to create guest PTY process")
-        await websocket.close(code=1011, reason=str(e))
-        return
-
-    print(f"WS /vms/{vm_id[:8]}/terminal — guest PTY pid={guest_pid}")
-
-    # Connect to guest WebSocket for output streaming
-    import websockets.sync.client as ws_sync
-    import base64
-
-    loop = asyncio.get_event_loop()
-    closed = False
-
-    def _read_guest_ws():
-        """Background thread: read from guest WS, forward to host WS."""
-        nonlocal closed
-        try:
-            orig_fd = _enter_netns(entry.ns_name)
-            try:
-                guest_ws_url = f"ws://{entry.guest_ip}:5000/processes/{guest_pid}/output"
-                guest_ws = ws_sync.connect(guest_ws_url)
-            finally:
-                _restore_netns(orig_fd)
-
-            for message in guest_ws:
-                if closed:
-                    break
-                try:
-                    ev = json.loads(message)
-                    if ev.get("type") in ("stdout", "stderr") and ev.get("data"):
-                        raw = base64.b64decode(ev["data"])
-                        asyncio.run_coroutine_threadsafe(
-                            websocket.send_bytes(raw), loop
-                        )
-                    elif ev.get("type") == "exit":
-                        break
-                except Exception:
-                    pass
-            guest_ws.close()
-        except Exception:
-            pass
-
-    reader_thread = threading.Thread(target=_read_guest_ws, daemon=True)
-    reader_thread.start()
-
-    try:
-        while True:
-            data = await websocket.receive_bytes()
-            # Forward input to guest process
-            try:
-                await _agent_request_async(entry, "POST", f"/processes/{guest_pid}/input", data, timeout=5)
-            except Exception:
-                pass
     except WebSocketDisconnect:
         print(f"WS /vms/{vm_id[:8]}/terminal — client disconnected")
     except Exception:
         log.exception("WS /vms/%s/terminal — error", vm_id[:8])
-    finally:
-        closed = True
-        # Kill the guest shell process
-        try:
-            await _agent_request_async(entry, "POST", f"/processes/{guest_pid}/signal",
-                          json.dumps({"signal": 9}).encode(), timeout=2)
-        except Exception:
-            pass
 
 
 # ── Template endpoints ──────────────────────────────────────────────────────
@@ -482,9 +364,11 @@ def build_template_endpoint(body: dict):
     template_id = _slugify(name)
     print(f"POST /templates/build — building {template_id}...")
 
+    daemon = _get_daemon()
+
     def _run_build():
         try:
-            _build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+            daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
             print(f"Template {template_id} built successfully")
         except Exception as e:
             print(f"Template {template_id} build failed: {e}")
@@ -520,10 +404,13 @@ def delete_template_endpoint(template_id: str):
     tmpl = get_template(template_id)
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
-    # Remove snapshot files
-    tdir = tmpl.get("template_dir", "")
-    if tdir and os.path.isdir(tdir):
-        shutil.rmtree(tdir, ignore_errors=True)
+    daemon = _get_daemon()
+    daemon.backend.delete_template_artifact(template_id, tmpl)
+    artifacts = tmpl.get("artifacts") or {}
+    for artifact in artifacts.values():
+        tdir = artifact.get("template_dir", "")
+        if tdir and os.path.isdir(tdir):
+            shutil.rmtree(tdir, ignore_errors=True)
     _delete_template(template_id)
     print(f"DELETE /templates/{template_id} — deleted")
     return {"ok": True}
@@ -533,6 +420,7 @@ def delete_template_endpoint(template_id: str):
 
 class FlintDaemon:
     def __init__(self) -> None:
+        self.backend = get_host_backend()
         self.manager: SandboxManager | None = None
         self.golden_ready: bool = False
         self.started_at: float = 0.0
@@ -546,9 +434,7 @@ class FlintDaemon:
 
         self._init_dirs()
         self._write_pid()
-        self._setup_networking()
-        self._create_golden_snapshot()
-        self._register_templates()
+        self._prepare_backend()
         self._start_pool()
         self._init_state_store()
         self._init_manager()
@@ -565,25 +451,18 @@ class FlintDaemon:
         with open(DAEMON_PID_PATH, "w") as f:
             f.write(str(os.getpid()))
 
-    def _setup_networking(self) -> None:
-        _ensure_bridge()
-        print("Bridge ready.")
-
-    def _create_golden_snapshot(self) -> None:
-        print("Creating golden snapshot...")
-        shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
-        create_golden_snapshot()
-        self.golden_ready = True
-        print("Golden snapshot ready.")
-
-    def _register_templates(self) -> None:
+    def _prepare_backend(self) -> None:
         os.makedirs(TEMPLATES_DIR, exist_ok=True)
-        register_template(DEFAULT_TEMPLATE_ID, "Default (Alpine)", GOLDEN_DIR)
-        print("Default template registered.")
+        self.backend.ensure_runtime_ready()
+        self.backend.ensure_default_template()
+        default_template = get_template(DEFAULT_TEMPLATE_ID) or {}
+        artifact = (default_template.get("artifacts") or {}).get(self.backend.kind) or {}
+        self.golden_ready = artifact.get("status") == "ready"
+        print(f"Backend ready: {self.backend.kind}")
 
     def _start_pool(self) -> None:
-        start_pool()
-        print("Rootfs pool started.")
+        self.backend.start_pool()
+        print("Backend pool started.")
 
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
@@ -591,7 +470,7 @@ class FlintDaemon:
         print("State store initialized.")
 
     def _init_manager(self) -> None:
-        self.manager = SandboxManager(state_store=self._state_store)
+        self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
         _write_state(self)
 
     def _recover_sandboxes(self) -> None:
@@ -634,7 +513,7 @@ class FlintDaemon:
             if self.manager:
                 with self.manager._lock:
                     self.manager._sandboxes.clear()
-            stop_pool()
+            self.backend.stop_pool()
             if self._state_store:
                 self._state_store.close()
             for path in (DAEMON_STATE_PATH, DAEMON_PID_PATH):
@@ -649,4 +528,22 @@ class FlintDaemon:
 
     def _serve(self) -> None:
         print(f"Daemon ready on {DAEMON_HOST}:{DAEMON_PORT}")
+
+        # On macOS, the Virtualization.framework needs the main thread's RunLoop
+        # to drive VM execution.  Run uvicorn on a background thread and reserve
+        # the main thread for the VZ backend's RunLoop.
+        if self.backend.kind == "macos-vz-arm64":
+            from flint.core.backends.macos_vz import MacOSVirtualizationBackend
+
+            if isinstance(self.backend, MacOSVirtualizationBackend):
+                uvicorn_thread = threading.Thread(
+                    target=lambda: uvicorn.run(
+                        app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning",
+                    ),
+                    daemon=True,
+                )
+                uvicorn_thread.start()
+                self.backend._runtime.run_loop()  # blocks forever
+                return
+
         uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning")
