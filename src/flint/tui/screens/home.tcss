@@ -1,41 +1,8 @@
 HomeScreen {
-    layout: vertical;
-    padding: 1 2;
+    layout: horizontal;
 }
 
-#brand-header {
-    height: 1;
-    color: $primary;
-    text-style: bold;
-    padding: 0 1;
-    margin-bottom: 1;
-}
-
-#section-header {
-    height: 1;
-    padding: 0 1;
-    margin-bottom: 1;
-}
-
-#section-title {
+#main-layout {
     width: 1fr;
-    height: 1;
-    text-style: bold;
-}
-
-#new-vm-btn {
-    min-width: 3;
-    height: 1;
-    border: none;
-    padding: 0 1;
-    background: transparent;
-    color: $text-muted;
-}
-
-#new-vm-btn:hover {
-    color: $primary;
-}
-
-ContentArea {
-    margin-top: 1;
+    height: 1fr;
 }

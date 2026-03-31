@@ -1,12 +1,11 @@
 """Virtual terminal widget for VM interaction"""
 import re
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click
 from textual.message import Message
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Input, RichLog, Rule, Static
 from ..prompt_row import PromptRow
-from ..throbber import Throbber
 from flint.sandbox import Sandbox
 from flint.core.config import TERM_COLS, TERM_ROWS
 from flint.tui.terminal_emulator import TerminalEmulator
@@ -28,46 +27,60 @@ class Terminal(Vertical):
     DEFAULT_CSS = """
     Terminal {
         height: 1fr;
+        padding: 1 1 0 1;
     }
 
-    #activity-bar {
-        width: 100%;
+    #terminal-header {
         height: 1;
-        visibility: hidden;
-    }
-
-    Terminal.-state-busy #activity-bar {
-        visibility: visible;
-    }
-
-    #status-bar {
-        height: 1;
-        color: $text-muted;
         padding: 0 1;
-        text-style: dim;
+    }
+
+    #header-name {
+        width: auto;
+        height: 1;
+    }
+
+    #header-tag {
+        width: auto;
+        height: 1;
+        margin: 0 1;
+        background: #333333;
+        color: $text-muted;
+    }
+
+    #header-dot {
+        width: 1fr;
+        height: 1;
+        text-align: right;
+    }
+
+    #terminal-separator {
+        color: #333333;
+        margin: 0;
     }
 
     #log-scroll {
         height: 1fr;
         overflow-x: hidden;
+        padding: 0 1;
+        margin-top: 2;
     }
 
     #vm-log {
         height: auto;
         overflow: hidden hidden;
-        padding: 0 1;
+        background: transparent;
+        color: $text-muted;
     }
 
     #prompt-row {
         height: 1;
-        padding: 0 1;
     }
 
     .prompt-label {
         width: auto;
         height: 1;
-        color: $primary;
-        text-style: bold;
+        color: $text-muted;
     }
 
     #vm-input {
@@ -75,6 +88,7 @@ class Terminal(Vertical):
         margin: 0;
         padding: 0;
         height: 1;
+        background: transparent;
     }
     """
 
@@ -97,8 +111,11 @@ class Terminal(Vertical):
         return sandboxes[vm_id]
 
     def compose(self) -> ComposeResult:
-        yield Throbber(id="activity-bar")
-        yield Static("", id="status-bar")
+        with Horizontal(id="terminal-header"):
+            yield Static("", id="header-name")
+            yield Static("", id="header-tag")
+            yield Static("", id="header-dot")
+        yield Rule(id="terminal-separator")
         with VerticalScroll(id="log-scroll"):
             yield RichLog(id="vm-log", wrap=True)
             yield PromptRow(id="prompt-row")
@@ -128,14 +145,10 @@ class Terminal(Vertical):
 
     def _set_busy(self) -> None:
         self._busy = True
-        self.remove_class("-state-idle")
-        self.add_class("-state-busy")
         self.query_one(PromptRow).display = False
 
     def _set_idle(self, cursor_line: str = "") -> None:
         self._busy = False
-        self.remove_class("-state-busy")
-        self.add_class("-state-idle")
         m = PROMPT_PREFIX.match(cursor_line)
         if m:
             prefix = m.group(1)
@@ -282,36 +295,32 @@ class Terminal(Vertical):
         self._update_status()
 
     def _update_status(self) -> None:
+        name_w = self.query_one("#header-name", Static)
+        tag_w = self.query_one("#header-tag", Static)
+        dot_w = self.query_one("#header-dot", Static)
         vm_data = self._vm_data if self._current_vm_id else None
         if not vm_data:
-            self.query_one("#status-bar", Static).update("")
+            name_w.update("")
+            tag_w.update("")
+            dot_w.update("")
             return
 
-        boot_ms = vm_data.get("boot_time_ms")
         ready_ms = vm_data.get("ready_time_ms")
-        boot_str = f"{boot_ms:.0f}ms" if boot_ms is not None else "-"
-        ready_str = f"{ready_ms:.0f}ms" if ready_ms is not None else "-"
+        time_str = f"{ready_ms:.0f}ms" if ready_ms is not None else "-"
 
         state = vm_data.get("state", "")
         agent_healthy = vm_data.get("agent_healthy", False)
 
         if state == "Started" and agent_healthy:
-            icon = "[bold green]\u25cf[/]"
-            status_text = "Connected"
+            dot = "[green]\u25cf[/]"
         elif state == "Error":
-            icon = "[bold red]\u25cf[/]"
-            status_text = "Error"
+            dot = "[red]\u25cf[/]"
         elif state == "Starting":
-            icon = "[bold yellow]\u25cb[/]"
-            status_text = "Booting"
+            dot = "[yellow]\u25cb[/]"
         else:
-            icon = "[dim]\u25cb[/]"
-            status_text = state
+            dot = "[dim]\u25cb[/]"
 
         short_id = self._current_vm_id[:8]
-        status = (
-            f" {icon} {status_text}"
-            f"  [dim]boot {boot_str}  ready {ready_str}[/]"
-            f"  [dim]{short_id}[/]"
-        )
-        self.query_one("#status-bar", Static).update(status)
+        name_w.update(short_id)
+        tag_w.update(f" {time_str} ")
+        dot_w.update(dot)

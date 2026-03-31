@@ -1,42 +1,55 @@
 BenchmarkScreen {
     align: center middle;
-    background: $background;
+}
+
+#benchmark-input-wrapper {
+    width: 100%;
+    height: auto;
 }
 
 #benchmark-input-container {
-    width: 60;
+    width: 50;
     height: auto;
-    border: round $primary;
     padding: 1 2;
-    background: $panel;
+    background: #1a1a1a;
+    border: solid #333333;
 }
 
 #benchmark-input-container .title {
     text-align: center;
-    text-style: bold;
     width: 100%;
     height: 1;
     margin-bottom: 1;
+    color: $text-muted;
 }
 
 #benchmark-count-input {
     width: 100%;
+    background: #111111;
+    border: solid #333333;
 }
 
-#benchmark-rootfs-drive-checkbox {
+.toggle-option {
     width: 100%;
-    height: auto;
+    height: 1;
     margin-top: 1;
+    color: $text-muted;
 }
 
-#benchmark-pyroute2-checkbox {
-    width: 100%;
-    height: auto;
+.toggle-option:hover {
+    color: white;
 }
 
 #benchmark-start-button {
     width: 100%;
     margin-top: 1;
+    background: #333333;
+    color: $text;
+    border: none;
+}
+
+#benchmark-start-button:hover {
+    background: #444444;
 }
 
 #benchmark-grid-container {
@@ -67,6 +80,13 @@ BenchmarkScreen {
     max-width: 100;
     height: auto;
     padding: 1 2;
-    border: round $success;
-    background: $panel;
+    background: #1a1a1a;
+    border: solid #333333;
+}
+
+#benchmark-hint {
+    width: 100%;
+    text-align: center;
+    color: $text-muted;
+    margin-top: 1;
 }

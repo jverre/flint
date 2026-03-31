@@ -10,6 +10,7 @@ class ContentArea(Vertical):
     DEFAULT_CSS = """
     ContentArea {
         width: 1fr;
+        height: 1fr;
     }
     """
 

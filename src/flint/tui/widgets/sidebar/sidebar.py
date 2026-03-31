@@ -2,10 +2,10 @@
 import time
 
 from textual.app import ComposeResult
-from textual.containers import Container
+from textual.containers import Container, Horizontal
 from textual.events import Click
 from textual.reactive import reactive
-from textual.widgets import Static, ListView, ListItem, Label
+from textual.widgets import Static, Button, ListView, ListItem, Label
 
 from flint.sandbox import Sandbox
 
@@ -28,35 +28,122 @@ class Sidebar(Container):
     """Sidebar displaying list of VMs"""
     DEFAULT_CSS = """
     Sidebar {
+        width: 32;
+        height: 1fr;
+        padding: 1 0;
+        border-right: solid #333333;
+    }
+
+    #brand-header {
+        height: 1;
+        color: white;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+
+    #section-header {
+        height: 1;
+        padding: 0 0 0 1;
+        margin-bottom: 1;
+    }
+
+    #section-title {
         width: 1fr;
-        height: auto;
-        max-height: 50%;
+        height: 1;
+        color: $text-muted;
+    }
+
+    #new-vm-btn {
+        min-width: 3;
+        height: 1;
+        border: none;
+        padding: 0 0;
+        background: transparent;
+        color: $text-muted;
+        dock: right;
+    }
+
+    #new-vm-btn:hover {
+        color: $primary;
     }
 
     #vm-list {
         height: auto;
+        background: transparent;
     }
 
     #vm-list > ListItem {
         height: 1;
         padding: 0 1;
+        background: transparent;
+        color: $text-muted;
     }
 
     #vm-list > ListItem:hover {
         background: $primary 10%;
+        color: white;
     }
 
     #vm-list > ListItem.-highlight {
         background: $primary 15%;
+        color: white;
+    }
+
+    #vm-list:focus > ListItem.-highlight {
+        background: $primary 20%;
+        color: white;
+    }
+
+    #benchmark-btn {
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #benchmark-btn:hover {
+        color: white;
+    }
+
+    #keybindings-btn {
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #keybindings-btn:hover {
+        color: white;
     }
     """
 
     vm_count = reactive(0)
 
     def compose(self) -> ComposeResult:
+        yield Static("Flint", id="brand-header")
+        with Horizontal(id="section-header"):
+            yield Static("Virtual Machines (0)", id="section-title")
+            yield Button("+", id="new-vm-btn", variant="default")
         yield ListView(id="vm-list")
+        yield Static("Benchmark [dark_goldenrod](ctrl+b)[/]", id="benchmark-btn")
+        yield Static("Keybindings [dark_goldenrod](ctrl+k)[/]", id="keybindings-btn")
 
     def on_click(self, event: Click) -> None:
+        widget = event.widget
+        if widget.id == "keybindings-btn" or any(
+            a.id == "keybindings-btn" for a in widget.ancestors
+        ):
+            from flint.tui.screens.keybindings import KeybindingsScreen
+            self.app.push_screen(KeybindingsScreen())
+            return
+        if widget.id == "benchmark-btn" or any(
+            a.id == "benchmark-btn" for a in widget.ancestors
+        ):
+            from flint.tui.screens.home import HomeScreen
+            screen = self.screen
+            if isinstance(screen, HomeScreen):
+                screen.action_benchmark()
+            return
         self.query_one("#vm-list", ListView).focus()
 
     def on_mount(self) -> None:
@@ -76,12 +163,17 @@ class Sidebar(Container):
         else:
             return "[dim]\u25cb[/]"
 
+    # Available width inside a ListItem (sidebar 32 - 1 border - 2 padding = 29)
+    _LABEL_WIDTH = 29
+
     def _make_label(self, short_id: str, state: str, created_at: float) -> str:
         dot = self._state_dot(state)
         age = _relative_time(created_at)
-        # Right-align the age by padding
         name_part = f"{dot} {short_id}"
-        return f"{name_part}    [dim]{age}[/]"
+        # dot markup doesn't count toward visible width; dot char is 1 wide
+        visible_name = len(short_id) + 2  # "X short_id"
+        padding = self._LABEL_WIDTH - visible_name - len(age)
+        return f"{name_part}{' ' * max(padding, 1)}[dim]{age}[/]"
 
     def _refresh_list(self) -> None:
         try:

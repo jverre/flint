@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import Center, Container
 from textual.screen import Screen
 from textual.timer import Timer
-from textual.widgets import Button, Checkbox, Footer, Input, Static
+from textual.widgets import Button, Input, Static
 from textual.worker import Worker
 
 from flint.sandbox import Sandbox
@@ -54,26 +54,44 @@ class BenchmarkScreen(Screen):
         self._last_error: str = ""
         self._use_pyroute2: bool = False
         self._use_rootfs_pool: bool = False
+        self._toggle_states: dict[str, bool] = {
+            "toggle-rootfs": False,
+            "toggle-pyroute2": False,
+        }
 
     def compose(self) -> ComposeResult:
-        with Container(id="benchmark-input-container"):
-            yield Static("Benchmark: How many VMs?", classes="title")
-            yield Input(value="16", id="benchmark-count-input")
-            yield Checkbox("Use rootfs pool", id="benchmark-rootfs-drive-checkbox", compact=True)
-            yield Checkbox("Use pyroute2", id="benchmark-pyroute2-checkbox", compact=True)
-            yield Button("Start", id="benchmark-start-button", variant="primary")
+        with Center(id="benchmark-input-wrapper"):
+            with Container(id="benchmark-input-container"):
+                yield Static("Benchmark: How many VMs?", classes="title")
+                yield Input(value="16", id="benchmark-count-input")
+                yield Static("\u25cb Rootfs pool", id="toggle-rootfs", classes="toggle-option")
+                yield Static("\u25cb Pyroute2", id="toggle-pyroute2", classes="toggle-option")
+                yield Button("Start", id="benchmark-start-button", variant="default")
         with Center(id="benchmark-grid-container"):
             yield BenchmarkGrid(id="benchmark-grid")
         yield Static("", id="benchmark-status")
         with Center(id="benchmark-results-container"):
             yield Static("", id="benchmark-results")
-        yield Footer()
+        yield Static("[dim]Press Escape to return[/]", id="benchmark-hint")
 
     def on_mount(self) -> None:
         self.query_one("#benchmark-grid-container").display = False
         self.query_one("#benchmark-status").display = False
         self.query_one("#benchmark-results-container").display = False
         self.query_one("#benchmark-count-input", Input).focus()
+
+    def on_click(self, event) -> None:
+        widget = event.widget
+        if isinstance(widget, Static) and widget.id in self._toggle_states:
+            self._toggle_states[widget.id] = not self._toggle_states[widget.id]
+            on = self._toggle_states[widget.id]
+            label = widget.id.replace("toggle-", "").replace("-", " ").title()
+            dot = "\u25cf" if on else "\u25cb"
+            color = "green" if on else ""
+            if color:
+                widget.update(f"[{color}]{dot}[/] {label}")
+            else:
+                widget.update(f"{dot} {label}")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "benchmark-start-button" or self._phase != "input":
@@ -87,11 +105,11 @@ class BenchmarkScreen(Screen):
             return
 
         self._vm_count = count
-        self._use_pyroute2 = self.query_one("#benchmark-pyroute2-checkbox", Checkbox).value
-        self._use_rootfs_pool = self.query_one("#benchmark-rootfs-drive-checkbox", Checkbox).value
+        self._use_rootfs_pool = self._toggle_states.get("toggle-rootfs", False)
+        self._use_pyroute2 = self._toggle_states.get("toggle-pyroute2", False)
         self._phase = "running"
 
-        self.query_one("#benchmark-input-container").display = False
+        self.query_one("#benchmark-input-wrapper").display = False
         self.query_one("#benchmark-grid-container").display = True
         self.query_one("#benchmark-status").display = True
 

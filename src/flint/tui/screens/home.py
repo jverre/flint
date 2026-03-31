@@ -4,13 +4,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.widgets import Button, Input, ListView, Static
+from textual.widgets import Button, ListView, Static
 
 from flint.sandbox import Sandbox
 from flint.tui.widgets.sidebar import Sidebar
 from flint.tui.widgets.content import ContentArea
 from flint.tui.widgets.terminal import Terminal
-from flint.tui.widgets.prompt_row import PromptRow
 
 log = logging.getLogger(__name__)
 
@@ -19,48 +18,54 @@ class HomeScreen(Screen):
     CSS_PATH = "home.tcss"
 
     BINDINGS = [
-        Binding("tab", "toggle_panel", "Toggle Panel", priority=True),
-        Binding("backspace", "delete_vm", "Delete VM"),
-        Binding("delete", "delete_vm", "Delete VM"),
-        Binding("b", "benchmark", "Benchmark"),
+        Binding("ctrl+up", "prev_vm", "Previous VM", priority=True),
+        Binding("ctrl+down", "next_vm", "Next VM", priority=True),
+        Binding("ctrl+d", "delete_vm", "Delete VM", priority=True),
+        Binding("ctrl+b", "benchmark", "Benchmark", priority=True),
+        Binding("ctrl+k", "show_keybindings", "Keybindings", priority=True),
     ]
 
     _pending_auto_focus: bool = False
 
     def compose(self) -> ComposeResult:
-        yield Static("Flint", id="brand-header")
-        with Horizontal(id="section-header"):
-            yield Static("Virtual Machines (0)", id="section-title")
-            yield Button("+", id="new-vm-btn", variant="default")
-        yield Sidebar()
-        yield ContentArea()
+        with Horizontal(id="main-layout"):
+            yield Sidebar()
+            yield ContentArea()
 
     def on_mount(self) -> None:
-        self.query_one("#vm-list", ListView).focus()
-        self.query_one(ContentArea).display = False
+        vm_list = self.query_one("#vm-list", ListView)
+        vm_list.focus()
+        # If VMs already exist, select the first one; otherwise hide content
+        vms = Sandbox.list()
+        if vms:
+            self.query_one(Sidebar).vm_count = len(vms)
+            self._update_section_title(len(vms))
+            self.set_timer(0.6, self._select_first_vm)
+        else:
+            self.query_one(ContentArea).display = False
+
+    def _select_first_vm(self) -> None:
+        vm_list = self.query_one("#vm-list", ListView)
+        if vm_list.children:
+            vm_list.index = 0
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "new-vm-btn":
             self.run_worker(self._start_vm_in_thread, thread=True)
 
-    def _sidebar_has_focus(self) -> bool:
-        focused = self.app.focused
-        if focused is None:
-            return False
-        sidebar = self.query_one(Sidebar)
-        return focused is sidebar or sidebar in focused.ancestors
+    def _move_vm_selection(self, delta: int) -> None:
+        vm_list = self.query_one("#vm-list", ListView)
+        if not vm_list.children:
+            return
+        current = vm_list.index or 0
+        new_index = max(0, min(len(vm_list.children) - 1, current + delta))
+        vm_list.index = new_index
 
-    def action_toggle_panel(self) -> None:
-        content = self.query_one(ContentArea)
-        if not content.display:
-            if self._sidebar_has_focus():
-                return
-        if self._sidebar_has_focus():
-            terminal = self.query_one(Terminal)
-            if terminal.query_one(PromptRow).display:
-                terminal.query_one("#vm-input", Input).focus()
-        else:
-            self.query_one("#vm-list", ListView).focus()
+    def action_prev_vm(self) -> None:
+        self._move_vm_selection(-1)
+
+    def action_next_vm(self) -> None:
+        self._move_vm_selection(1)
 
     def _start_vm_in_thread(self) -> None:
         try:
@@ -80,8 +85,6 @@ class HomeScreen(Screen):
         self._pending_auto_focus = True
 
     def action_delete_vm(self) -> None:
-        if not self._sidebar_has_focus():
-            return
         vm_list = self.query_one("#vm-list", ListView)
         if vm_list.highlighted_child is None:
             return
@@ -105,6 +108,10 @@ class HomeScreen(Screen):
     def action_benchmark(self) -> None:
         from .benchmark import BenchmarkScreen
         self.app.push_screen(BenchmarkScreen())
+
+    def action_show_keybindings(self) -> None:
+        from .keybindings import KeybindingsScreen
+        self.app.push_screen(KeybindingsScreen())
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if event.item is not None:
