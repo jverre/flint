@@ -1,0 +1,39 @@
+# Example: Using Flint to parallelize vitest in GitHub Actions
+#
+# Prerequisites:
+#   - A self-hosted runner with Flint installed and Firecracker configured
+#   - The runner must have KVM access (bare metal or nested virt enabled)
+#
+# This workflow runs your vitest suite across 8 parallel Firecracker microVMs,
+# each handling 1/8 of your test files. VMs boot in <100ms so the overhead
+# is negligible compared to traditional CI matrix strategies.
+
+name: Tests (Flint parallel)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: self-hosted  # Must have Flint + Firecracker installed
+    steps:
+      - uses: actions/checkout@v4
+
+      # Option 1: Use the Flint action directly
+      - name: Run tests (8 shards)
+        uses: jverre/flint@main
+        with:
+          shards: "8"
+          setup-cmd: "npm ci --prefer-offline"
+          test-cmd: "npx vitest run --reporter=verbose --shard={shard}"
+
+      # Option 2: Use the CLI directly for more control
+      # - name: Run tests
+      #   run: |
+      #     flint run . \
+      #       --shards 8 \
+      #       --test-cmd "npx vitest run --reporter=verbose --shard={shard}" \
+      #       --setup-cmd "npm ci" \
+      #       --exclude ".github,docs"

@@ -69,6 +69,64 @@ def install_deps(fc_version, install_dir, kernel_dir, kernel_version, skip_kerne
     )
 
 
+@cli.command(name="run")
+@click.argument("project_dir", default=".")
+@click.option("--shards", "-s", default=4, type=int, help="Number of parallel shards (default: 4)")
+@click.option("--test-cmd", "-t", default="npx vitest run --reporter=verbose --shard={shard}",
+              help="Test command template. Use {shard} for the shard placeholder (default: vitest)")
+@click.option("--setup-cmd", default="npm ci --prefer-offline",
+              help="Setup command to run before tests (default: npm ci)")
+@click.option("--no-setup", is_flag=True, default=False, help="Skip setup command")
+@click.option("--workdir", "-w", default="/home/project", help="Working directory inside each VM")
+@click.option("--timeout", default=300, type=float, help="Timeout per command in seconds (default: 300)")
+@click.option("--exclude", "-e", multiple=True, help="Additional directories to exclude from upload")
+def run(project_dir, shards, test_cmd, setup_cmd, no_setup, workdir, timeout, exclude):
+    """Run tests in parallel across Flint sandboxes.
+
+    Shards your test suite across multiple Firecracker microVMs for fast parallel execution.
+    By default, runs vitest with --shard flag. Customize with --test-cmd.
+
+    \b
+    Examples:
+        flint run .                              # 4 shards, vitest
+        flint run . -s 8                         # 8 shards
+        flint run . -t "npx jest --shard={shard}"  # jest instead of vitest
+        flint run ./my-project --no-setup        # skip npm install
+    """
+    from flint.sandbox import Sandbox
+    if not Sandbox.is_daemon_running():
+        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
+        raise SystemExit(1)
+
+    from flint.runner import run_sharded_tests
+
+    excludes = None
+    if exclude:
+        from flint.runner import _DEFAULT_EXCLUDES
+        excludes = _DEFAULT_EXCLUDES | set(exclude)
+
+    result = run_sharded_tests(
+        project_dir=project_dir,
+        shards=shards,
+        test_cmd=test_cmd,
+        setup_cmd=None if no_setup else setup_cmd,
+        workdir=workdir,
+        timeout=timeout,
+        excludes=excludes,
+    )
+
+    # Print per-shard stdout for failed shards
+    for shard in sorted(result.shards, key=lambda x: x.shard_index):
+        if shard.exit_code != 0:
+            click.echo(f"\n--- shard {shard.shard_index}/{shard.total_shards} output ---")
+            if shard.stdout:
+                click.echo(shard.stdout)
+            if shard.stderr:
+                click.echo(shard.stderr, err=True)
+
+    raise SystemExit(result.exit_code)
+
+
 @cli.command(name="list")
 def list_vms():
     """List all VMs."""

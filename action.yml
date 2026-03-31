@@ -1,0 +1,75 @@
+name: "Flint Parallel Tests"
+description: "Run tests in parallel across Firecracker microVMs using Flint"
+
+inputs:
+  shards:
+    description: "Number of parallel shards"
+    required: false
+    default: "4"
+  test-cmd:
+    description: "Test command template. Use {shard} for vitest/jest shard flag (e.g. 1/4)"
+    required: false
+    default: "npx vitest run --reporter=verbose --shard={shard}"
+  setup-cmd:
+    description: "Setup command to run in each VM before tests (set to empty string to skip)"
+    required: false
+    default: "npm ci --prefer-offline"
+  project-dir:
+    description: "Path to the project directory"
+    required: false
+    default: "."
+  workdir:
+    description: "Working directory inside each VM"
+    required: false
+    default: "/home/project"
+  timeout:
+    description: "Timeout per command in seconds"
+    required: false
+    default: "300"
+  exclude:
+    description: "Comma-separated list of additional directories to exclude from upload"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure Flint daemon is running
+      shell: bash
+      run: |
+        if ! flint list > /dev/null 2>&1; then
+          echo "Starting Flint daemon..."
+          flint start &
+          # Wait for daemon + golden snapshot
+          for i in $(seq 1 60); do
+            if flint list > /dev/null 2>&1; then
+              echo "Flint daemon ready."
+              break
+            fi
+            sleep 2
+          done
+        fi
+
+    - name: Run sharded tests
+      shell: bash
+      run: |
+        ARGS=("${{ inputs.project-dir }}")
+        ARGS+=("--shards" "${{ inputs.shards }}")
+        ARGS+=("--test-cmd" "${{ inputs.test-cmd }}")
+        ARGS+=("--workdir" "${{ inputs.workdir }}")
+        ARGS+=("--timeout" "${{ inputs.timeout }}")
+
+        if [ -n "${{ inputs.setup-cmd }}" ]; then
+          ARGS+=("--setup-cmd" "${{ inputs.setup-cmd }}")
+        else
+          ARGS+=("--no-setup")
+        fi
+
+        if [ -n "${{ inputs.exclude }}" ]; then
+          IFS=',' read -ra EXCLUDES <<< "${{ inputs.exclude }}"
+          for ex in "${EXCLUDES[@]}"; do
+            ARGS+=("--exclude" "$(echo "$ex" | xargs)")
+          done
+        fi
+
+        flint run "${ARGS[@]}"
