@@ -26,6 +26,8 @@ from rich.style import Style as RichStyle
 from textual.strip import Strip
 from textual.widget import Widget
 
+from flint.tui.palette import BACKGROUND_HEX, ERROR_HEX, SUCCESS_HEX
+
 # ── Braille patterns ─────────────────────────────────────────
 
 # Full braille block (all 8 dots on)
@@ -51,24 +53,24 @@ GAP_W = 1    # space chars between cells horizontally
 MAX_ROWS = 5
 # Vertical: alternating cell rows and gap rows
 
-# ── GitHub dark theme colors ─────────────────────────────────
+# ── Flint palette colors ─────────────────────────────────────
 
-BG_COLOR = Color.parse("#0d1117")
-FAILED_COLOR = Color.parse("#da3633")
-FLASH_COLOR = Color.parse("#e8ffe8")
+BG_COLOR = Color.parse(BACKGROUND_HEX)
+FAILED_COLOR = Color.parse(ERROR_HEX)
+FLASH_COLOR = Color.parse("#d9e7da")
 
 # Green ramp for READY cells (fast → slow)
-# Brighter than GitHub's palette since braille dots are tiny
-GREEN_FAST = Color.parse("#39d353")
+# Slightly brighter than the base success tone so braille dots stay legible.
+GREEN_FAST = Color.parse(SUCCESS_HEX)
 
 # Warm gradient for STARTING animation (never goes too dim)
 _STARTING_RAMP = [
-    Color.parse("#8a7020"),
-    Color.parse("#c4b030"),
-    Color.parse("#f0e040"),
-    Color.parse("#ffbb22"),
-    Color.parse("#f0e040"),
-    Color.parse("#c4b030"),
+    Color.parse("#876d44"),
+    Color.parse("#ab8854"),
+    Color.parse("#cfa56a"),
+    Color.parse("#dfb679"),
+    Color.parse("#cfa56a"),
+    Color.parse("#ab8854"),
 ]
 
 FLASH_DURATION = 0.35  # seconds

@@ -11,8 +11,8 @@ BenchmarkScreen {
     width: 50;
     height: auto;
     padding: 1 2;
-    background: #1a1a1a;
-    border: solid #333333;
+    background: $surface;
+    border: solid $primary 18%;
 }
 
 #benchmark-input-container .title {
@@ -25,8 +25,8 @@ BenchmarkScreen {
 
 #benchmark-count-input {
     width: 100%;
-    background: #111111;
-    border: solid #333333;
+    background: $background;
+    border: solid $primary 18%;
 }
 
 .toggle-option {
@@ -37,19 +37,19 @@ BenchmarkScreen {
 }
 
 .toggle-option:hover {
-    color: white;
+    color: $text;
 }
 
 #benchmark-start-button {
     width: 100%;
     margin-top: 1;
-    background: #333333;
+    background: $panel;
     color: $text;
     border: none;
 }
 
 #benchmark-start-button:hover {
-    background: #444444;
+    background: $primary 25%;
 }
 
 #benchmark-grid-container {
@@ -80,8 +80,8 @@ BenchmarkScreen {
     max-width: 100;
     height: auto;
     padding: 1 2;
-    background: #1a1a1a;
-    border: solid #333333;
+    background: $surface;
+    border: solid $primary 18%;
 }
 
 #benchmark-hint {

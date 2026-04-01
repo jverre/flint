@@ -4,6 +4,8 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
+from flint.tui.palette import MUTED_HEX, TEXT_HEX
+
 
 BINDINGS_LIST = [
     ("ctrl+up", "Previous VM"),
@@ -25,8 +27,8 @@ class KeybindingsScreen(ModalScreen):
         width: 40;
         height: auto;
         max-height: 80%;
-        background: #1a1a1a;
-        border: solid #333333;
+        background: $surface;
+        border: solid $primary 18%;
         padding: 1 2;
     }
 
@@ -38,15 +40,6 @@ class KeybindingsScreen(ModalScreen):
 
     .keybinding-row {
         height: 1;
-    }
-
-    .keybinding-key {
-        width: auto;
-        color: white;
-    }
-
-    .keybinding-desc {
-        color: $text-muted;
     }
 
     #keybindings-hint {
@@ -63,7 +56,10 @@ class KeybindingsScreen(ModalScreen):
         with Vertical(id="keybindings-modal"):
             yield Static("Keybindings", id="keybindings-title")
             for key, desc in BINDINGS_LIST:
-                yield Static(f"  [white]{key:<12}[/] [dim]{desc}[/]", classes="keybinding-row")
+                yield Static(
+                    f"  [{TEXT_HEX}]{key:<12}[/] [{MUTED_HEX}]{desc}[/]",
+                    classes="keybinding-row",
+                )
             yield Static("Press esc to close", id="keybindings-hint")
 
     def on_click(self, event) -> None:

@@ -8,6 +8,7 @@ from textual.widgets import Input, RichLog, Rule, Static
 from ..prompt_row import PromptRow
 from flint.sandbox import Sandbox
 from flint.core.config import TERM_COLS, TERM_ROWS
+from flint.tui.palette import ERROR_HEX, SUCCESS_HEX, WARNING_HEX
 from flint.tui.terminal_emulator import TerminalEmulator
 
 PROMPT_PATTERN = re.compile(r'[#$]\s*$')
@@ -27,43 +28,67 @@ class Terminal(Vertical):
     DEFAULT_CSS = """
     Terminal {
         height: 1fr;
-        padding: 1 1 0 1;
+        padding: 0 1 0 1;
+        background: $background;
+    }
+
+    #terminal-chrome {
+        width: 1fr;
+        height: auto;
+        padding: 1 0 0 0;
+        background: $background;
     }
 
     #terminal-header {
+        width: 1fr;
+        height: 1;
+        padding: 0;
+        background: transparent;
+    }
+
+    #active-vm-pill {
+        width: auto;
+        height: 1;
+        background: transparent;
+    }
+
+    #header-primary {
+        width: auto;
         height: 1;
         padding: 0 1;
-    }
-
-    #header-name {
-        width: auto;
-        height: 1;
-    }
-
-    #header-tag {
-        width: auto;
-        height: 1;
-        margin: 0 1;
-        background: #333333;
         color: $text-muted;
     }
 
-    #header-dot {
+    #header-meta {
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: transparent;
+    }
+
+    #header-health {
+        width: auto;
+        height: 1;
+        padding: 0 0 0 1;
+        color: $text-muted;
+    }
+
+    #header-spacer {
         width: 1fr;
         height: 1;
-        text-align: right;
     }
 
     #terminal-separator {
-        color: #333333;
+        color: $border-blurred;
         margin: 0;
     }
 
     #log-scroll {
         height: 1fr;
         overflow-x: hidden;
-        padding: 0 1;
-        margin-top: 2;
+        padding: 0 1 0 1;
+        background: $background;
     }
 
     #vm-log {
@@ -75,6 +100,7 @@ class Terminal(Vertical):
 
     #prompt-row {
         height: 1;
+        background: $background;
     }
 
     .prompt-label {
@@ -89,6 +115,7 @@ class Terminal(Vertical):
         padding: 0;
         height: 1;
         background: transparent;
+        color: $text-muted;
     }
     """
 
@@ -111,11 +138,14 @@ class Terminal(Vertical):
         return sandboxes[vm_id]
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="terminal-header"):
-            yield Static("", id="header-name")
-            yield Static("", id="header-tag")
-            yield Static("", id="header-dot")
-        yield Rule(id="terminal-separator")
+        with Vertical(id="terminal-chrome"):
+            with Horizontal(id="terminal-header"):
+                with Horizontal(id="active-vm-pill"):
+                    yield Static("", id="header-primary")
+                    yield Static("", id="header-meta")
+                    yield Static("", id="header-health")
+                yield Static("", id="header-spacer")
+            yield Rule(id="terminal-separator")
         with VerticalScroll(id="log-scroll"):
             yield RichLog(id="vm-log", wrap=True)
             yield PromptRow(id="prompt-row")
@@ -295,16 +325,19 @@ class Terminal(Vertical):
         self._update_status()
 
     def _update_status(self) -> None:
-        name_w = self.query_one("#header-name", Static)
-        tag_w = self.query_one("#header-tag", Static)
-        dot_w = self.query_one("#header-dot", Static)
+        pill = self.query_one("#active-vm-pill", Horizontal)
+        primary_w = self.query_one("#header-primary", Static)
+        meta_w = self.query_one("#header-meta", Static)
+        health_w = self.query_one("#header-health", Static)
         vm_data = self._vm_data if self._current_vm_id else None
         if not vm_data:
-            name_w.update("")
-            tag_w.update("")
-            dot_w.update("")
+            pill.display = False
+            primary_w.update("")
+            meta_w.update("")
+            health_w.update("")
             return
 
+        pill.display = True
         ready_ms = vm_data.get("ready_time_ms")
         time_str = f"{ready_ms:.0f}ms" if ready_ms is not None else "-"
 
@@ -312,15 +345,15 @@ class Terminal(Vertical):
         agent_healthy = vm_data.get("agent_healthy", False)
 
         if state == "Started" and agent_healthy:
-            dot = "[green]\u25cf[/]"
+            dot = f"[{SUCCESS_HEX}]\u25cf[/]"
         elif state == "Error":
-            dot = "[red]\u25cf[/]"
+            dot = f"[{ERROR_HEX}]\u25cf[/]"
         elif state == "Starting":
-            dot = "[yellow]\u25cb[/]"
+            dot = f"[{WARNING_HEX}]\u25cf[/]"
         else:
             dot = "[dim]\u25cb[/]"
 
         short_id = self._current_vm_id[:8]
-        name_w.update(short_id)
-        tag_w.update(f" {time_str} ")
-        dot_w.update(dot)
+        primary_w.update(short_id)
+        meta_w.update(time_str)
+        health_w.update(dot)

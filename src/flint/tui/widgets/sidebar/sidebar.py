@@ -2,12 +2,13 @@
 import time
 
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal
+from textual.containers import Container, Horizontal, Vertical
 from textual.events import Click
 from textual.reactive import reactive
 from textual.widgets import Static, Button, ListView, ListItem, Label
 
 from flint.sandbox import Sandbox
+from flint.tui.palette import ERROR_HEX, MUTED_HEX, SUCCESS_HEX, WARNING_HEX
 
 
 def _relative_time(created_at: float) -> str:
@@ -30,21 +31,28 @@ class Sidebar(Container):
     Sidebar {
         width: 32;
         height: 1fr;
+        padding: 0;
+        background: $surface;
+        border-right: solid $border;
+    }
+
+    #sidebar-top {
+        height: auto;
         padding: 1 0;
-        border-right: solid #333333;
+        background: $surface;
     }
 
     #brand-header {
         height: 1;
-        color: white;
+        color: $text-muted;
         padding: 0 1;
-        margin-bottom: 1;
+        background: transparent;
     }
 
     #section-header {
         height: 1;
-        padding: 0 0 0 1;
-        margin-bottom: 1;
+        padding: 0 1;
+        background: transparent;
     }
 
     #section-title {
@@ -54,21 +62,22 @@ class Sidebar(Container):
     }
 
     #new-vm-btn {
-        min-width: 3;
+        min-width: 5;
         height: 1;
         border: none;
-        padding: 0 0;
+        padding: 0 1;
         background: transparent;
         color: $text-muted;
         dock: right;
     }
 
     #new-vm-btn:hover {
-        color: $primary;
+        color: $text;
     }
 
     #vm-list {
-        height: auto;
+        height: 1fr;
+        padding: 0;
         background: transparent;
     }
 
@@ -81,52 +90,70 @@ class Sidebar(Container):
 
     #vm-list > ListItem:hover {
         background: $primary 10%;
-        color: white;
+        color: $text;
     }
 
     #vm-list > ListItem.-highlight {
-        background: $primary 15%;
-        color: white;
+        background: $primary 18%;
+        color: $text;
     }
 
     #vm-list:focus > ListItem.-highlight {
-        background: $primary 20%;
-        color: white;
+        background: $primary 24%;
+        color: $text;
+    }
+
+    #sidebar-footer {
+        dock: bottom;
+        height: auto;
+        padding: 1 0;
+        background: transparent;
+    }
+
+    .sidebar-footer-item {
+        height: 1;
+        padding: 0 1;
+        background: transparent;
+        color: $text-muted;
     }
 
     #benchmark-btn {
-        dock: bottom;
-        height: 1;
-        padding: 0 1;
         color: $text-muted;
     }
 
     #benchmark-btn:hover {
-        color: white;
+        color: $text;
     }
 
     #keybindings-btn {
-        dock: bottom;
-        height: 1;
-        padding: 0 1;
         color: $text-muted;
     }
 
     #keybindings-btn:hover {
-        color: white;
+        color: $text;
     }
     """
 
     vm_count = reactive(0)
 
     def compose(self) -> ComposeResult:
-        yield Static("Flint", id="brand-header")
-        with Horizontal(id="section-header"):
-            yield Static("Virtual Machines (0)", id="section-title")
-            yield Button("+", id="new-vm-btn", variant="default")
+        with Vertical(id="sidebar-top"):
+            yield Static("Flint", id="brand-header")
+            with Horizontal(id="section-header"):
+                yield Static("Virtual Machines (0)", id="section-title")
+                yield Button("+ VM", id="new-vm-btn", variant="default")
         yield ListView(id="vm-list")
-        yield Static("Benchmark [dark_goldenrod](ctrl+b)[/]", id="benchmark-btn")
-        yield Static("Keybindings [dark_goldenrod](ctrl+k)[/]", id="keybindings-btn")
+        with Vertical(id="sidebar-footer"):
+            yield Static(
+                f"Benchmark [{WARNING_HEX}](ctrl+b)[/]",
+                id="benchmark-btn",
+                classes="sidebar-footer-item",
+            )
+            yield Static(
+                f"Keybindings [{WARNING_HEX}](ctrl+k)[/]",
+                id="keybindings-btn",
+                classes="sidebar-footer-item",
+            )
 
     def on_click(self, event: Click) -> None:
         widget = event.widget
@@ -157,9 +184,11 @@ class Sidebar(Container):
     @staticmethod
     def _state_dot(state: str) -> str:
         if state == "Started":
-            return "[green]\u25cf[/]"
+            return f"[{SUCCESS_HEX}]\u25cf[/]"
         elif state == "Error":
-            return "[red]\u25cf[/]"
+            return f"[{ERROR_HEX}]\u25cf[/]"
+        elif state == "Starting":
+            return f"[{WARNING_HEX}]\u25cf[/]"
         else:
             return "[dim]\u25cb[/]"
 
@@ -173,7 +202,7 @@ class Sidebar(Container):
         # dot markup doesn't count toward visible width; dot char is 1 wide
         visible_name = len(short_id) + 2  # "X short_id"
         padding = self._LABEL_WIDTH - visible_name - len(age)
-        return f"{name_part}{' ' * max(padding, 1)}[dim]{age}[/]"
+        return f"{name_part}{' ' * max(padding, 1)}[{MUTED_HEX}]{age}[/]"
 
     def _refresh_list(self) -> None:
         try:

@@ -1,6 +1,7 @@
 """Content area widget for VM log display"""
 from textual.app import ComposeResult
 from textual.containers import Vertical
+
 from ..terminal import Terminal
 
 
@@ -11,6 +12,7 @@ class ContentArea(Vertical):
     ContentArea {
         width: 1fr;
         height: 1fr;
+        background: $background;
     }
     """
 

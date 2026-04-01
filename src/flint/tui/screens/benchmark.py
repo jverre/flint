@@ -14,6 +14,7 @@ from textual.widgets import Button, Input, Static
 from textual.worker import Worker
 
 from flint.sandbox import Sandbox
+from flint.tui.palette import ACCENT_HEX, ERROR_HEX, SUCCESS_HEX, WARNING_HEX
 from flint.tui.widgets.benchmark_grid import BenchmarkGrid, CellState
 
 
@@ -87,7 +88,7 @@ class BenchmarkScreen(Screen):
             on = self._toggle_states[widget.id]
             label = widget.id.replace("toggle-", "").replace("-", " ").title()
             dot = "\u25cf" if on else "\u25cb"
-            color = "green" if on else ""
+            color = SUCCESS_HEX if on else ""
             if color:
                 widget.update(f"[{color}]{dot}[/] {label}")
             else:
@@ -101,7 +102,7 @@ class BenchmarkScreen(Screen):
             if count < 1:
                 raise ValueError
         except ValueError:
-            self.notify("Enter a valid number (≥ 1)", severity="error")
+            self.notify("Enter a valid number (>= 1)", severity="error")
             return
 
         self._vm_count = count
@@ -123,7 +124,7 @@ class BenchmarkScreen(Screen):
         self._launch_worker = self.run_worker(self._run_benchmark, thread=True)
 
     def _run_benchmark(self) -> None:
-        """Sequential benchmark: create VM via daemon → measure time → kill → next."""
+        """Sequential benchmark: create VM via daemon -> measure time -> kill -> next."""
         grid = self.query_one("#benchmark-grid", BenchmarkGrid)
 
         for i in range(self._vm_count):
@@ -182,7 +183,7 @@ class BenchmarkScreen(Screen):
         if not self._ready_times:
             err = self._last_error or "unknown"
             results_widget.update(
-                f"[bold red]No VMs completed successfully.[/]\n\n"
+                f"[bold {ERROR_HEX}]No VMs completed successfully.[/]\n\n"
                 f"[dim]Last error:\n{err}[/]"
             )
             return
@@ -192,47 +193,44 @@ class BenchmarkScreen(Screen):
         grid = self.query_one("#benchmark-grid", BenchmarkGrid)
         state_counts = Counter(grid._cell_states)
         tti_total_ms = sum(self._ready_times)
-        throughput = s['count'] / (tti_total_ms / 1000) if tti_total_ms > 0 else 0
+        throughput = s["count"] / (tti_total_ms / 1000) if tti_total_ms > 0 else 0
 
-        # State counts line
         state_parts = []
         for st, color in [
-            (CellState.READY, "green"),
-            (CellState.FAILED, "red"),
-            (CellState.STARTING, "yellow"),
+            (CellState.READY, SUCCESS_HEX),
+            (CellState.FAILED, ERROR_HEX),
+            (CellState.STARTING, WARNING_HEX),
         ]:
             cnt = state_counts.get(st, 0)
             if cnt:
                 state_parts.append(f"[{color}]{st.value}: {cnt}[/]")
         state_line = "  " + "   ".join(state_parts) if state_parts else ""
 
-        # Build per-step breakdown from collected timings
         step_breakdown = ""
         if self._step_timings:
-            # Collect all timing keys across iterations
             all_keys: list[str] = []
             seen: set[str] = set()
-            for t in self._step_timings:
-                for k in t:
-                    if k not in seen:
-                        all_keys.append(k)
-                        seen.add(k)
+            for timings in self._step_timings:
+                for key in timings:
+                    if key not in seen:
+                        all_keys.append(key)
+                        seen.add(key)
 
             if all_keys:
                 step_breakdown = "\n[bold]Per-step breakdown (ms):[/]\n"
                 step_breakdown += f"  {'Step':<24s} {'Avg':>8s} {'Min':>8s} {'Max':>8s} {'P95':>8s}\n"
                 for key in all_keys:
-                    vals = [t[key] for t in self._step_timings if key in t]
+                    vals = [timings[key] for timings in self._step_timings if key in timings]
                     if not vals:
                         continue
                     st = _compute_stats(vals)
                     label = key.replace("_ms", "").replace("_", " ")
                     step_breakdown += (
                         f"  {label:<24s} "
-                        f"[yellow]{st['avg']:>7,.0f}[/] "
-                        f"[green]{st['min']:>7,.0f}[/] "
-                        f"[red]{st['max']:>7,.0f}[/] "
-                        f"[yellow]{st['p95']:>7,.0f}[/]\n"
+                        f"[{WARNING_HEX}]{st['avg']:>7,.0f}[/] "
+                        f"[{SUCCESS_HEX}]{st['min']:>7,.0f}[/] "
+                        f"[{ERROR_HEX}]{st['max']:>7,.0f}[/] "
+                        f"[{WARNING_HEX}]{st['p95']:>7,.0f}[/]\n"
                     )
 
         results_widget.update(
@@ -242,12 +240,12 @@ class BenchmarkScreen(Screen):
             f"  Throughput:   [bold]{throughput:>8.2f} VMs/s[/]\n"
             f"{state_line}\n\n"
             f"[bold]Ready time (ms):[/]\n"
-            f"  Min:    [green]{s['min']:>8,.0f} ms[/]"
-            f"     Median: [cyan]{s['median']:>8,.0f} ms[/]\n"
-            f"  Avg:    [yellow]{s['avg']:>8,.0f} ms[/]"
-            f"     P95:    [yellow]{s['p95']:>8,.0f} ms[/]\n"
-            f"  Max:    [red]{s['max']:>8,.0f} ms[/]"
-            f"     P99:    [red]{s['p99']:>8,.0f} ms[/]\n"
+            f"  Min:    [{SUCCESS_HEX}]{s['min']:>8,.0f} ms[/]"
+            f"     Median: [{ACCENT_HEX}]{s['median']:>8,.0f} ms[/]\n"
+            f"  Avg:    [{WARNING_HEX}]{s['avg']:>8,.0f} ms[/]"
+            f"     P95:    [{WARNING_HEX}]{s['p95']:>8,.0f} ms[/]\n"
+            f"  Max:    [{ERROR_HEX}]{s['max']:>8,.0f} ms[/]"
+            f"     P99:    [{ERROR_HEX}]{s['p99']:>8,.0f} ms[/]\n"
             f"{step_breakdown}\n"
             f"  [dim]Press Escape to return[/]"
         )
