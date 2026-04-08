@@ -63,5 +63,5 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Run tests
-        run: uv run python -m pytest tests/ -v --timeout=300 -m "not slow"
+        run: uv run python -m pytest tests/ -v -m "not slow"
         timeout-minutes: 10
