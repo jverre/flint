@@ -13,10 +13,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-          cache-dependency-path: services/r2nfs/go.sum
-      - name: Download dependencies
+      - name: Resolve dependencies
         working-directory: services/r2nfs
-        run: go mod tidy
+        run: go get ./... && go mod tidy
       - name: Build
         working-directory: services/r2nfs
         run: go build -o r2nfs .
@@ -57,7 +56,7 @@ jobs:
         run: uv sync --dev
       - name: Build r2nfs
         working-directory: services/r2nfs
-        run: go mod tidy && go build -o r2nfs .
+        run: go get ./... && go mod tidy && go build -o r2nfs .
       - name: Enable KVM access
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
