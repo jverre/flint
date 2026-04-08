@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
       - name: Resolve dependencies
         working-directory: services/r2nfs
         run: go get ./... && go mod tidy
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
           cache-dependency-path: guest/flintd/go.sum
       - name: Download dependencies
         working-directory: guest/flintd
@@ -51,7 +51,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
       - name: Install dependencies
         run: uv sync --dev
       - name: Build r2nfs
