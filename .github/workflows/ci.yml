@@ -67,10 +67,9 @@ jobs:
         working-directory: guest/flintd
         run: go build -o flintd .
 
-  # ── E2E tests (Linux only, requires Firecracker) ────────────────────────
+  # ── E2E tests (Firecracker + daemon) ─────────────────────────────────────
   e2e:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [python-check, go-r2nfs, go-flintd]
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +79,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install Python dependencies
         run: uv sync --dev
+      - name: Build r2nfs
+        working-directory: services/r2nfs
+        run: go mod tidy && go build -o r2nfs .
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Run e2e tests
-        run: uv run python -m pytest tests/test_e2e.py -v --timeout=300 -m "not slow"
+        run: uv run python -m pytest tests/ -v --timeout=300 -m "not slow"
         timeout-minutes: 10
