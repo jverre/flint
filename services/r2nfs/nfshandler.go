@@ -1,11 +1,11 @@
 package main
 
 import (
+	"context"
 	"net"
 
 	"github.com/go-git/go-billy/v5"
 	nfs "github.com/willscott/go-nfs"
-	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
 // nfsHandler wraps ExportManager to provide per-client overlay filesystems.
@@ -19,40 +19,47 @@ func newNFSHandler(exports *ExportManager) nfs.Handler {
 
 // Mount returns the billy.Filesystem for the requesting client.
 // Each client gets its own overlay (sandbox layer + template layer).
-func (h *nfsHandler) Mount(conn net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
+func (h *nfsHandler) Mount(ctx context.Context, conn net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
 	clientIP := extractIP(conn.RemoteAddr())
 
 	export := h.exports.Lookup(clientIP)
 	if export == nil {
-		return nfs.MountStatusNoEnt, nil, nil
+		return nfs.MountStatusErrNoEnt, nil, nil
 	}
 
 	fs := newOverlayFS(h.exports.r2, h.exports.cache, export.VMID, export.TemplateID)
 	return nfs.MountStatusOk, fs, []nfs.AuthFlavor{nfs.AuthFlavorNull}
 }
 
-// Change returns a handler that tracks filesystem changes for NFS.
+// Change returns a billy.Change for tracking filesystem mutations.
 func (h *nfsHandler) Change(fs billy.Filesystem) billy.Change {
-	return nfshelper.NewCachingHandler(fs, 1024)
-}
-
-// FSStat returns filesystem statistics.
-func (h *nfsHandler) FSStat(conn net.Conn, fs billy.Filesystem) nfs.FSStat {
-	return nfs.FSStat{
-		TotalSize: 1 << 40, // 1 TB virtual
-		FreeSize:  1 << 40,
-		AvailSize: 1 << 40,
+	if c, ok := fs.(billy.Change); ok {
+		return c
 	}
+	return nil
 }
 
-// ToHandle converts a path to an NFS file handle.
+// FSStat fills in filesystem statistics.
+func (h *nfsHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.FSStat) error {
+	stat.TotalSize = 1 << 40 // 1 TB virtual
+	stat.FreeSize = 1 << 40
+	stat.AvailableSize = 1 << 40
+	return nil
+}
+
+// ToHandle is a no-op — handled by the CachingHandler wrapper.
 func (h *nfsHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
-	return nfshelper.ToFileHandle(fs, path)
+	return []byte{}
 }
 
-// FromHandle converts an NFS file handle back to a path.
+// FromHandle is a no-op — handled by the CachingHandler wrapper.
 func (h *nfsHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	return nfshelper.HandleFromFileHandle(fh)
+	return nil, nil, nil
+}
+
+// InvalidateHandle is called on rename/delete.
+func (h *nfsHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
+	return nil
 }
 
 // HandleLimit returns the max number of file handles to track.
