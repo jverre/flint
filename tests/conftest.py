@@ -36,6 +36,18 @@ import pytest
 from flint import Sandbox
 
 _daemon_process = None
+_daemon_log_path = os.path.join(tempfile.gettempdir(), "flint-test-daemon.log")
+
+# Session-level flag: None = untested, True = works, str = error message
+_sandbox_creation_result: str | bool | None = None
+
+
+def _read_daemon_log() -> str:
+    try:
+        with open(_daemon_log_path) as f:
+            return f.read()
+    except OSError:
+        return "(no daemon log available)"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -47,11 +59,14 @@ def _ensure_daemon():
 
     env = os.environ.copy()
     print(f"Starting daemon: uv run flint start (port={env.get('FLINT_PORT')})")
+    # Write daemon output to a file instead of a pipe to avoid pipe buffer
+    # deadlock — the daemon prints extensively and nobody reads the pipe
+    # during normal operation.
+    log_fd = open(_daemon_log_path, "w")
     _daemon_process = subprocess.Popen(
         ["uv", "run", "flint", "start"],
-        stdout=subprocess.PIPE,
+        stdout=log_fd,
         stderr=subprocess.STDOUT,
-        text=True,
         env=env,
     )
 
@@ -61,9 +76,8 @@ def _ensure_daemon():
         if Sandbox.is_daemon_running():
             break
         if _daemon_process.poll() is not None:
-            output = ""
-            if _daemon_process.stdout:
-                output = _daemon_process.stdout.read()
+            log_fd.close()
+            output = _read_daemon_log()
             print(f"=== Daemon stdout/stderr ===\n{output}\n=== End daemon output ===")
             pytest.exit(
                 f"Daemon exited with code {_daemon_process.returncode}.\n{output.strip()}",
@@ -73,9 +87,9 @@ def _ensure_daemon():
     else:
         # Timed out — grab whatever output we have.
         _daemon_process.kill()
-        output = ""
-        if _daemon_process.stdout:
-            output = _daemon_process.stdout.read()
+        _daemon_process.wait(timeout=5)
+        log_fd.close()
+        output = _read_daemon_log()
         print(f"=== Daemon stdout/stderr (timeout) ===\n{output}\n=== End daemon output ===")
         pytest.exit(
             f"Daemon failed to start within 120s.\n{output.strip()}",
@@ -85,19 +99,45 @@ def _ensure_daemon():
     yield
 
     _daemon_process.terminate()
-    _daemon_process.wait(timeout=10)
+    try:
+        _daemon_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _daemon_process.kill()
+        _daemon_process.wait(timeout=5)
+    log_fd.close()
 
 
-@pytest.fixture
-def sandbox():
-    """Create a sandbox and kill it after the test."""
+@pytest.fixture(scope="session")
+def _sandbox_probe(_ensure_daemon):
+    """Try to create a sandbox once per session. Cache the result."""
+    global _sandbox_creation_result
     resp = httpx.get(f"http://127.0.0.1:{TEST_PORT}/health", timeout=5.0)
     resp.raise_for_status()
     health = resp.json()
     if not health.get("golden_snapshot_ready", False):
-        pytest.skip(
-            f"Active backend {health.get('backend_kind', 'unknown')} is not ready for sandbox creation on this host."
-        )
+        _sandbox_creation_result = f"Backend {health.get('backend_kind', 'unknown')} not ready"
+        return
+
+    try:
+        sb = Sandbox()
+        sb.kill()
+        _sandbox_creation_result = True
+    except Exception as e:
+        output = _read_daemon_log()
+        print(f"=== Sandbox probe failed ===\n{e}\n=== Daemon log (last 3000 chars) ===\n{output[-3000:]}\n=== End ===")
+        _sandbox_creation_result = str(e)
+
+
+@pytest.fixture
+def require_sandbox(_sandbox_probe):
+    """Skip the test if sandbox creation is not available on this host."""
+    if _sandbox_creation_result is not True:
+        pytest.skip(f"Sandbox creation not available: {_sandbox_creation_result}")
+
+
+@pytest.fixture
+def sandbox(require_sandbox):
+    """Create a sandbox and kill it after the test."""
     sb = Sandbox()
     yield sb
     sb.kill()

@@ -136,7 +136,24 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         network_policy = data.get("network_policy")
         if network_policy is not None:
             _validate_network_policy(network_policy)
-    vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
+
+    # Run in executor to avoid blocking the event loop (create can take 10s+ on failure)
+    loop = asyncio.get_event_loop()
+    try:
+        vm_id = await loop.run_in_executor(
+            None,
+            lambda: mgr.create(
+                template_id=template_id,
+                allow_internet_access=allow_internet_access,
+                use_pool=use_pool,
+                use_pyroute2=use_pyroute2,
+                network_policy=network_policy,
+            ),
+        )
+    except Exception as e:
+        log.exception("POST /vms — VM creation failed")
+        print(f"POST /vms — VM creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"VM creation failed: {e}")
 
     # Set up storage for the new sandbox (no-op for local backend).
     if daemon.storage:

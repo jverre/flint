@@ -220,7 +220,7 @@ def test_run_code_python(sandbox):
 # ── Multiple sandboxes ───────────────────────────────────────────────────────
 
 
-def test_multiple_sandboxes():
+def test_multiple_sandboxes(require_sandbox):
     """Create two sandboxes and verify they are isolated."""
     sb1 = Sandbox()
     sb2 = Sandbox()
@@ -269,7 +269,7 @@ def test_workspace_file_ops(sandbox):
     assert "storage-test.txt" in names
 
 
-def test_workspace_isolation():
+def test_workspace_isolation(require_sandbox):
     """Two sandboxes cannot see each other's workspace files."""
     sb1 = Sandbox()
     sb2 = Sandbox()

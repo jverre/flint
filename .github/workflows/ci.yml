@@ -72,6 +72,8 @@ jobs:
           sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
       - name: Build rootfs
         run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+      - name: Prepare runtime directories
+        run: sudo mkdir -p /srv/jailer
       - name: Run tests
         run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/ -v -m "not slow"
         timeout-minutes: 10
