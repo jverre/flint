@@ -15,7 +15,7 @@ from flint.core._boot import _RecoveredProcess, _boot_from_snapshot, _teardown_v
 from flint.core._firecracker import _fc_patch, _fc_put, _fc_request, _fc_status_ok, _wait_for_agent, _wait_for_api_socket
 from flint.core._netns import _delete_netns, _ensure_bridge, _enter_netns, _restore_netns
 from flint.core._pool import start_pool, stop_pool
-from flint.core._recovery import _probe_sandbox
+
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
 from flint.core._template_build import build_template as _build_template
 from flint.core._template_registry import (
@@ -325,8 +325,23 @@ class LinuxFirecrackerBackend(HostBackend):
             pass
         return True, None
 
+    @staticmethod
+    def _probe_sandbox(row: dict) -> str:
+        """Check if a sandbox process is still alive. Returns 'alive', 'paused', or 'dead'."""
+        state = row.get("state", "")
+        if state == "Paused":
+            return "paused"
+        pid = row.get("pid")
+        if not pid:
+            return "dead"
+        try:
+            os.kill(pid, 0)
+            return "alive"
+        except (OSError, ProcessLookupError):
+            return "dead"
+
     def recover_row(self, row: dict):
-        probe = _probe_sandbox(row)
+        probe = self._probe_sandbox(row)
         if probe == "paused":
             return "paused", None
         if probe != "alive":
