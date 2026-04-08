@@ -18,6 +18,7 @@ import (
 	"unicode"
 
 	nfs "github.com/willscott/go-nfs"
+	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
 func main() {
@@ -60,8 +61,9 @@ func main() {
 	log.Printf("r2nfs listening on %s (mgmt on %s)", *listenAddr, *mgmtAddr)
 
 	handler := newNFSHandler(exports)
+	cachedHandler := nfshelper.NewCachingHandler(handler, 1024)
 	go func() {
-		if err := nfs.Serve(listener, handler); err != nil {
+		if err := nfs.Serve(listener, cachedHandler); err != nil {
 			log.Fatalf("NFS server error: %v", err)
 		}
 	}()
