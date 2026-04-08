@@ -46,6 +46,7 @@ def _ensure_daemon():
         return
 
     env = os.environ.copy()
+    print(f"Starting daemon: uv run flint start (port={env.get('FLINT_PORT')})")
     _daemon_process = subprocess.Popen(
         ["uv", "run", "flint", "start"],
         stdout=subprocess.PIPE,
@@ -63,11 +64,23 @@ def _ensure_daemon():
             output = ""
             if _daemon_process.stdout:
                 output = _daemon_process.stdout.read()
-            pytest.skip(f"Daemon failed to start on this host: {output.strip()}")
+            print(f"=== Daemon stdout/stderr ===\n{output}\n=== End daemon output ===")
+            pytest.exit(
+                f"Daemon exited with code {_daemon_process.returncode}.\n{output.strip()}",
+                returncode=1,
+            )
         time.sleep(1)
     else:
+        # Timed out — grab whatever output we have.
         _daemon_process.kill()
-        pytest.exit("Daemon failed to start within 120s", returncode=1)
+        output = ""
+        if _daemon_process.stdout:
+            output = _daemon_process.stdout.read()
+        print(f"=== Daemon stdout/stderr (timeout) ===\n{output}\n=== End daemon output ===")
+        pytest.exit(
+            f"Daemon failed to start within 120s.\n{output.strip()}",
+            returncode=1,
+        )
 
     yield
 
