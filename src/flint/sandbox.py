@@ -120,10 +120,14 @@ class Sandbox:
             self._id = vm["vm_id"]
             self._timings: dict[str, float] = vm.get("timings", {})
             self._ready_time_ms: float | None = vm.get("ready_time_ms")
+            self._storage_backend: str = vm.get("storage_backend", "local")
+            self._workspace_dir: str = vm.get("workspace_dir", "/workspace")
         else:
             self._id = vm_id
             self._timings = {}
             self._ready_time_ms = None
+            self._storage_backend = "local"
+            self._workspace_dir = "/workspace"
         self._template_id = template_id
         self._commands = Commands(self._id)
         self._pty = Pty(self._id)
@@ -156,6 +160,16 @@ class Sandbox:
     def ready_time_ms(self) -> float | None:
         """Total time-to-ready in ms as measured by the daemon (None for reconnected VMs)."""
         return self._ready_time_ms
+
+    @property
+    def storage_backend(self) -> str:
+        """Storage backend: 'local', 's3_files', or 'r2'."""
+        return self._storage_backend
+
+    @property
+    def workspace_dir(self) -> str:
+        """Path to the workspace directory inside the sandbox."""
+        return self._workspace_dir
 
     @property
     def commands(self) -> Commands:

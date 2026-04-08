@@ -30,5 +30,9 @@ func newServer() *http.ServeMux {
 	mux.HandleFunc("POST /files/mkdir", handleFileMkdir)
 	mux.HandleFunc("DELETE /files", handleFileDelete)
 
+	// NFS mount management (for cloud storage backends)
+	mux.HandleFunc("POST /mount/nfs", handleMountNFS)
+	mux.HandleFunc("DELETE /mount/nfs", handleUnmountNFS)
+
 	return mux
 }

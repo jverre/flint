@@ -27,6 +27,7 @@ class BootResult:
     chroot_base: str
     timings: dict[str, float] = field(default_factory=dict)
     t_total: float = 0.0
+    veth_ip: str = ""    # veth IP for bridge access (empty if no internet)
 
 
 class _RecoveredProcess:
@@ -112,11 +113,12 @@ def _boot_from_snapshot(
             os.symlink("/rootfs.ext4", _snapshot_drive_in_chroot)
 
         # 3. Create network namespace + TAP
+        veth_ip = ""
         with _timed(timings, "netns_setup_ms"):
             if use_pyroute2:
-                _setup_netns_pyroute2(ns_name, GOLDEN_TAP, internet=allow_internet_access)
+                veth_ip = _setup_netns_pyroute2(ns_name, GOLDEN_TAP, internet=allow_internet_access)
             else:
-                _setup_netns_subprocess(ns_name, GOLDEN_TAP, internet=allow_internet_access)
+                veth_ip = _setup_netns_subprocess(ns_name, GOLDEN_TAP, internet=allow_internet_access)
 
         # 4. Stage snapshot files into chroot
         with _timed(timings, "stage_snapshot_ms"):
@@ -177,6 +179,7 @@ def _boot_from_snapshot(
             chroot_base=spec.chroot_base,
             timings=timings,
             t_total=t_total,
+            veth_ip=veth_ip,
         )
 
     except:

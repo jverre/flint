@@ -89,3 +89,20 @@ VZ_BOOT_ARGS = os.environ.get("FLINT_VZ_BOOT_ARGS", "console=hvc0 root=/dev/vda 
 VZ_CPU_COUNT = int(os.environ.get("FLINT_VZ_CPU_COUNT", "2"))
 VZ_MEMORY_BYTES = int(os.environ.get("FLINT_VZ_MEMORY_BYTES", str(2 * 1024 * 1024 * 1024)))
 VZ_READY_TIMEOUT = float(os.environ.get("FLINT_VZ_READY_TIMEOUT", "60"))
+
+# ── Storage backend ─────────────────────────────────────────────────────
+STORAGE_BACKEND = os.environ.get("FLINT_STORAGE_BACKEND", "local")  # "local" | "s3_files" | "r2"
+WORKSPACE_DIR = os.environ.get("FLINT_WORKSPACE_DIR", "/workspace")
+
+# S3 Files backend
+S3_FILES_NFS_ENDPOINT = os.environ.get("FLINT_S3_FILES_NFS_ENDPOINT", "")
+
+# R2 backend
+R2_ACCOUNT_ID = os.environ.get("FLINT_R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("FLINT_R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("FLINT_R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.environ.get("FLINT_R2_BUCKET", "flint-storage")
+R2_CACHE_DIR = os.environ.get("FLINT_R2_CACHE_DIR", os.path.join(STATE_DIR, "r2-cache"))
+R2_CACHE_SIZE_MB = int(os.environ.get("FLINT_R2_CACHE_SIZE_MB", "1024"))
+R2NFS_PORT = int(os.environ.get("FLINT_R2NFS_PORT", "2049"))
+R2NFS_MGMT_PORT = int(os.environ.get("FLINT_R2NFS_MGMT_PORT", "9200"))
