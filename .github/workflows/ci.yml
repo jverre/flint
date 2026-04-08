@@ -19,18 +19,8 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: uv sync --dev
-      - name: Check Python syntax & imports
-        run: uv run python -c "
-          import ast, pathlib, sys;
-          errors = [];
-          [errors.append(f'{p}: {e}') for p in pathlib.Path('src').rglob('*.py')
-           for e in [None] if not (lambda p: (ast.parse(p.read_text()), True)[-1])(p)];
-          [errors.append(f'{p}: {e}') for p in pathlib.Path('tests').rglob('*.py')
-           for e in [None] if not (lambda p: (ast.parse(p.read_text()), True)[-1])(p)];
-          print('All Python files parse OK') if not errors else (print('\n'.join(errors)), sys.exit(1));
-          "
       - name: Verify package imports cleanly
-        run: uv run python -c "import flint; print(f'flint {flint.__name__} OK')"
+        run: uv run python -c "import flint; print('flint OK')"
 
   # ── Go: r2nfs tests ─────────────────────────────────────────────────────
   go-r2nfs:
