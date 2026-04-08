@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ── Python: lint + import check ──────────────────────────────────────────
+  python-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --dev
+      - name: Check Python syntax & imports
+        run: uv run python -c "
+          import ast, pathlib, sys;
+          errors = [];
+          [errors.append(f'{p}: {e}') for p in pathlib.Path('src').rglob('*.py')
+           for e in [None] if not (lambda p: (ast.parse(p.read_text()), True)[-1])(p)];
+          [errors.append(f'{p}: {e}') for p in pathlib.Path('tests').rglob('*.py')
+           for e in [None] if not (lambda p: (ast.parse(p.read_text()), True)[-1])(p)];
+          print('All Python files parse OK') if not errors else (print('\n'.join(errors)), sys.exit(1));
+          "
+      - name: Verify package imports cleanly
+        run: uv run python -c "import flint; print(f'flint {flint.__name__} OK')"
+
+  # ── Go: r2nfs tests ─────────────────────────────────────────────────────
+  go-r2nfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: services/r2nfs/go.sum
+      - name: Download dependencies
+        working-directory: services/r2nfs
+        run: go mod tidy
+      - name: Build
+        working-directory: services/r2nfs
+        run: go build -o r2nfs .
+      - name: Test
+        working-directory: services/r2nfs
+        run: go test -v -race -count=1 ./...
+
+  # ── Go: guest flintd build ──────────────────────────────────────────────
+  go-flintd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: guest/flintd/go.sum
+      - name: Download dependencies
+        working-directory: guest/flintd
+        run: go mod tidy
+      - name: Build
+        working-directory: guest/flintd
+        run: go build -o flintd .
+
+  # ── E2E tests (Linux only, requires Firecracker) ────────────────────────
+  e2e:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [python-check, go-r2nfs, go-flintd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --dev
+      - name: Run e2e tests
+        run: uv run python -m pytest tests/test_e2e.py -v --timeout=300 -m "not slow"
+        timeout-minutes: 10
