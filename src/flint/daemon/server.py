@@ -17,6 +17,7 @@ from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
     TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
     DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, ERROR_CLEANUP_DELAY,
+    WORKSPACE_DIR,
 )
 from flint.core.manager import SandboxManager
 from flint.core._template_registry import (
@@ -110,7 +111,11 @@ async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes |
 def health():
     print("GET /health")
     daemon = _get_daemon()
-    return {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind}
+    result = {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind}
+    if daemon.storage:
+        result["storage_backend"] = daemon.storage.kind
+        result["storage_healthy"] = daemon.storage.is_running()
+    return result
 
 
 @app.post("/vms")
@@ -132,7 +137,27 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         if network_policy is not None:
             _validate_network_policy(network_policy)
     vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
+
+    # Set up storage for the new sandbox (no-op for local backend).
+    if daemon.storage:
+        entry = mgr.get_entry(vm_id)
+        if entry:
+            veth_ip = (entry.backend_metadata or {}).get("veth_ip", "")
+            try:
+                daemon.storage.setup_sandbox(
+                    vm_id=vm_id,
+                    template_id=template_id,
+                    veth_ip=veth_ip,
+                    ns_name=entry.ns_name,
+                    agent_url=entry.agent_url,
+                )
+            except Exception as e:
+                log.warning("Storage setup failed for %s: %s", vm_id[:8], e)
+
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
+    if daemon.storage:
+        result["storage_backend"] = daemon.storage.kind
+        result["workspace_dir"] = WORKSPACE_DIR
     _write_state(daemon)
     print(f"POST /vms — created {vm_id[:8]}")
     return {"vm": result}
@@ -163,9 +188,17 @@ def delete_vm(vm_id: str):
     print(f"DELETE /vms/{vm_id[:8]}")
     daemon = _get_daemon()
     mgr = _require_manager()
-    if mgr.get_dict(vm_id) is None:
+    entry_dict = mgr.get_dict(vm_id)
+    if entry_dict is None:
         print(f"DELETE /vms/{vm_id[:8]} — not found")
         raise HTTPException(status_code=404, detail="VM not found")
+    # Tear down storage before killing the VM (no-op for local backend).
+    if daemon.storage:
+        entry = mgr.get_entry(vm_id)
+        veth_ip = ""
+        if entry:
+            veth_ip = (entry.backend_metadata or {}).get("veth_ip", "")
+        daemon.storage.teardown_sandbox(vm_id, veth_ip)
     mgr.kill(vm_id)
     _write_state(daemon)
     print(f"DELETE /vms/{vm_id[:8]} — killed")
@@ -427,6 +460,7 @@ class FlintDaemon:
         self._state_store = None
         self._health_monitor = None
         self._lifecycle_manager = None
+        self.storage = None
 
     def run(self) -> None:
         self.started_at = time.time()
@@ -435,6 +469,7 @@ class FlintDaemon:
         self._init_dirs()
         self._write_pid()
         self._prepare_backend()
+        self._init_storage()
         self._start_pool()
         self._init_state_store()
         self._init_manager()
@@ -459,6 +494,12 @@ class FlintDaemon:
         artifact = (default_template.get("artifacts") or {}).get(self.backend.kind) or {}
         self.golden_ready = artifact.get("status") == "ready"
         print(f"Backend ready: {self.backend.kind}")
+
+    def _init_storage(self) -> None:
+        from flint.core.storage import get_storage_backend
+        self.storage = get_storage_backend()
+        self.storage.start()
+        print(f"Storage backend: {self.storage.kind}")
 
     def _start_pool(self) -> None:
         self.backend.start_pool()
@@ -513,6 +554,8 @@ class FlintDaemon:
             if self.manager:
                 with self.manager._lock:
                     self.manager._sandboxes.clear()
+            if self.storage:
+                self.storage.stop()
             self.backend.stop_pool()
             if self._state_store:
                 self._state_store.close()

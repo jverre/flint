@@ -103,6 +103,7 @@ class LinuxFirecrackerBackend(HostBackend):
                 "socket_path": boot.socket_path,
                 "ns_name": boot.ns_name,
                 "chroot_base": boot.chroot_base,
+                "veth_ip": boot.veth_ip,
             },
         )
 

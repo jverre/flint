@@ -235,6 +235,66 @@ def test_multiple_sandboxes():
         sb2.kill()
 
 
+# ── Storage backend ─────────────────────────────────────────────────────────
+
+
+def test_health_reports_storage_backend():
+    """Health endpoint exposes the active storage backend and its health."""
+    port = os.environ["FLINT_PORT"]
+    resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+    resp.raise_for_status()
+    data = resp.json()
+    # storage_backend should always be present (defaults to "local").
+    assert "storage_backend" in data, f"health response missing storage_backend: {data}"
+    assert data["storage_backend"] in ("local", "s3_files", "r2")
+    assert "storage_healthy" in data
+    assert data["storage_healthy"] is True
+
+
+def test_sandbox_reports_storage_backend(sandbox):
+    """Sandbox object exposes the configured storage backend and workspace dir."""
+    assert sandbox.storage_backend in ("local", "s3_files", "r2")
+    assert sandbox.workspace_dir  # non-empty string
+
+
+def test_workspace_file_ops(sandbox):
+    """Write a file to workspace, read it back, verify it appears in listing."""
+    ws = sandbox.workspace_dir
+    sandbox.write_file(f"{ws}/storage-test.txt", "hello storage")
+    data = sandbox.read_file(f"{ws}/storage-test.txt")
+    assert data == b"hello storage"
+
+    entries = sandbox.list_files(ws)
+    names = [e["name"] for e in entries]
+    assert "storage-test.txt" in names
+
+
+def test_workspace_isolation():
+    """Two sandboxes cannot see each other's workspace files."""
+    sb1 = Sandbox()
+    sb2 = Sandbox()
+    try:
+        ws = sb1.workspace_dir
+        sb1.write_file(f"{ws}/private.txt", "sb1-only")
+
+        # sb2 should not see sb1's file.
+        result = sb2.commands.run(f"cat {ws}/private.txt 2>&1")
+        assert result.exit_code != 0, "sb2 should not read sb1's workspace file"
+    finally:
+        sb1.kill()
+        sb2.kill()
+
+
+def test_workspace_persists_across_pause_resume(sandbox):
+    """Files written to workspace survive pause/resume."""
+    ws = sandbox.workspace_dir
+    sandbox.write_file(f"{ws}/persist.txt", "survives")
+    sandbox.pause()
+    sandbox.resume()
+    data = sandbox.read_file(f"{ws}/persist.txt")
+    assert data == b"survives"
+
+
 @pytest.mark.slow
 def test_template_build_and_run(backend_kind):
     if backend_kind != "linux-firecracker":

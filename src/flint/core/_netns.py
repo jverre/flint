@@ -107,8 +107,11 @@ def _ensure_bridge() -> None:
         )
 
 
-def _setup_veth_pair(ns_name: str, vm_id: str) -> None:
-    """Create a veth pair connecting the netns to br-flint for internet access."""
+def _setup_veth_pair(ns_name: str, vm_id: str) -> str:
+    """Create a veth pair connecting the netns to br-flint for internet access.
+
+    Returns the allocated veth IP address (e.g., '10.0.0.2').
+    """
     _ensure_bridge()
 
     # Linux interface names limited to 15 chars
@@ -151,9 +154,14 @@ def _setup_veth_pair(ns_name: str, vm_id: str) -> None:
     run_in_ns(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/30", "-o", veth_ns, "-j", "MASQUERADE"])
 
     log.info("veth %s <-> %s, ns IP %s", veth_host, veth_ns, veth_ip)
+    return veth_ip
 
 
-def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True) -> None:
+def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True) -> str:
+    """Create a network namespace with a configured TAP device inside it.
+
+    Returns the veth IP address if internet access is enabled, or '' otherwise.
+    """
     """Create a network namespace with a configured TAP device inside it."""
     _create_netns(ns_name)
     try:
@@ -169,12 +177,17 @@ def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True)
         raise RuntimeError(f"Failed to setup TAP {tap_name} in {ns_name}: {exc}") from exc
 
     # Set up veth pair for internet access
+    veth_ip = ""
     if internet:
-        _setup_veth_pair(ns_name, ns_name.removeprefix("fc-"))
+        veth_ip = _setup_veth_pair(ns_name, ns_name.removeprefix("fc-"))
+    return veth_ip
 
 
-def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = True) -> None:
-    """Create a network namespace with a configured TAP device using ip commands."""
+def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = True) -> str:
+    """Create a network namespace using ip commands.
+
+    Returns the veth IP address if internet access is enabled, or '' otherwise.
+    """
     subprocess.run(["ip", "netns", "add", ns_name], capture_output=True, check=True)
     run_in_ns = lambda cmd: subprocess.run(
         ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
@@ -183,7 +196,7 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
     run_in_ns(["ip", "link", "set", tap_name, "up"])
 
     if not internet:
-        return
+        return ""
 
     # Set up veth pair for internet access
     vm_id_prefix = ns_name.removeprefix("fc-")
@@ -206,6 +219,7 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
     run_in_ns(["ip", "route", "add", "default", "via", BRIDGE_IP])
     run_in_ns(["sysctl", "-w", "net.ipv4.ip_forward=1"])
     run_in_ns(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.16.0.0/30", "-o", veth_ns, "-j", "MASQUERADE"])
+    return veth_ip
 
 
 def _setup_proxy_redirect(ns_name: str) -> None:
