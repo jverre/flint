@@ -17,7 +17,7 @@ from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
     TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
     DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, ERROR_CLEANUP_DELAY,
-    STORAGE_BACKEND, WORKSPACE_DIR,
+    WORKSPACE_DIR,
 )
 from flint.core.manager import SandboxManager
 from flint.core._template_registry import (
@@ -113,7 +113,7 @@ def health():
     daemon = _get_daemon()
     result = {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind}
     if daemon.storage:
-        result["storage_backend"] = daemon.storage.backend
+        result["storage_backend"] = daemon.storage.kind
         result["storage_healthy"] = daemon.storage.is_running()
     return result
 
@@ -138,8 +138,8 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
             _validate_network_policy(network_policy)
     vm_id = mgr.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
 
-    # Set up cloud storage mount if configured.
-    if daemon.storage and daemon.storage.is_cloud:
+    # Set up storage for the new sandbox (no-op for local backend).
+    if daemon.storage:
         entry = mgr.get_entry(vm_id)
         if entry:
             veth_ip = (entry.backend_metadata or {}).get("veth_ip", "")
@@ -156,7 +156,7 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
 
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     if daemon.storage:
-        result["storage_backend"] = daemon.storage.backend
+        result["storage_backend"] = daemon.storage.kind
         result["workspace_dir"] = WORKSPACE_DIR
     _write_state(daemon)
     print(f"POST /vms — created {vm_id[:8]}")
@@ -192,8 +192,8 @@ def delete_vm(vm_id: str):
     if entry_dict is None:
         print(f"DELETE /vms/{vm_id[:8]} — not found")
         raise HTTPException(status_code=404, detail="VM not found")
-    # Tear down cloud storage before killing the VM.
-    if daemon.storage and daemon.storage.is_cloud:
+    # Tear down storage before killing the VM (no-op for local backend).
+    if daemon.storage:
         entry = mgr.get_entry(vm_id)
         veth_ip = ""
         if entry:
@@ -496,13 +496,10 @@ class FlintDaemon:
         print(f"Backend ready: {self.backend.kind}")
 
     def _init_storage(self) -> None:
-        from flint.core._storage import StorageManager
-        self.storage = StorageManager()
-        if self.storage.is_cloud:
-            self.storage.start()
-            print(f"Storage backend: {self.storage.backend}")
-        else:
-            print("Storage backend: local")
+        from flint.core.storage import get_storage_backend
+        self.storage = get_storage_backend()
+        self.storage.start()
+        print(f"Storage backend: {self.storage.kind}")
 
     def _start_pool(self) -> None:
         self.backend.start_pool()
