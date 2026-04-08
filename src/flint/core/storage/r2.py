@@ -108,16 +108,20 @@ class R2StorageBackend(StorageBackend):
             f"--listen={BRIDGE_IP}:{R2NFS_PORT}",
             f"--mgmt=127.0.0.1:{R2NFS_MGMT_PORT}",
             f"--bucket={R2_BUCKET}",
-            f"--account-id={R2_ACCOUNT_ID}",
-            f"--access-key={R2_ACCESS_KEY_ID}",
-            f"--secret-key={R2_SECRET_ACCESS_KEY}",
             f"--cache-dir={R2_CACHE_DIR}",
             f"--cache-size-mb={R2_CACHE_SIZE_MB}",
         ]
 
-        log.info("Starting r2nfs: %s", " ".join(cmd[:3]) + " ...")
+        # Pass credentials via environment to avoid leaking them in `ps` output.
+        env = os.environ.copy()
+        env["R2_ACCOUNT_ID"] = R2_ACCOUNT_ID
+        env["R2_ACCESS_KEY_ID"] = R2_ACCESS_KEY_ID
+        env["R2_SECRET_ACCESS_KEY"] = R2_SECRET_ACCESS_KEY
+
+        log.info("Starting r2nfs: %s", " ".join(cmd))
         self._process = subprocess.Popen(
             cmd,
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,

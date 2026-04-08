@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"unicode"
 
 	nfs "github.com/willscott/go-nfs"
 )
@@ -81,10 +82,40 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// isValidID checks that an ID contains only safe characters (letters, digits,
+// hyphens, underscores) to prevent path traversal via crafted vm_id/template_id.
+func isValidID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for _, c := range s {
+		if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// newMgmtHandler builds the HTTP handler for the management API.
+// Extracted so tests can call it without starting a real listener.
+func newMgmtHandler(exports *ExportManager) http.Handler {
+	mux := http.NewServeMux()
+	registerMgmtRoutes(mux, exports)
+	return mux
+}
+
 // serveMgmtAPI runs a small HTTP server for managing NFS exports.
 func serveMgmtAPI(addr string, exports *ExportManager) {
 	mux := http.NewServeMux()
+	registerMgmtRoutes(mux, exports)
+	log.Printf("Management API on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("Management API error: %v", err)
+	}
+}
 
+// registerMgmtRoutes adds the management API routes to a ServeMux.
+func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager) {
 	mux.HandleFunc("POST /exports", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ClientIP   string `json:"client_ip"`
@@ -99,8 +130,20 @@ func serveMgmtAPI(addr string, exports *ExportManager) {
 			http.Error(w, `{"error":"client_ip and vm_id are required"}`, http.StatusBadRequest)
 			return
 		}
+		if net.ParseIP(req.ClientIP) == nil {
+			http.Error(w, `{"error":"invalid client_ip"}`, http.StatusBadRequest)
+			return
+		}
+		if !isValidID(req.VMID) {
+			http.Error(w, `{"error":"invalid vm_id"}`, http.StatusBadRequest)
+			return
+		}
 		if req.TemplateID == "" {
 			req.TemplateID = "default"
+		}
+		if !isValidID(req.TemplateID) {
+			http.Error(w, `{"error":"invalid template_id"}`, http.StatusBadRequest)
+			return
 		}
 		exports.Register(req.ClientIP, req.VMID, req.TemplateID)
 		w.Header().Set("Content-Type", "application/json")
@@ -118,9 +161,4 @@ func serveMgmtAPI(addr string, exports *ExportManager) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"ok","exports":%d}`, exports.Count())
 	})
-
-	log.Printf("Management API on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("Management API error: %v", err)
-	}
 }

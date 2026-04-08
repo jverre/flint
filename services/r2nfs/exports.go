@@ -15,14 +15,14 @@ type SandboxExport struct {
 // ExportManager tracks per-sandbox NFS exports and maps client IPs
 // to their R2 overlay filesystem (template base + sandbox layer).
 type ExportManager struct {
-	r2    *R2Client
+	r2    ObjectStore
 	cache *DiskCache
 
 	mu      sync.RWMutex
 	exports map[string]*SandboxExport // client IP → export
 }
 
-func newExportManager(r2 *R2Client, cache *DiskCache) *ExportManager {
+func newExportManager(r2 ObjectStore, cache *DiskCache) *ExportManager {
 	return &ExportManager{
 		r2:      r2,
 		cache:   cache,

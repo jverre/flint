@@ -12,6 +12,17 @@ import (
 	"github.com/go-git/go-billy/v5"
 )
 
+// ObjectStore is the interface used by OverlayFS to read/write objects.
+// Implemented by R2Client (production) and mockR2Client (tests).
+type ObjectStore interface {
+	GetObject(ctx context.Context, key string) ([]byte, error)
+	PutObject(ctx context.Context, key string, data []byte) error
+	HeadObject(ctx context.Context, key string) (*R2Object, error)
+	DeleteObject(ctx context.Context, key string) error
+	CopyObject(ctx context.Context, srcKey, dstKey string) error
+	ListObjects(ctx context.Context, prefix string) ([]R2Object, error)
+}
+
 // OverlayFS implements billy.Filesystem with two R2 layers:
 //   - Template layer (read-only): templates/{template_id}/
 //   - Sandbox layer (read-write): sandboxes/{vm_id}/
@@ -20,13 +31,13 @@ import (
 // Writes always go to the sandbox layer.
 // Deletes place whiteout markers to hide template files.
 type OverlayFS struct {
-	r2             *R2Client
+	r2             ObjectStore
 	cache          *DiskCache
 	sandboxPrefix  string
 	templatePrefix string
 }
 
-func newOverlayFS(r2 *R2Client, cache *DiskCache, vmID, templateID string) *OverlayFS {
+func newOverlayFS(r2 ObjectStore, cache *DiskCache, vmID, templateID string) *OverlayFS {
 	return &OverlayFS{
 		r2:             r2,
 		cache:          cache,
@@ -284,10 +295,15 @@ func (o *OverlayFS) Symlink(target, link string) error {
 func cleanPath(name string) string {
 	name = strings.TrimPrefix(name, "/")
 	name = strings.TrimSuffix(name, "/")
-	if name == "." {
+	if name == "" || name == "." {
 		return ""
 	}
-	return name
+	// Normalize the path and reject any traversal that escapes root.
+	cleaned := path.Clean(name)
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return ""
+	}
+	return cleaned
 }
 
 // --- r2File implements billy.File ---
@@ -295,7 +311,7 @@ func cleanPath(name string) string {
 type r2File struct {
 	name     string
 	key      string
-	r2       *R2Client
+	r2       ObjectStore
 	cache    *DiskCache
 	content  []byte
 	offset   int64
