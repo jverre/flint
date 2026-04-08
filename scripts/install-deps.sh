@@ -7,13 +7,11 @@ set -euo pipefail
 #   FC_VERSION    - firecracker version to install (default: latest)
 #   INSTALL_DIR   - where to install binaries (default: /usr/local/bin)
 #   KERNEL_DIR    - where to store vmlinux (default: /root/firecracker-vm)
-#   KERNEL_VERSION - kernel major version for S3 URL (default: 6.1)
 #   SKIP_KERNEL   - set to 1 to skip vmlinux download (default: 0)
 
 FC_VERSION="${FC_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 KERNEL_DIR="${KERNEL_DIR:-/root/firecracker-vm}"
-KERNEL_VERSION="${KERNEL_VERSION:-6.1}"
 SKIP_KERNEL="${SKIP_KERNEL:-0}"
 
 TMPDIR="$(mktemp -d)"
@@ -82,13 +80,12 @@ if [ "$SKIP_KERNEL" = "1" ]; then
   skip "Skipping vmlinux download (SKIP_KERNEL=1)"
 else
   VMLINUX_PATH="$KERNEL_DIR/vmlinux"
-  KERNEL_PATCH="5.10.217"
-  KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v${KERNEL_VERSION}/${ARCH}/vmlinux-${KERNEL_PATCH}"
+  KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin"
 
   if [ -f "$VMLINUX_PATH" ]; then
     skip "vmlinux already exists at $VMLINUX_PATH - skipping"
   else
-    info "Downloading vmlinux kernel (${KERNEL_VERSION}) to $KERNEL_DIR..."
+    info "Downloading vmlinux kernel to $KERNEL_DIR..."
     mkdir -p "$KERNEL_DIR"
     curl -fsSL -o "$VMLINUX_PATH" "$KERNEL_URL"
     info "vmlinux installed at $VMLINUX_PATH ($(du -sh "$VMLINUX_PATH" | cut -f1))"
