@@ -227,7 +227,12 @@ def pause_vm(vm_id: str):
     print(f"POST /vms/{vm_id[:8]}/pause")
     daemon = _get_daemon()
     mgr = _require_manager()
-    mgr.pause(vm_id)
+    try:
+        mgr.pause(vm_id)
+    except Exception as e:
+        log.exception("POST /vms/%s/pause — failed", vm_id[:8])
+        print(f"POST /vms/{vm_id[:8]}/pause — failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Pause failed: {e}")
     _write_state(daemon)
     print(f"POST /vms/{vm_id[:8]}/pause — paused")
     return {"ok": True}
@@ -238,7 +243,12 @@ def resume_vm(vm_id: str):
     print(f"POST /vms/{vm_id[:8]}/resume")
     daemon = _get_daemon()
     mgr = _require_manager()
-    mgr.resume(vm_id)
+    try:
+        mgr.resume(vm_id)
+    except Exception as e:
+        log.exception("POST /vms/%s/resume — failed", vm_id[:8])
+        print(f"POST /vms/{vm_id[:8]}/resume — failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Resume failed: {e}")
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)
     print(f"POST /vms/{vm_id[:8]}/resume — resumed")

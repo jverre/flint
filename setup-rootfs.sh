@@ -48,6 +48,9 @@ ip route add default via 172.16.0.1
 # DNS
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
+# Ensure workspace directory exists for storage backends
+mkdir -p /workspace
+
 # Start flintd guest agent (HTTP+WebSocket process manager)
 /usr/local/bin/flintd > /var/log/flintd.log 2>&1 &
 

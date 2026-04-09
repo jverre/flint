@@ -151,10 +151,13 @@ class LinuxFirecrackerBackend(HostBackend):
         spec = JailSpec(vm_id=sandbox_id, ns_name=ns_name)
         socket_path = spec.socket_path_on_host
 
-        try:
-            os.unlink(socket_path)
-        except FileNotFoundError:
-            pass
+        # Remove stale artifacts from the previous jailer run that would
+        # conflict with the new jailer (it tries to hard-link the binary).
+        for stale in (socket_path, os.path.join(spec.chroot_root, "firecracker")):
+            try:
+                os.unlink(stale)
+            except FileNotFoundError:
+                pass
 
         log_path = f"{vm_dir}/firecracker.log"
         with open(log_path, "w") as log_fd:
