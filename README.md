@@ -470,3 +470,7 @@ You should have:
 ```
 
 Once these are in place, `flint start` will create the golden snapshot automatically on first run.
+
+---
+
+Built on [Firecracker](https://jacquesverre.com/firecracker).
