@@ -140,7 +140,7 @@ class LinuxFirecrackerBackend(HostBackend):
             state_store.update_sandbox(entry.vm_id, pause_state_ref=entry.vm_dir)
 
     def resume(self, row: dict) -> BackendBootResult:
-        from flint.core._jailer import JailSpec, build_jailer_command
+        from flint.core._jailer import JailSpec, build_jailer_command, cleanup_jailer
         import subprocess
 
         sandbox_id = row["vm_id"]
@@ -152,12 +152,23 @@ class LinuxFirecrackerBackend(HostBackend):
         socket_path = spec.socket_path_on_host
 
         # Remove stale artifacts from the previous jailer run that would
-        # conflict with the new jailer (it tries to hard-link the binary).
+        # conflict with the new jailer (hard-link, socket, cgroups).
         for stale in (socket_path, os.path.join(spec.chroot_root, "firecracker")):
             try:
                 os.unlink(stale)
             except FileNotFoundError:
                 pass
+        # Clean stale cgroup entries (jailer creates them on startup and
+        # they persist after the process is killed during pause).
+        import shutil
+        for cg_base in (
+            f"/sys/fs/cgroup/firecracker/{sandbox_id}",
+            f"/sys/fs/cgroup/cpu/firecracker/{sandbox_id}",
+            f"/sys/fs/cgroup/memory/firecracker/{sandbox_id}",
+            f"/sys/fs/cgroup/pids/firecracker/{sandbox_id}",
+        ):
+            if os.path.isdir(cg_base):
+                shutil.rmtree(cg_base, ignore_errors=True)
 
         log_path = f"{vm_dir}/firecracker.log"
         with open(log_path, "w") as log_fd:
@@ -176,6 +187,7 @@ class LinuxFirecrackerBackend(HostBackend):
                 "mem_backend": {"backend_type": "File", "backend_path": "pause-mem"},
                 "enable_diff_snapshots": False,
                 "resume_vm": False,
+                "network_overrides": [{"iface_id": "eth0", "host_dev_name": GOLDEN_TAP}],
             }
             resp = _fc_put(socket_path, "/snapshot/load", snapshot_body)
             if not _fc_status_ok(resp):
@@ -184,6 +196,12 @@ class LinuxFirecrackerBackend(HostBackend):
             _fc_patch(socket_path, "/vm", {"state": "Resumed"})
             agent_url = _wait_for_agent(ns_name)
         except Exception:
+            # Capture firecracker log for debugging
+            try:
+                with open(log_path) as f:
+                    log.error("Resume failed — firecracker log:\n%s", f.read()[-2000:])
+            except OSError:
+                pass
             process.kill()
             try:
                 process.wait(timeout=2)
