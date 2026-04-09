@@ -1,21 +1,24 @@
 <p align="center">
   <h1 align="center">Flint</h1>
-  <p align="center">Lightning-fast Firecracker microVM management with an interactive TUI</p>
+  <p align="center">Lightning-fast Firecracker microVM management with a Python SDK, interactive TUI, and REST API</p>
 </p>
 
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-python-sdk">SDK</a> •
+  <a href="#-templates">Templates</a> •
   <a href="#-tui">TUI</a> •
-  <a href="#-api">API</a> •
+  <a href="#-cli">CLI</a> •
+  <a href="#-rest-api">REST API</a> •
   <a href="#-benchmarks">Benchmarks</a> •
-  <a href="#-architecture">Architecture</a> •
-  <a href="#-host-setup">Host Setup</a>
+  <a href="#-configuration">Configuration</a> •
+  <a href="#-macos-apple-silicon">macOS</a> •
+  <a href="#-linux-host-setup">Linux Setup</a>
 </p>
 
 ---
 
-Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a terminal UI for interactive VM management.
+Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a Python SDK, terminal UI, and CLI for interactive VM management. Supports Linux (Firecracker) and macOS Apple Silicon (Virtualization.framework).
 
 https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 
@@ -23,9 +26,8 @@ https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 
 ### Prerequisites
 
-- Linux host with [Firecracker](https://github.com/firecracker-microvm/firecracker) installed
-- A rootfs image and vmlinux kernel at `/root/firecracker-vm/`
-- `musl-tools`, `musl-dev`, `binutils` (for building the guest relay — auto-installed by `setup-rootfs.sh`)
+- **Linux** host with [Firecracker](https://github.com/firecracker-microvm/firecracker) installed, or **macOS** Apple Silicon (Virtualization.framework)
+- A rootfs image and vmlinux kernel at `/root/firecracker-vm/` (Linux) — see [Linux Host Setup](#-linux-host-setup)
 - Python 3.12+
 
 ### Install
@@ -63,13 +65,6 @@ result = sandbox.commands.run("echo hello")
 print(result.stdout)     # "hello"
 print(result.exit_code)  # 0
 
-# Interactive PTY
-terminal = sandbox.pty.create(
-    on_data=lambda data: print(data.decode(), end=''),
-)
-terminal.send_input("ls -la\n")
-terminal.kill()
-
 # Properties
 sandbox.id            # str
 sandbox.state         # str
@@ -80,8 +75,8 @@ sandbox.pause()
 sandbox.resume()
 
 # Auto-cleanup timeout (seconds)
-sandbox.set_timeout(300)              # kill after 5 min
-sandbox.set_timeout(300, policy="pause")  # pause instead of kill
+sandbox.set_timeout(300)                   # kill after 5 min
+sandbox.set_timeout(300, policy="pause")   # pause instead of kill
 
 # List & connect to existing sandboxes
 sandboxes = Sandbox.list()
@@ -93,41 +88,220 @@ sandbox.kill()
 
 > **Note:** The daemon must be running (`flint start`) before using the SDK.
 
+### Code Execution
+
+Execute code with auto-detected runtime (Python or Node.js):
+
+```python
+# Python (default)
+result = sandbox.run_code("print(2 + 2)")
+print(result.stdout)  # "4"
+
+# Node.js
+result = sandbox.run_code("console.log('hello')", runtime="node")
+print(result.stdout)  # "hello"
+```
+
+### Filesystem Operations
+
+Read, write, and list files inside the sandbox:
+
+```python
+# Write a file
+sandbox.write_file("/workspace/hello.py", "print('hello world')")
+
+# Read it back
+content = sandbox.read_file("/workspace/hello.py")
+print(content)  # b"print('hello world')"
+
+# List directory contents
+files = sandbox.list_files("/workspace")
+```
+
+### Interactive PTY
+
+```python
+terminal = sandbox.pty.create(
+    on_data=lambda data: print(data.decode(), end=''),
+)
+terminal.send_input("ls -la\n")
+terminal.kill()
+```
+
+### Network Policy / Credential Injection
+
+Inject HTTP headers into outbound requests based on domain rules. A transparent HTTPS proxy intercepts traffic from the sandbox and adds headers — sandboxes never see raw credentials:
+
+```python
+sandbox.update_network_policy({
+    "allow": {
+        "api.openai.com": [
+            {"transform": [{"headers": {"Authorization": "Bearer sk-..."}}]}
+        ],
+        "*.anthropic.com": [
+            {"transform": [{"headers": {"x-api-key": "sk-ant-..."}}]}
+        ],
+    }
+})
+
+# Retrieve current policy
+policy = sandbox.get_network_policy()
+```
+
+You can also pass `network_policy=` when creating a sandbox via the REST API.
+
+### Boot Timings
+
+```python
+# Total boot time
+print(sandbox.ready_time_ms)  # e.g. 42
+
+# Per-step breakdown
+print(sandbox.timings)
+# {'rootfs_copy_ms': 3, 'netns_setup_ms': 5, 'firecracker_popen_ms': 8, ...}
+```
+
+## 📦 Templates
+
+Build custom VM templates with a fluent builder API:
+
+```python
+from flint import Template, Sandbox
+
+template = (
+    Template("python-data-science")
+    .from_ubuntu_image("22.04")
+    .apt_install("python3", "python3-pip")
+    .pip_install("numpy", "pandas")
+    .set_workdir("/workspace")
+    .build()
+)
+
+# Create a sandbox from the template
+sandbox = Sandbox(template_id=template.template_id)
+```
+
+**Base image methods:**
+
+| Method | Description |
+|--------|-------------|
+| `.from_ubuntu_image(tag)` | Ubuntu base image |
+| `.from_python_image(tag)` | Python base image |
+| `.from_node_image(tag)` | Node.js base image |
+| `.from_alpine_image(tag)` | Alpine base image |
+| `.from_image(image)` | Any Docker image |
+| `.from_dockerfile(dockerfile)` | Raw Dockerfile string |
+
+**Operation methods:**
+
+| Method | Description |
+|--------|-------------|
+| `.apt_install(*packages)` | Install apt packages |
+| `.pip_install(*packages)` | Install pip packages |
+| `.npm_install(*packages)` | Install npm packages |
+| `.run_cmd(cmd)` | Run a shell command |
+| `.copy(src, dest)` | Copy files into the image |
+| `.set_workdir(path)` | Set the working directory |
+| `.set_envs(**envs)` | Set environment variables |
+| `.git_clone(repo, dest)` | Clone a git repository |
+
+Call `.build()` to build the template via the daemon. It blocks until the template is ready and returns a `TemplateInfo` with `template_id`, `name`, and `status`.
+
 ## 💻 TUI
 
 The TUI connects to the daemon and gives you an interactive terminal into each VM.
 
 | Key | Action |
 |-----|--------|
-| `s` | Start a new VM |
-| `Backspace` / `Delete` | Kill selected VM |
-| `Tab` | Toggle focus between sidebar and terminal |
-| `b` | Run benchmark |
+| `+` | New VM |
+| `Ctrl+D` | Delete VM |
+| `Ctrl+Up` | Previous VM |
+| `Ctrl+Down` | Next VM |
+| `Ctrl+B` | Run benchmark |
+| `Ctrl+K` | Show keybindings |
 
 > **Tip:** The sidebar auto-refreshes. You can also manage VMs from the CLI while the TUI is running.
 
-### CLI
+## 🖥️ CLI
 
-```bash
-uv run flint list              # List running VMs
-uv run flint stop <vm_id>      # Kill a VM by ID
-```
+| Command | Description |
+|---------|-------------|
+| `flint start` | Start the daemon (`--port`, `--data-dir`, `--state-dir`) |
+| `flint app` | Launch the interactive TUI |
+| `flint list` | List running VMs |
+| `flint stop <vm_id>` | Kill a VM by ID |
+| `flint install-deps` | Install Firecracker, jailer, and vmlinux kernel (Linux) |
+| `flint install-deps --check` | Verify installed dependencies |
+| `flint setup-macos` | Prepare macOS Virtualization.framework guest assets |
+| `flint setup-macos --check` | Verify macOS guest assets |
 
-## 📡 API
+## 📡 REST API
 
-The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`:
+The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`.
+
+### Sandbox Lifecycle
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Health check + golden snapshot status |
-| `POST` | `/vms` | Create a new VM |
+| `POST` | `/vms` | Create a new VM (`template_id`, `allow_internet_access` query params; optional `network_policy` body) |
 | `GET` | `/vms` | List all VMs |
 | `GET` | `/vms/{vm_id}` | Get VM details |
 | `DELETE` | `/vms/{vm_id}` | Kill a VM |
 | `POST` | `/vms/{vm_id}/pause` | Pause a VM (snapshot to disk) |
 | `POST` | `/vms/{vm_id}/resume` | Resume a paused VM |
 | `PATCH` | `/vms/{vm_id}` | Set timeout / timeout policy |
-| `WS` | `/vms/{vm_id}/terminal` | Interactive terminal (binary frames) |
+
+### Command Execution
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/vms/{vm_id}/exec` | Execute a command (`{cmd, timeout}`) |
+
+### Filesystem
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/vms/{vm_id}/files?path=` | Read a file |
+| `POST` | `/vms/{vm_id}/files?path=` | Write a file |
+| `DELETE` | `/vms/{vm_id}/files?path=` | Delete a file or directory |
+| `GET` | `/vms/{vm_id}/files/stat?path=` | Stat a file |
+| `GET` | `/vms/{vm_id}/files/list?path=` | List directory contents |
+| `POST` | `/vms/{vm_id}/files/mkdir?path=` | Create a directory |
+
+### Process Management
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/vms/{vm_id}/processes` | Start a new process |
+| `GET` | `/vms/{vm_id}/processes` | List processes |
+| `POST` | `/vms/{vm_id}/processes/{pid}/input` | Send stdin to a process |
+| `POST` | `/vms/{vm_id}/processes/{pid}/signal` | Send a signal to a process |
+| `POST` | `/vms/{vm_id}/processes/{pid}/resize` | Resize process PTY |
+
+### Network Policy
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `PUT` | `/vms/{vm_id}/network-policy` | Update credential injection rules |
+| `GET` | `/vms/{vm_id}/network-policy` | Get current network policy |
+
+### Templates
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/templates/build` | Build a template from a Dockerfile |
+| `GET` | `/templates` | List all templates |
+| `GET` | `/templates/{template_id}` | Get template details |
+| `DELETE` | `/templates/{template_id}` | Delete a template |
+
+### Terminal / Health
+
+| Protocol | Endpoint | Description |
+|----------|----------|-------------|
+| `WS` | `/vms/{vm_id}/terminal` | Interactive terminal (binary WebSocket frames) |
+| `GET` | `/health` | Health check + golden snapshot status + backend info |
+
+### Examples
 
 ```bash
 # Create a VM
@@ -135,6 +309,14 @@ curl -X POST localhost:9100/vms
 
 # List VMs
 curl localhost:9100/vms
+
+# Execute a command
+curl -X POST localhost:9100/vms/<vm_id>/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"cmd": "echo hello", "timeout": 30}'
+
+# Read a file
+curl localhost:9100/vms/<vm_id>/files?path=/etc/hostname
 
 # Pause / resume
 curl -X POST localhost:9100/vms/<vm_id>/pause
@@ -157,83 +339,87 @@ Flint includes a built-in benchmark mode that boots N VMs sequentially, measures
   <img src="assets/benchmark-screenshot.png" alt="Flint benchmark — booting 16 VMs with per-step timing breakdown" width="800">
 </p>
 
-Press `b` in the TUI to run a benchmark. Results include:
+Press `Ctrl+B` in the TUI to run a benchmark. Results include:
 
 - **Per-VM TTI** (time-to-interactive) with min/avg/median/p95/p99/max
 - **Per-step breakdown**: rootfs copy, netns setup, Firecracker popen, API ready wait, snapshot load, drive patch, VM resume, TCP connect, first command
 - **Throughput**: VMs/second
 
-## 🏗️ Architecture
+## ⚙️ Configuration
 
-Flint is split into two processes with a strict separation:
+Flint is configured via environment variables.
 
+### Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_PORT` | `9100` | Daemon listen port |
+| `FLINT_DATA_DIR` | `/microvms` (Linux), `~/Library/Application Support/flint/data` (macOS) | Data directory for VMs |
+| `FLINT_STATE_DIR` | `/tmp/flint` (Linux), `~/Library/Application Support/flint/state` (macOS) | State directory for daemon files |
+
+### Storage
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_STORAGE_BACKEND` | `local` | Storage backend: `local`, `s3_files`, or `r2` |
+| `FLINT_WORKSPACE_DIR` | `/workspace` | Workspace path inside sandboxes |
+
+### S3 Files
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_S3_FILES_NFS_ENDPOINT` | — | S3 Files NFS endpoint |
+
+### Cloudflare R2
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_R2_ACCOUNT_ID` | — | R2 account ID |
+| `FLINT_R2_ACCESS_KEY_ID` | — | R2 access key ID |
+| `FLINT_R2_SECRET_ACCESS_KEY` | — | R2 secret access key |
+| `FLINT_R2_BUCKET` | `flint-storage` | R2 bucket name |
+| `FLINT_R2_CACHE_DIR` | `{STATE_DIR}/r2-cache` | Local cache directory |
+| `FLINT_R2_CACHE_SIZE_MB` | `1024` | Local cache size in MB |
+
+### Firecracker / Jailer
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_FIRECRACKER_BINARY` | `/usr/local/bin/firecracker` | Path to Firecracker binary |
+| `FLINT_JAILER_BINARY` | `jailer` | Path to jailer binary |
+| `FLINT_JAILER_BASE_DIR` | `/srv/jailer` | Jailer base directory |
+| `FLINT_JAILER_UID` | `1000` | Jailer UID |
+| `FLINT_JAILER_GID` | `1000` | Jailer GID |
+
+### macOS Virtualization.framework
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLINT_VZ_KERNEL_PATH` | `{DATA_DIR}/vz/vmlinux` | VZ kernel path |
+| `FLINT_VZ_ROOTFS_PATH` | `{DATA_DIR}/vz/rootfs.img` | VZ rootfs path |
+| `FLINT_VZ_CPU_COUNT` | `2` | vCPUs per VM |
+| `FLINT_VZ_MEMORY_BYTES` | `2147483648` (2 GB) | Memory per VM |
+| `FLINT_VZ_READY_TIMEOUT` | `60` | Seconds to wait for VM readiness |
+
+## 🍎 macOS Apple Silicon
+
+Flint supports macOS on Apple Silicon via the Virtualization.framework backend.
+
+### Setup
+
+```bash
+# Download kernel and build Alpine rootfs for macOS
+flint setup-macos
+
+# Verify assets are in place
+flint setup-macos --check
 ```
-┌─────────────┐
-│  flint app  │  TUI with terminal emulation
-│  (TUI)      │
-└──────┬──────┘
-       │
-       │         Sandbox SDK
-       ▼         (HTTP + WebSocket)
-┌──────────────┐                    ┌─────────────────┐
-│   Sandbox    │ ◄────────────────► │  flint start    │
-│ (Python SDK) │  localhost:9100    │  (daemon)       │
-└──────────────┘                    │                 │
-       ▲                            │  FastAPI        │
-       │                            │  SandboxManager │
-┌──────┴──────┐                     │  Rootfs pool    │
-│  flint list │  CLI commands       └─────────────────┘
-│  flint stop │
-└─────────────┘
-```
 
-- **Daemon** (`flint start`): Manages VM lifecycle — golden snapshot creation, rootfs pool, Firecracker process management, TCP connections. Exposes REST + WebSocket API.
-- **SDK** (`Sandbox`): E2B-style Python SDK for programmatic VM management. Used by both the TUI and CLI internally — also available for your own applications.
-- **TUI** (`flint app`): Interactive terminal UI built on the SDK. Handles terminal emulation (pyte) client-side.
-- **CLI** (`flint list`, `flint stop`): Stateless commands built on the SDK.
+Options: `--alpine-version`, `--kernel-version`, `--rootfs-size-mb`, `--force`.
 
-### Key Design Decisions
+Once setup is complete, `flint start` auto-detects the macOS backend and starts the daemon.
 
-- **Golden snapshot**: A single pre-booted VM snapshot that all new VMs are cloned from, enabling millisecond boot times
-- **Rootfs pool**: Pre-copied rootfs images ready to go, eliminating copy latency at VM creation time
-- **WebSocket terminal**: Raw binary frames over WebSocket for terminal I/O — no base64, no polling
-- **SQLite state store**: All sandbox state is durably persisted to SQLite (WAL mode) so VMs survive daemon restarts. The daemon detaches from VMs on shutdown and reclaims them on startup.
-- **Crash recovery**: On startup the daemon probes for orphaned Firecracker processes from a previous run, reconnects to healthy ones, and cleans up dead ones
-- **Health monitoring**: Background thread checks process liveness every 5s and transitions dead VMs to error state
-- **Pause/resume**: VMs can be paused to disk (Firecracker snapshot) and resumed later, preserving full guest state
-
-## 📁 Project Structure
-
-```
-guest/
-└── tcp-relay.c          # Static C relay: pre-spawned PTY shell over TCP
-src/flint/
-├── cli.py              # Click CLI commands
-├── daemon/
-│   └── server.py       # FastAPI daemon + lifecycle
-├── sandbox.py          # Public Sandbox SDK
-├── _client/
-│   └── client.py       # Internal HTTP + WebSocket client
-├── core/
-│   ├── manager.py      # VM lifecycle (create/kill/pause/resume)
-│   ├── types.py        # SandboxState enum, _SandboxEntry dataclass
-│   ├── config.py       # Constants and paths
-│   ├── _boot.py        # Firecracker boot sequence + BootResult
-│   ├── _snapshot.py    # Golden snapshot creation
-│   ├── _pool.py        # Rootfs pool management
-│   ├── _tcp.py         # TCP output reader
-│   ├── _state_store.py # SQLite WAL state persistence
-│   ├── _state_machine.py # State transition validator
-│   ├── _recovery.py    # Crash recovery engine
-│   ├── _health.py      # Background health monitor
-│   └── _lifecycle.py   # Timeout enforcement + error cleanup
-└── tui/
-    ├── app.py           # Textual app
-    ├── screens/         # Home + Benchmark screens
-    └── widgets/         # Sidebar, Terminal, etc.
-```
-
-## 🔧 Host Setup
+## 🔧 Linux Host Setup
 
 Flint expects a Linux host with Firecracker, a kernel, and a rootfs image.
 
