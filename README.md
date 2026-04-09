@@ -26,9 +26,9 @@ https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 
 ### Prerequisites
 
-- **Linux** host with [Firecracker](https://github.com/firecracker-microvm/firecracker) installed, or **macOS** Apple Silicon (Virtualization.framework)
-- A rootfs image and vmlinux kernel at `/root/firecracker-vm/` (Linux) — see [Linux Host Setup](#-linux-host-setup)
-- Python 3.12+
+- **Linux** host (x86_64 or aarch64) or **macOS** Apple Silicon
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- Go 1.24+ (or Docker Desktop as fallback for building the guest agent)
 
 ### Install
 
@@ -36,6 +36,25 @@ https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 git clone https://github.com/jacquesverre/flint.git
 cd flint
 uv sync
+```
+
+### Setup
+
+One command installs all platform dependencies (Firecracker, jailer, kernel, rootfs):
+
+```bash
+# Linux — installs Firecracker, jailer, kernel, and builds the rootfs
+sudo uv run flint setup
+
+# macOS — downloads kernel and builds the Virtualization.framework guest image
+uv run flint setup
+```
+
+Verify everything is in place:
+
+```bash
+sudo uv run flint setup --check   # Linux
+uv run flint setup --check         # macOS
 ```
 
 ### Run
@@ -226,6 +245,9 @@ The TUI connects to the daemon and gives you an interactive terminal into each V
 
 | Command | Description |
 |---------|-------------|
+| `flint setup` | Auto-detect platform and install all dependencies (Linux or macOS) |
+| `flint setup --check` | Verify that all dependencies are installed |
+| `flint setup --force` | Rebuild assets even if they already exist |
 | `flint start` | Start the daemon (`--port`, `--data-dir`, `--state-dir`) |
 | `flint app` | Launch the interactive TUI |
 | `flint list` | List running VMs |
@@ -407,15 +429,21 @@ Flint supports macOS on Apple Silicon via the Virtualization.framework backend.
 
 ### Setup
 
+The easiest way to set up is with the unified setup command:
+
 ```bash
-# Download kernel and build Alpine rootfs for macOS
-flint setup-macos
+# Downloads kernel and builds Alpine rootfs for macOS (requires Docker Desktop)
+flint setup
 
 # Verify assets are in place
-flint setup-macos --check
+flint setup --check
 ```
 
-Options: `--alpine-version`, `--kernel-version`, `--rootfs-size-mb`, `--force`.
+You can also use the platform-specific command directly for more options:
+
+```bash
+flint setup-macos --alpine-version 3.21.3 --kernel-version 1.12 --rootfs-size-mb 1024
+```
 
 Once setup is complete, `flint start` auto-detects the macOS backend and starts the daemon.
 
@@ -423,9 +451,31 @@ Once setup is complete, `flint start` auto-detects the macOS backend and starts 
 
 Flint expects a Linux host with Firecracker, a kernel, and a rootfs image.
 
-### 1. Install Firecracker, jailer, and kernel
+### Recommended: one-command setup
 
-If Flint is already installed:
+`flint setup` handles everything — installs Firecracker + jailer binaries, downloads the vmlinux kernel, and builds the Alpine rootfs with the `flintd` guest agent:
+
+```bash
+sudo flint setup
+```
+
+To pin a specific Firecracker version:
+
+```bash
+sudo flint setup --version v1.10.1
+```
+
+Verify everything is in place:
+
+```bash
+sudo flint setup --check
+```
+
+### Manual setup (advanced)
+
+If you prefer to run each step individually:
+
+#### 1. Install Firecracker, jailer, and kernel
 
 ```bash
 sudo flint install-deps
@@ -437,19 +487,7 @@ Or without Flint installed yet:
 curl -fsSL https://raw.githubusercontent.com/jacquesverre/flint/main/scripts/install-deps.sh | sudo sh
 ```
 
-To pin a specific version:
-
-```bash
-FC_VERSION=v1.10.1 curl -fsSL https://raw.githubusercontent.com/jacquesverre/flint/main/scripts/install-deps.sh | sudo sh
-```
-
-To verify what is installed:
-
-```bash
-sudo flint install-deps --check
-```
-
-### 2. Build the rootfs image
+#### 2. Build the rootfs image
 
 Flint uses an Alpine-based rootfs with the `flintd` guest agent. The `setup-rootfs.sh` script builds it:
 
@@ -459,7 +497,7 @@ sudo ./setup-rootfs.sh
 
 This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4`.
 
-### 3. Verify
+#### 3. Verify
 
 You should have:
 

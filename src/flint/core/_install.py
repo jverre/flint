@@ -28,6 +28,42 @@ _VZ_ENTITLEMENTS_PLIST = """\
 </dict>
 </plist>"""
 
+_INIT_NET_SCRIPT = """\
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+# Configure network
+ip addr add 172.16.0.2/30 dev eth0
+ip link set eth0 up
+ip route add default via 172.16.0.1
+
+# DNS
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Ensure workspace directory exists for storage backends
+mkdir -p /workspace
+
+# Start flintd guest agent (HTTP+WebSocket process manager)
+/usr/local/bin/flintd > /var/log/flintd.log 2>&1 &
+
+# Wait for flintd to be listening before signaling READY
+i=0
+while [ "$i" -lt 200 ]; do
+    if grep -q ":1388" /proc/net/tcp 2>/dev/null; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.05 2>/dev/null || sleep 1
+done
+
+echo "READY"
+exec /bin/sh
+"""
+
 
 def _python_has_vz_entitlement(binary: str) -> bool:
     try:
@@ -188,19 +224,20 @@ def _download_macos_kernel(dest: Path, kernel_release: str, kernel_build: str) -
     _info(f"Kernel installed at {dest} ({size_mb}M)")
 
 
-def _build_flintd_linux_arm64(output_path: Path) -> None:
+def _build_flintd(output_path: Path, goarch: str = "arm64") -> None:
+    """Build flintd guest agent as a static binary for linux/<goarch>."""
     source_dir = _project_root() / "guest" / "flintd"
     if not source_dir.is_dir():
         raise FileNotFoundError(f"flintd source not found: {source_dir}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _info("Building flintd guest agent for linux/arm64...")
+    _info(f"Building flintd guest agent for linux/{goarch}...")
     local_go = shutil.which("go")
     if local_go:
         env = os.environ.copy()
         env["CGO_ENABLED"] = "0"
         env["GOOS"] = "linux"
-        env["GOARCH"] = "arm64"
+        env["GOARCH"] = goarch
         subprocess.run(
             [local_go, "build", "-buildvcs=false", "-ldflags=-s -w", "-o", str(output_path), "."],
             cwd=source_dir,
@@ -208,6 +245,7 @@ def _build_flintd_linux_arm64(output_path: Path) -> None:
             env=env,
         )
     else:
+        _require_docker()
         subprocess.run(
             [
                 "docker",
@@ -222,7 +260,7 @@ def _build_flintd_linux_arm64(output_path: Path) -> None:
                 "golang:1.24-alpine",
                 "sh",
                 "-lc",
-                "CGO_ENABLED=0 GOOS=linux GOARCH=arm64 /usr/local/go/bin/go build -buildvcs=false -ldflags='-s -w' -o /out/flintd .",
+                f"CGO_ENABLED=0 GOOS=linux GOARCH={goarch} /usr/local/go/bin/go build -buildvcs=false -ldflags='-s -w' -o /out/{output_path.name} .",
             ],
             check=True,
         )
@@ -351,7 +389,7 @@ def setup_macos_vz(
             )
             _info(f"Downloading Alpine minirootfs {alpine_version}...")
             _download(alpine_url, alpine_tarball)
-            _build_flintd_linux_arm64(flintd_path)
+            _build_flintd(flintd_path, goarch="arm64")
             rootfs_dir.mkdir(parents=True, exist_ok=True)
             _prepare_macos_rootfs_tree(rootfs_dir, alpine_tarball, flintd_path)
             _build_ext4_image_with_docker(rootfs_dir, rootfs_image, rootfs_size_mb)
@@ -519,3 +557,129 @@ def install_deps(
             _install_kernel(kernel_version, kernel_patch, arch, kernel_dir)
 
     print("\n  Done.")
+
+
+# ── Linux rootfs builder ────────────────────────────────────────────────────
+
+
+def _build_ext4_image_native(rootfs_dir: Path, dest: Path, size_mb: int) -> None:
+    """Build ext4 image using native mke2fs -d (Linux with e2fsprogs)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    _info(f"Building ext4 rootfs image ({size_mb} MB) at {dest}...")
+    with open(tmp, "wb") as f:
+        f.truncate(size_mb * 1024 * 1024)
+    subprocess.run(
+        ["mke2fs", "-q", "-d", str(rootfs_dir), "-t", "ext4", "-F", str(tmp)],
+        check=True,
+    )
+    os.replace(tmp, dest)
+    _info(f"Rootfs image installed at {dest}")
+
+
+def check_linux_rootfs(rootfs_dir: str = "/root/firecracker-vm") -> bool:
+    """Check if the Linux rootfs image exists. Returns True if present."""
+    rootfs_path = Path(rootfs_dir) / "rootfs.ext4"
+    if rootfs_path.exists():
+        size_mb = rootfs_path.stat().st_size // (1024 * 1024)
+        print(f"  rootfs       {rootfs_path} ({size_mb}M)")
+        return True
+    print(f"  rootfs       NOT FOUND (expected at {rootfs_path})")
+    return False
+
+
+def build_linux_rootfs(
+    *,
+    rootfs_dir: str = "/root/firecracker-vm",
+    alpine_version: str = "3.21.3",
+    rootfs_size_mb: int = 200,
+    force: bool = False,
+) -> None:
+    """Build the Alpine rootfs image with the flintd guest agent (Linux)."""
+    if os.geteuid() != 0:
+        _error("This command must be run as root (sudo flint setup)")
+        raise SystemExit(1)
+
+    arch = _detect_arch()
+    goarch = "arm64" if arch in ("arm64", "aarch64") else "amd64"
+    rootfs_path = Path(rootfs_dir) / "rootfs.ext4"
+
+    if rootfs_path.exists() and not force:
+        _skip(f"Rootfs already exists at {rootfs_path} - skipping (use --force to rebuild)")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="flint-rootfs-") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        alpine_tarball = tmpdir / f"alpine-minirootfs-{alpine_version}-{arch}.tar.gz"
+        flintd_path = tmpdir / "flintd"
+        tree_dir = tmpdir / "rootfs"
+
+        # Download Alpine minirootfs
+        alpine_minor = ".".join(alpine_version.split(".")[:2])
+        alpine_url = (
+            f"https://dl-cdn.alpinelinux.org/alpine/v{alpine_minor}/releases/{arch}/"
+            f"alpine-minirootfs-{alpine_version}-{arch}.tar.gz"
+        )
+        _info(f"Downloading Alpine minirootfs {alpine_version} for {arch}...")
+        _download(alpine_url, alpine_tarball)
+
+        # Build flintd guest agent
+        _build_flintd(flintd_path, goarch=goarch)
+
+        # Prepare rootfs tree
+        tree_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(alpine_tarball, "r:gz") as tf:
+            tf.extractall(tree_dir)
+
+        (tree_dir / "usr" / "local" / "bin").mkdir(parents=True, exist_ok=True)
+        (tree_dir / "var" / "log").mkdir(parents=True, exist_ok=True)
+        (tree_dir / "workspace").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(flintd_path, tree_dir / "usr" / "local" / "bin" / "flintd")
+        os.chmod(tree_dir / "usr" / "local" / "bin" / "flintd", 0o755)
+
+        init_script = tree_dir / "etc" / "init-net.sh"
+        init_script.write_text(_INIT_NET_SCRIPT)
+        os.chmod(init_script, 0o755)
+
+        # Build ext4 image — prefer native mke2fs, fall back to Docker
+        if shutil.which("mke2fs"):
+            _build_ext4_image_native(tree_dir, rootfs_path, rootfs_size_mb)
+        else:
+            _require_docker()
+            _build_ext4_image_with_docker(tree_dir, rootfs_path, rootfs_size_mb)
+
+    _info(f"Rootfs ready at {rootfs_path}")
+
+
+# ── Unified setup ───────────────────────────────────────────────────────────
+
+
+def setup_all(
+    *,
+    check: bool = False,
+    force: bool = False,
+    fc_version: str = "latest",
+) -> None:
+    """Unified setup — detects platform and installs everything needed to run Flint."""
+    system = platform.system()
+
+    if system == "Darwin":
+        print("  Detected macOS — setting up Virtualization.framework backend\n")
+        if check:
+            all_present = check_macos_vz_assets()
+            raise SystemExit(0 if all_present else 1)
+        setup_macos_vz(force=force)
+
+    elif system == "Linux":
+        print("  Detected Linux — setting up Firecracker backend\n")
+        if check:
+            deps_ok = check_deps()
+            rootfs_ok = check_linux_rootfs()
+            raise SystemExit(0 if (deps_ok and rootfs_ok) else 1)
+        install_deps(fc_version=fc_version)
+        build_linux_rootfs(force=force)
+        print("\n  Setup complete. Run 'flint start' to launch the daemon.")
+
+    else:
+        _error(f"Unsupported platform: {system}")
+        raise SystemExit(1)

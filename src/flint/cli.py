@@ -53,6 +53,23 @@ def stop(vm_id):
     click.echo(f"Stopped VM: {vm_id}")
 
 
+@cli.command("setup")
+@click.option("--check", is_flag=True, default=False, help="Verify setup status and exit")
+@click.option("--force", is_flag=True, default=False, help="Rebuild assets even if they already exist")
+@click.option("--version", "fc_version", default="latest", help="Firecracker version to install (Linux only, default: latest)")
+def setup(check, force, fc_version):
+    """Set up Flint for your platform (Linux or macOS).
+
+    \b
+    On Linux:  installs Firecracker, jailer, kernel, and builds the rootfs image.
+    On macOS:  downloads kernel and builds guest image for Virtualization.framework.
+
+    Requires sudo on Linux. On macOS, requires Docker Desktop.
+    """
+    from flint.core._install import setup_all
+    setup_all(check=check, force=force, fc_version=fc_version)
+
+
 @cli.command("install-deps")
 @click.option("--version", "fc_version", default="latest", help="Firecracker version to install (default: latest)")
 @click.option("--install-dir", default="/usr/local/bin", help="Directory to install binaries (default: /usr/local/bin)")
