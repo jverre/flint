@@ -175,7 +175,13 @@ class DaemonClient:
 
     def resume(self, vm_id: str) -> dict:
         resp = self._http.post(f"/vms/{vm_id}/resume")
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            detail = resp.text
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                pass
+            raise RuntimeError(f"Resume failed ({resp.status_code}): {detail}")
         return resp.json()["vm"]
 
     def set_timeout(self, vm_id: str, timeout_seconds: float, policy: str = "kill") -> None:

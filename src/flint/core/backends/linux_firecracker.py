@@ -140,7 +140,8 @@ class LinuxFirecrackerBackend(HostBackend):
             state_store.update_sandbox(entry.vm_id, pause_state_ref=entry.vm_dir)
 
     def resume(self, row: dict) -> BackendBootResult:
-        from flint.core._jailer import JailSpec, build_jailer_command, cleanup_jailer
+        from flint.core._jailer import JailSpec, build_jailer_command
+        import shutil
         import subprocess
 
         sandbox_id = row["vm_id"]
@@ -151,16 +152,27 @@ class LinuxFirecrackerBackend(HostBackend):
         spec = JailSpec(vm_id=sandbox_id, ns_name=ns_name)
         socket_path = spec.socket_path_on_host
 
-        # Remove stale artifacts from the previous jailer run that would
-        # conflict with the new jailer (hard-link, socket, cgroups).
-        for stale in (socket_path, os.path.join(spec.chroot_root, "firecracker")):
-            try:
-                os.unlink(stale)
-            except FileNotFoundError:
-                pass
-        # Clean stale cgroup entries (jailer creates them on startup and
-        # they persist after the process is killed during pause).
-        import shutil
+        # The jailer creates several artifacts in the chroot on startup
+        # (firecracker binary link, /dev/kvm, /dev/net/tun, /dev/urandom,
+        # cgroup dirs). These conflict if the jailer is restarted with the
+        # same --id. Remove everything except the files we need to keep.
+        _keep = {"rootfs.ext4", "pause-vmstate", "pause-mem"}
+        for entry in os.listdir(spec.chroot_root):
+            if entry in _keep:
+                continue
+            path = os.path.join(spec.chroot_root, entry)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        # Also need to keep the symlink tree that maps the golden rootfs
+        # path inside the chroot (e.g. microvms/.golden/rootfs.ext4 -> /rootfs.ext4).
+        # _boot_from_snapshot recreates this, so we just ensure the parent exists.
+
+        # Clean stale cgroup entries
         for cg_base in (
             f"/sys/fs/cgroup/firecracker/{sandbox_id}",
             f"/sys/fs/cgroup/cpu/firecracker/{sandbox_id}",
@@ -196,10 +208,12 @@ class LinuxFirecrackerBackend(HostBackend):
             _fc_patch(socket_path, "/vm", {"state": "Resumed"})
             agent_url = _wait_for_agent(ns_name)
         except Exception:
-            # Capture firecracker log for debugging
+            # Capture firecracker/jailer log for debugging
             try:
                 with open(log_path) as f:
-                    log.error("Resume failed — firecracker log:\n%s", f.read()[-2000:])
+                    fc_log = f.read()[-2000:]
+                    log.error("Resume failed — firecracker log:\n%s", fc_log)
+                    print(f"Resume failed — firecracker log:\n{fc_log}")
             except OSError:
                 pass
             process.kill()
