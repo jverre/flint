@@ -40,14 +40,24 @@ uv sync
 
 ### Setup
 
-One command installs all platform dependencies (Firecracker, jailer, kernel, rootfs):
+Run the interactive setup wizard — it detects your platform, installs all dependencies, and lets you pick a storage backend:
 
 ```bash
-# Linux — installs Firecracker, jailer, kernel, and builds the rootfs
-sudo uv run flint setup
+sudo uv run flint setup   # Linux (requires sudo)
+uv run flint setup         # macOS
+```
 
-# macOS — downloads kernel and builds the Virtualization.framework guest image
-uv run flint setup
+The wizard walks you through:
+1. **Platform detection** — auto-detects Linux or macOS and installs the right backend
+2. **Storage selection** — choose between local filesystem, AWS S3 Files, or Cloudflare R2
+3. **Credential collection** — prompts for any required cloud credentials
+4. **Dependency installation** — downloads and builds everything with progress indicators
+5. **Config file** — writes a `.env` with your storage settings
+
+For CI or scripting, skip the wizard with `--no-interactive`:
+
+```bash
+sudo uv run flint setup --no-interactive
 ```
 
 Verify everything is in place:
@@ -245,9 +255,10 @@ The TUI connects to the daemon and gives you an interactive terminal into each V
 
 | Command | Description |
 |---------|-------------|
-| `flint setup` | Auto-detect platform and install all dependencies (Linux or macOS) |
+| `flint setup` | Interactive setup wizard — installs deps, configures storage backend |
 | `flint setup --check` | Verify that all dependencies are installed |
 | `flint setup --force` | Rebuild assets even if they already exist |
+| `flint setup --no-interactive` | Non-interactive setup (local storage defaults, for CI) |
 | `flint start` | Start the daemon (`--port`, `--data-dir`, `--state-dir`) |
 | `flint app` | Launch the interactive TUI |
 | `flint list` | List running VMs |
@@ -451,18 +462,19 @@ Once setup is complete, `flint start` auto-detects the macOS backend and starts 
 
 Flint expects a Linux host with Firecracker, a kernel, and a rootfs image.
 
-### Recommended: one-command setup
+### Recommended: interactive setup
 
-`flint setup` handles everything — installs Firecracker + jailer binaries, downloads the vmlinux kernel, and builds the Alpine rootfs with the `flintd` guest agent:
+`flint setup` launches a wizard that installs Firecracker + jailer + kernel, builds the rootfs, and configures your storage backend:
 
 ```bash
 sudo flint setup
 ```
 
-To pin a specific Firecracker version:
+The wizard will prompt you to choose a storage backend (local, S3 Files, or R2) and collect any required credentials. For CI or scripting, use `--no-interactive`:
 
 ```bash
-sudo flint setup --version v1.10.1
+sudo flint setup --no-interactive                 # defaults to local storage
+sudo flint setup --no-interactive --version v1.10.1  # pin Firecracker version
 ```
 
 Verify everything is in place:

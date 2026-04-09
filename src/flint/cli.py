@@ -57,17 +57,26 @@ def stop(vm_id):
 @click.option("--check", is_flag=True, default=False, help="Verify setup status and exit")
 @click.option("--force", is_flag=True, default=False, help="Rebuild assets even if they already exist")
 @click.option("--version", "fc_version", default="latest", help="Firecracker version to install (Linux only, default: latest)")
-def setup(check, force, fc_version):
+@click.option("--no-interactive", is_flag=True, default=False, help="Skip interactive wizard (for CI / scripting)")
+def setup(check, force, fc_version, no_interactive):
     """Set up Flint for your platform (Linux or macOS).
+
+    \b
+    Launches an interactive wizard that installs platform dependencies
+    and lets you choose a storage backend (local, S3, or R2).
 
     \b
     On Linux:  installs Firecracker, jailer, kernel, and builds the rootfs image.
     On macOS:  downloads kernel and builds guest image for Virtualization.framework.
 
-    Requires sudo on Linux. On macOS, requires Docker Desktop.
+    Use --no-interactive to skip prompts (installs with local storage defaults).
     """
-    from flint.core._install import setup_all
-    setup_all(check=check, force=force, fc_version=fc_version)
+    if check or no_interactive:
+        from flint.core._install import setup_all
+        setup_all(check=check, force=force, fc_version=fc_version)
+    else:
+        from flint.core._setup_wizard import run_wizard
+        run_wizard(force=force, fc_version=fc_version)
 
 
 @cli.command("install-deps")
