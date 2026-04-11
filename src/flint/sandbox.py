@@ -264,6 +264,9 @@ class Sandbox:
         sb._id = vm_id
         sb._timings = {}
         sb._ready_time_ms = None
+        sb._storage_backend = "local"
+        sb._workspace_dir = "/workspace"
+        sb._template_id = "default"
         sb._commands = Commands(vm_id)
         sb._pty = Pty(vm_id)
         return sb

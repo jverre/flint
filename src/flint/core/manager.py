@@ -245,6 +245,11 @@ class SandboxManager:
             raise RuntimeError("StateStore required for set_timeout")
         timeout_at = time.time() + timeout_seconds
         self._state_store.set_timeout(sandbox_id, timeout_at, policy)
+        with self._lock:
+            entry = self._sandboxes.get(sandbox_id)
+        if entry:
+            entry.timeout_seconds = timeout_seconds
+            entry.timeout_policy = policy
 
     def list_dicts(self) -> list[dict]:
         """Return JSON-serializable dicts for all VMs."""
@@ -255,9 +260,36 @@ class SandboxManager:
         """Return JSON-serializable dict for a single VM, or None."""
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
-        if entry is None:
-            return None
-        return entry.to_dict()
+        if entry is not None:
+            return entry.to_dict()
+        # Fallback: check state store for paused/persisted VMs
+        if self._state_store:
+            row = self._state_store.get_sandbox(sandbox_id)
+            if row:
+                timings = {}
+                if row.get("timings_json"):
+                    try:
+                        timings = json.loads(row["timings_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return {
+                    "vm_id": row["vm_id"],
+                    "pid": row["pid"],
+                    "state": row["state"],
+                    "template_id": row.get("template_id", "default"),
+                    "backend_kind": row.get("backend_kind", "linux-firecracker"),
+                    "agent_healthy": False,
+                    "created_at": row["created_at"],
+                    "boot_time_ms": row.get("boot_time_ms"),
+                    "ready_time_ms": None,
+                    "timings": timings,
+                    "log_lines": [],
+                    "line_count": 0,
+                    "network_policy": None,
+                    "timeout_seconds": None,
+                    "timeout_policy": row.get("timeout_policy"),
+                }
+        return None
 
     def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
         """Return the raw entry for a VM. None if not found."""

@@ -67,6 +67,8 @@ class _SandboxEntry:
     line_count: int = 0
     network_policy: dict | None = None
     proxy: Any = None  # CredentialProxy instance, if active
+    timeout_seconds: float | None = None
+    timeout_policy: str | None = None
 
     def to_dict(self) -> dict:
         """Return JSON-serializable representation."""
@@ -84,6 +86,8 @@ class _SandboxEntry:
             "log_lines": list(self.log_lines),
             "line_count": self.line_count,
             "network_policy": _redact_policy(self.network_policy),
+            "timeout_seconds": self.timeout_seconds,
+            "timeout_policy": self.timeout_policy,
         }
 
 
