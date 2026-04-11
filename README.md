@@ -6,6 +6,7 @@
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-python-sdk">SDK</a> •
+  <a href="#-agents">Agents</a> •
   <a href="#-templates">Templates</a> •
   <a href="#-tui">TUI</a> •
   <a href="#-cli">CLI</a> •
@@ -207,6 +208,98 @@ sandbox = Sandbox(template_id=template.template_id)
 
 Call `.build()` to build the template via the daemon. It blocks until the template is ready and returns a `TemplateInfo` with `template_id`, `name`, and `status`.
 
+## 🤖 Agents
+
+Flint ships with pre-packaged AI agents that you can deploy in isolated microVMs with a single command. Each agent is built as a Flint template — the first deploy builds the image, and subsequent deploys boot in milliseconds from the cached snapshot.
+
+### Available Agents
+
+| Agent | Description |
+|-------|-------------|
+| **hermes** | Self-improving AI agent by [Nous Research](https://nousresearch.com) with persistent memory and a learning loop |
+| **openclaw** | Autonomous AI agent framework for real-world task execution via messaging platforms |
+
+### CLI
+
+```bash
+# List available agents
+flint agents list
+
+# Get details about an agent
+flint agents info hermes
+
+# Deploy an agent
+flint agents deploy hermes
+
+# Deploy with environment variables
+flint agents deploy openclaw -e MODEL_API_KEY=sk-... -e OPENCLAW_PORT=5000
+
+# Deploy without internet access
+flint agents deploy hermes --no-internet
+```
+
+### Python SDK
+
+```python
+from flint.agents import Agent
+
+# List available agents
+for defn in Agent.catalog():
+    print(f"{defn.name}: {defn.description}")
+
+# Deploy Hermes with API credentials
+agent = Agent.deploy("hermes", env={"MODEL_API_KEY": "sk-..."})
+print(f"Running in sandbox {agent.sandbox.id}")
+
+# Inject API credentials via network policy (transparent proxy)
+agent.set_credentials({
+    "api.openai.com": {"Authorization": "Bearer sk-..."},
+    "api.anthropic.com": {"x-api-key": "sk-ant-..."},
+})
+
+# Run commands inside the agent VM
+result = agent.exec("ls /app")
+print(result.stdout)
+
+# Check logs
+print(agent.logs())
+
+# Pause / resume (snapshot to disk, restore later)
+agent.pause()
+agent.resume()
+
+# Stop the agent
+agent.stop()
+```
+
+### Custom Agents
+
+You can register your own agents in the catalog:
+
+```python
+from flint.agents.catalog import AgentDefinition, register_agent
+
+register_agent(AgentDefinition(
+    name="my-agent",
+    description="My custom AI agent",
+    repo="https://github.com/me/my-agent.git",
+    version="latest",
+    license="MIT",
+    tags=["custom"],
+    dockerfile="""\
+FROM python:3.12-slim
+RUN pip install my-agent-package
+WORKDIR /app
+COPY flintd /usr/local/bin/flintd
+COPY init-net.sh /etc/init-net.sh
+RUN chmod +x /usr/local/bin/flintd /etc/init-net.sh
+""",
+    post_start_cmd="python -m my_agent &",
+))
+
+agent = Agent.deploy("my-agent")
+```
+
 ## 💻 TUI
 
 The TUI connects to the daemon and gives you an interactive terminal into each VM.
@@ -230,6 +323,9 @@ The TUI connects to the daemon and gives you an interactive terminal into each V
 | `flint app` | Launch the interactive TUI |
 | `flint list` | List running VMs |
 | `flint stop <vm_id>` | Kill a VM by ID |
+| `flint agents list` | List available pre-packaged agents |
+| `flint agents info <name>` | Show agent details |
+| `flint agents deploy <name>` | Build and deploy an agent in a microVM |
 | `flint install-deps` | Install Firecracker, jailer, and vmlinux kernel (Linux) |
 | `flint install-deps --check` | Verify installed dependencies |
 | `flint setup-macos` | Prepare macOS Virtualization.framework guest assets |
