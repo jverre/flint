@@ -60,7 +60,7 @@ _HERMES = AgentDefinition(
         "HERMES_PORT": "3000",
     },
     dockerfile=_agent_dockerfile(f"{GHCR_REGISTRY}/agent-hermes:latest"),
-    post_start_cmd="cd /app && python -m hermes_agent 2>/dev/null || python main.py 2>/dev/null &",
+    post_start_cmd="cd /opt/hermes && hermes gateway --bind 0.0.0.0 --port 3000 2>/dev/null &",
 )
 
 _OPENCLAW = AgentDefinition(
@@ -78,7 +78,7 @@ _OPENCLAW = AgentDefinition(
         "OPENCLAW_PORT": "4000",
     },
     dockerfile=_agent_dockerfile(f"{GHCR_REGISTRY}/agent-openclaw:latest"),
-    post_start_cmd="cd /app && npm start 2>/dev/null || node index.js 2>/dev/null &",
+    post_start_cmd="cd /app && node dist/index.js gateway --bind 0.0.0.0 --port 4000 2>/dev/null &",
 )
 
 
