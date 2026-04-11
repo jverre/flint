@@ -225,6 +225,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+          cache-dependency-path: guest/flintd/go.sum
       - name: Install Python dependencies
         run: uv sync --dev
       - name: Build r2nfs
@@ -247,6 +248,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
+      - name: Pre-build flintd for template pipeline
+        run: cp /tmp/flintd assets/flintd
       - name: Build agent Docker images locally
         run: |
           for agent_dir in agents/*/; do
@@ -256,5 +259,5 @@ jobs:
             docker build -t "$tag" "$agent_dir"
           done
       - name: Run agent e2e tests
-        run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v
+        run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v -s
         timeout-minutes: 30
