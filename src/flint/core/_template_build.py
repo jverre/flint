@@ -191,8 +191,12 @@ def build_template(
         _extract_rootfs(image_tag, rootfs_path, rootfs_size_mb)
 
         # Create golden snapshot for this template
-        ns_name = f"fc-tmpl-{template_id[:12]}"
-        tap_name = f"tap-tmpl-{template_id[:8]}"
+        # TAP device names must be ≤15 chars (Linux IFNAMSIZ limit).
+        # Use a short hash of the template_id to guarantee this.
+        import hashlib
+        _h = hashlib.sha1(template_id.encode()).hexdigest()[:8]
+        ns_name = f"fc-tmpl-{_h}"
+        tap_name = f"tapt-{_h}"
         create_golden_snapshot(
             source_rootfs=rootfs_path,
             snapshot_dir=template_dir,
