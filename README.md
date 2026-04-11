@@ -210,7 +210,7 @@ Call `.build()` to build the template via the daemon. It blocks until the templa
 
 ## 🤖 Agents
 
-Flint ships with pre-packaged AI agents that you can deploy in isolated microVMs with a single command. Each agent is built as a Flint template — the first deploy builds the image, and subsequent deploys boot in milliseconds from the cached snapshot.
+Flint ships with pre-packaged AI agents that you can deploy in isolated microVMs with a single command. Agent images are pre-built and published to GitHub Container Registry (GHCR) by CI, so deploys pull a ready-made image instead of building from source. After the first pull, subsequent deploys boot from a cached snapshot in milliseconds.
 
 ### Available Agents
 
@@ -218,6 +218,28 @@ Flint ships with pre-packaged AI agents that you can deploy in isolated microVMs
 |-------|-------------|
 | **hermes** | Self-improving AI agent by [Nous Research](https://nousresearch.com) with persistent memory and a learning loop |
 | **openclaw** | Autonomous AI agent framework for real-world task execution via messaging platforms |
+
+### Pre-building Agent Templates
+
+Pre-build agent templates so deploys are instant (milliseconds):
+
+```bash
+# Pre-build a single agent
+flint agents build hermes
+
+# Pre-build all agents
+flint agents build --all
+
+# Force rebuild (ignore cache)
+flint agents build hermes --force
+```
+
+```python
+from flint.agents import Agent
+
+Agent.build("hermes")      # build one
+Agent.build_all()           # build all
+```
 
 ### CLI
 
@@ -228,7 +250,7 @@ flint agents list
 # Get details about an agent
 flint agents info hermes
 
-# Deploy an agent
+# Deploy an agent (builds template on first run, instant after)
 flint agents deploy hermes
 
 # Deploy with environment variables
@@ -236,6 +258,9 @@ flint agents deploy openclaw -e MODEL_API_KEY=sk-... -e OPENCLAW_PORT=5000
 
 # Deploy without internet access
 flint agents deploy hermes --no-internet
+
+# Force rebuild even if cached
+flint agents deploy hermes --force-build
 ```
 
 ### Python SDK
@@ -325,7 +350,9 @@ The TUI connects to the daemon and gives you an interactive terminal into each V
 | `flint stop <vm_id>` | Kill a VM by ID |
 | `flint agents list` | List available pre-packaged agents |
 | `flint agents info <name>` | Show agent details |
-| `flint agents deploy <name>` | Build and deploy an agent in a microVM |
+| `flint agents build <name>` | Pre-build an agent template for instant deploys |
+| `flint agents build --all` | Pre-build all agent templates |
+| `flint agents deploy <name>` | Deploy an agent in a microVM (builds if needed) |
 | `flint install-deps` | Install Firecracker, jailer, and vmlinux kernel (Linux) |
 | `flint install-deps --check` | Verify installed dependencies |
 | `flint setup-macos` | Prepare macOS Virtualization.framework guest assets |

@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from flint.agents.catalog import AgentDefinition, get_agent, list_agents
 from flint.sandbox import Sandbox, CommandResult
 from flint.template import Template, TemplateInfo
+from flint._client.client import DaemonClient
+
+log = logging.getLogger(__name__)
+
+TEMPLATE_PREFIX = "agent-"
+
+
+def _template_id_for(agent_name: str) -> str:
+    """Return the template_id that would be used for a given agent name."""
+    return f"{TEMPLATE_PREFIX}{agent_name}"
+
+
+def _template_is_ready(template_id: str) -> TemplateInfo | None:
+    """Check if a template already exists and is ready via the daemon.
+
+    Returns TemplateInfo if the template is cached and ready, None otherwise.
+    """
+    client = DaemonClient()
+    try:
+        info = client.get_template(template_id)
+        if info is not None and info.get("status") == "ready":
+            return TemplateInfo(
+                template_id=template_id,
+                name=info.get("name", template_id),
+                status="ready",
+            )
+    except Exception:
+        pass
+    finally:
+        client.close()
+    return None
 
 
 @dataclass
@@ -26,7 +58,7 @@ class Agent:
 
         from flint.agents import Agent
 
-        # Deploy Hermes agent
+        # Deploy Hermes agent (uses cached image if already built)
         agent = Agent.deploy("hermes", env={"MODEL_API_KEY": "sk-..."})
         print(f"Agent running in sandbox {agent.sandbox.id}")
 
@@ -41,6 +73,11 @@ class Agent:
 
         # Stop the agent
         agent.stop()
+
+    Pre-build agent templates for instant deploys::
+
+        Agent.build("hermes")       # build one agent
+        Agent.build_all()           # build all agents in the catalog
 
     You can also list available agents::
 
@@ -130,6 +167,63 @@ class Agent:
     # ── Class Methods ──────────────────────────────────────────────────────
 
     @classmethod
+    def build(
+        cls,
+        agent_name: str,
+        *,
+        rootfs_size_mb: int | None = None,
+        force: bool = False,
+    ) -> TemplateInfo:
+        """Pre-build an agent template so deploys are instant.
+
+        If the template is already built and ``force`` is False, returns
+        the cached template without rebuilding.
+
+        Args:
+            agent_name: Name of the agent (e.g. "hermes", "openclaw").
+            rootfs_size_mb: Override the default rootfs size for the template.
+            force: Rebuild even if the template is already cached.
+
+        Returns:
+            TemplateInfo for the built template.
+        """
+        definition = get_agent(agent_name)
+        if definition is None:
+            available = ", ".join(a.name for a in list_agents())
+            raise ValueError(
+                f"Unknown agent '{agent_name}'. Available agents: {available}"
+            )
+
+        template_id = _template_id_for(definition.name)
+
+        # Check cache unless force rebuild
+        if not force:
+            cached = _template_is_ready(template_id)
+            if cached is not None:
+                log.info("Agent '%s' template already cached (id=%s)", agent_name, template_id)
+                return cached
+
+        size = rootfs_size_mb or definition.rootfs_size_mb
+        template = Template(f"agent-{definition.name}", rootfs_size_mb=size)
+        return template.from_dockerfile(definition.dockerfile).build()
+
+    @classmethod
+    def build_all(cls, *, force: bool = False) -> list[TemplateInfo]:
+        """Pre-build templates for all agents in the catalog.
+
+        Args:
+            force: Rebuild even if templates are already cached.
+
+        Returns:
+            List of TemplateInfo for each agent.
+        """
+        results = []
+        for defn in list_agents():
+            info = cls.build(defn.name, force=force)
+            results.append(info)
+        return results
+
+    @classmethod
     def deploy(
         cls,
         agent_name: str,
@@ -138,8 +232,12 @@ class Agent:
         rootfs_size_mb: int | None = None,
         allow_internet_access: bool = True,
         network_policy: dict | None = None,
+        force_build: bool = False,
     ) -> Agent:
         """Build (if needed) and deploy an agent from the catalog.
+
+        The template is cached after the first build. Subsequent deploys
+        skip the build step and boot from the cached snapshot in milliseconds.
 
         Args:
             agent_name: Name of the agent in the catalog (e.g. "hermes", "openclaw").
@@ -147,6 +245,7 @@ class Agent:
             rootfs_size_mb: Override the default rootfs size for the template.
             allow_internet_access: Whether the VM can reach the internet.
             network_policy: Optional network policy with credential injection rules.
+            force_build: Force a rebuild even if the template is cached.
 
         Returns:
             An Agent instance wrapping the running sandbox.
@@ -158,10 +257,12 @@ class Agent:
                 f"Unknown agent '{agent_name}'. Available agents: {available}"
             )
 
-        # Build the template from the agent's Dockerfile
-        size = rootfs_size_mb or definition.rootfs_size_mb
-        template = Template(f"agent-{definition.name}", rootfs_size_mb=size)
-        template_info = template.from_dockerfile(definition.dockerfile).build()
+        # Build or reuse cached template
+        template_info = cls.build(
+            agent_name,
+            rootfs_size_mb=rootfs_size_mb,
+            force=force_build,
+        )
 
         # Launch a sandbox from the template
         sandbox = Sandbox(
