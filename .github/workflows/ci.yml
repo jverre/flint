@@ -258,6 +258,19 @@ jobs:
             echo "Building ${tag} from ${agent_dir}..."
             docker build -t "$tag" "$agent_dir"
           done
+      - name: Verify Docker images and disk space
+        run: |
+          echo "=== Docker images ==="
+          docker images | grep -E "agent-|REPOSITORY"
+          echo "=== Disk space ==="
+          df -h /
       - name: Run agent e2e tests
         run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v -s
         timeout-minutes: 30
+      - name: Print daemon log on failure
+        if: failure()
+        run: |
+          echo "=== Daemon log ==="
+          cat /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log found"
+          echo "=== Disk space ==="
+          df -h /
