@@ -210,3 +210,51 @@ jobs:
             echo '```'
           } > /tmp/comment.md
           gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md --repo "${GITHUB_REPOSITORY}"
+
+  agent-e2e:
+    runs-on: ubuntu-latest
+    needs: [go-r2nfs, go-flintd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install Python dependencies
+        run: uv sync --dev
+      - name: Build r2nfs
+        working-directory: services/r2nfs
+        run: go get ./... && go mod tidy && go build -o r2nfs .
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install Firecracker + kernel
+        run: sudo bash scripts/install-deps.sh
+      - name: Download Alpine minirootfs
+        run: |
+          sudo mkdir -p /root/firecracker-vm
+          curl -fsSL -o /tmp/alpine.tar.gz \
+            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
+          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
+      - name: Build rootfs
+        run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+      - name: Prepare runtime directories
+        run: sudo mkdir -p /srv/jailer
+      - name: Build agent Docker images locally
+        run: |
+          for agent_dir in agents/*/; do
+            agent_name=$(basename "$agent_dir")
+            tag="ghcr.io/jverre/flint/agent-${agent_name}:latest"
+            echo "Building ${tag} from ${agent_dir}..."
+            docker build -t "$tag" "$agent_dir"
+          done
+      - name: Run agent e2e tests
+        run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v
+        timeout-minutes: 30
