@@ -6,13 +6,29 @@ images built locally (CI does this via `docker build` before running
 pytest).  All tests are marked ``@pytest.mark.slow``.
 """
 
+import os
 import shutil
+import tempfile
 import time
 
 import pytest
 
 from flint.agents.agent import Agent
 from flint.agents.catalog import get_agent, GHCR_REGISTRY
+
+
+def _dump_daemon_log():
+    """Print daemon log for debugging CI failures."""
+    log_path = os.path.join(tempfile.gettempdir(), "flint-test-daemon.log")
+    try:
+        with open(log_path) as f:
+            content = f.read()
+        # Print last 5000 chars to avoid overwhelming output
+        if len(content) > 5000:
+            content = f"... (truncated, showing last 5000 chars) ...\n{content[-5000:]}"
+        print(f"\n=== DAEMON LOG ({log_path}) ===\n{content}\n=== END DAEMON LOG ===")
+    except OSError:
+        print(f"\n=== No daemon log at {log_path} ===")
 
 
 def _require_agent_infra(backend_kind):
@@ -33,7 +49,13 @@ def test_hermes_build_and_deploy(backend_kind):
     default env vars are injected, and commands execute correctly."""
     _require_agent_infra(backend_kind)
 
-    agent = Agent.deploy("hermes")
+    try:
+        agent = Agent.deploy("hermes")
+    except Exception as e:
+        print(f"\n!!! Agent.deploy('hermes') FAILED: {e}")
+        _dump_daemon_log()
+        raise
+
     try:
         assert agent.name == "hermes"
         assert agent.sandbox.is_running()
@@ -75,7 +97,13 @@ def test_openclaw_build_and_deploy(backend_kind):
     default env vars are injected, and commands execute correctly."""
     _require_agent_infra(backend_kind)
 
-    agent = Agent.deploy("openclaw")
+    try:
+        agent = Agent.deploy("openclaw")
+    except Exception as e:
+        print(f"\n!!! Agent.deploy('openclaw') FAILED: {e}")
+        _dump_daemon_log()
+        raise
+
     try:
         assert agent.name == "openclaw"
         assert agent.sandbox.is_running()
