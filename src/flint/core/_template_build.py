@@ -135,7 +135,9 @@ def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
                 stdin=export_proc.stdout,
                 check=True,
             )
-            export_proc.wait()
+            rc = export_proc.wait()
+            if rc != 0:
+                raise RuntimeError(f"docker export failed with exit code {rc}")
         finally:
             subprocess.run(["docker", "rm", container_id], capture_output=True)
     finally:
