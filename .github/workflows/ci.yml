@@ -249,7 +249,10 @@ jobs:
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
       - name: Pre-build flintd for template pipeline
-        run: cp /tmp/flintd assets/flintd
+        run: |
+          cp /tmp/flintd assets/flintd
+          ls -la assets/
+          echo "flintd binary: $(file assets/flintd)"
       - name: Build agent Docker images locally
         run: |
           for agent_dir in agents/*/; do
@@ -264,13 +267,23 @@ jobs:
           docker images | grep -E "agent-|REPOSITORY"
           echo "=== Disk space ==="
           df -h /
+      - name: Verify assets and project layout
+        run: |
+          echo "=== Working directory ==="
+          pwd
+          echo "=== assets/ contents ==="
+          ls -la assets/
+          echo "=== Python package location ==="
+          sudo -E env "PATH=$PATH" uv run python -c "import flint.core._template_build as tb; print('__file__:', tb.__file__); print('project_root:', tb._find_project_root())"
       - name: Run agent e2e tests
         run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v -s --tb=long
         timeout-minutes: 30
-      - name: Print daemon log on failure
-        if: failure()
+      - name: Print daemon log
+        if: always()
         run: |
-          echo "=== Daemon log ==="
-          cat /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log found"
+          echo "=== Daemon log (last 200 lines) ==="
+          tail -200 /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log found"
+          echo "=== Flint debug log ==="
+          tail -100 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log found"
           echo "=== Disk space ==="
           df -h /
