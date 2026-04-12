@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   go-r2nfs:
     runs-on: ubuntu-latest
@@ -291,16 +295,24 @@ jobs:
         if: failure() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          DAEMON_LOG=$(tail -150 /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log")
-          DEBUG_LOG=$(tail -80 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log")
-          jq -n \
-            --arg daemon "$DAEMON_LOG" \
-            --arg debug "$DEBUG_LOG" \
-            '{body: ("## Agent E2E Diagnostics (auto-posted)\n\n<details><summary>Daemon log (last 150 lines)</summary>\n\n```\n" + $daemon + "\n```\n\n</details>\n\n<details><summary>Debug log (last 80 lines)</summary>\n\n```\n" + $debug + "\n```\n\n</details>")}' | \
-          curl -s -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            -d @- || echo "Failed to post PR comment"
+          {
+            echo "## Agent E2E Diagnostics (auto-posted)"
+            echo ""
+            echo "<details><summary>Daemon log (last 150 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -150 /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log"
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "<details><summary>Debug log (last 80 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -80 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } > /tmp/pr-comment-body.md
+          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} -F /tmp/pr-comment-body.md
