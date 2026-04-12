@@ -53,7 +53,7 @@ _HERMES = AgentDefinition(
     homepage="https://hermes-agent.nousresearch.com",
     license="Apache-2.0",
     tags=["ai-agent", "self-improving", "multi-platform", "nous-research"],
-    rootfs_size_mb=1024,
+    rootfs_size_mb=2048,
     docker_image=f"{GHCR_REGISTRY}/agent-hermes:latest",
     default_env={
         "HERMES_HOST": "0.0.0.0",
@@ -71,7 +71,7 @@ _OPENCLAW = AgentDefinition(
     homepage="https://docs.openclaw.ai",
     license="MIT",
     tags=["ai-agent", "autonomous", "messaging", "task-execution"],
-    rootfs_size_mb=1024,
+    rootfs_size_mb=2048,
     docker_image=f"{GHCR_REGISTRY}/agent-openclaw:latest",
     default_env={
         "OPENCLAW_HOST": "0.0.0.0",
