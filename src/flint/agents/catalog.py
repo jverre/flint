@@ -71,7 +71,7 @@ _OPENCLAW = AgentDefinition(
     homepage="https://docs.openclaw.ai",
     license="MIT",
     tags=["ai-agent", "autonomous", "messaging", "task-execution"],
-    rootfs_size_mb=2048,
+    rootfs_size_mb=4096,
     docker_image=f"{GHCR_REGISTRY}/agent-openclaw:latest",
     default_env={
         "OPENCLAW_HOST": "0.0.0.0",

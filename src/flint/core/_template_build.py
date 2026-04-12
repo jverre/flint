@@ -138,7 +138,7 @@ def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
 
     # Create empty ext4 image
     subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
-    subprocess.run(["mkfs.ext4", "-F", rootfs_path], check=True, capture_output=True)
+    subprocess.run(["mkfs.ext4", "-F", "-m", "0", rootfs_path], check=True, capture_output=True)
 
     # Mount, export docker filesystem, unmount
     mount_dir = f"/tmp/flint-rootfs-mount-{os.getpid()}"
