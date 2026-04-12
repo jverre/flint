@@ -295,30 +295,12 @@ jobs:
         run: |
           DAEMON_LOG=$(tail -150 /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log")
           DEBUG_LOG=$(tail -80 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log")
-          BODY=$(cat <<'HEREDOC'
-          ## Agent E2E Failure Diagnostics (auto-posted)
-
-          <details><summary>Daemon log (last 150 lines)</summary>
-
-          ```
-          DAEMON_LOG_PLACEHOLDER
-          ```
-
-          </details>
-
-          <details><summary>Debug log (last 80 lines)</summary>
-
-          ```
-          DEBUG_LOG_PLACEHOLDER
-          ```
-
-          </details>
-          HEREDOC
-          )
-          BODY="${BODY/DAEMON_LOG_PLACEHOLDER/$DAEMON_LOG}"
-          BODY="${BODY/DEBUG_LOG_PLACEHOLDER/$DEBUG_LOG}"
+          jq -n \
+            --arg daemon "$DAEMON_LOG" \
+            --arg debug "$DEBUG_LOG" \
+            '{body: ("## Agent E2E Diagnostics (auto-posted)\n\n<details><summary>Daemon log (last 150 lines)</summary>\n\n```\n" + $daemon + "\n```\n\n</details>\n\n<details><summary>Debug log (last 80 lines)</summary>\n\n```\n" + $debug + "\n```\n\n</details>")}' | \
           curl -s -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            -d "$(jq -n --arg body "$BODY" '{body: $body}')" || echo "Failed to post PR comment"
+            -d @- || echo "Failed to post PR comment"
