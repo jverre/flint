@@ -193,10 +193,17 @@ class DaemonClient:
 
     # ── Template methods ───────────────────────────────────────────────────
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+    def build_template(
+        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+    ) -> dict:
         resp = self._http.post(
             "/templates/build",
-            json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb},
+            json={
+                "name": name,
+                "image_ref": image_ref,
+                "rootfs_size_mb": rootfs_size_mb,
+                "inject_flint": inject_flint,
+            },
             timeout=600.0,
         )
         resp.raise_for_status()

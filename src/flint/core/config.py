@@ -90,6 +90,11 @@ VZ_CPU_COUNT = int(os.environ.get("FLINT_VZ_CPU_COUNT", "2"))
 VZ_MEMORY_BYTES = int(os.environ.get("FLINT_VZ_MEMORY_BYTES", str(2 * 1024 * 1024 * 1024)))
 VZ_READY_TIMEOUT = float(os.environ.get("FLINT_VZ_READY_TIMEOUT", "60"))
 
+# ── OCI image pull ──────────────────────────────────────────────────────
+OCI_CACHE_DIR = os.environ.get("FLINT_OCI_CACHE_DIR", f"{DATA_DIR}/.oci-cache")
+DEFAULT_BASE_IMAGE = os.environ.get("FLINT_BASE_IMAGE", "ghcr.io/jverre/flint/base:latest")
+CRANE_BINARY = os.environ.get("FLINT_CRANE_BINARY", "crane")
+
 # ── Storage backend ─────────────────────────────────────────────────────
 STORAGE_BACKEND = os.environ.get("FLINT_STORAGE_BACKEND", "local")  # "local" | "s3_files" | "r2"
 WORKSPACE_DIR = os.environ.get("FLINT_WORKSPACE_DIR", "/workspace")

@@ -1,4 +1,4 @@
-"""Template build pipeline: Dockerfile generation, Docker build, rootfs extraction."""
+"""Template build pipeline: OCI image pull, rootfs extraction, snapshot creation."""
 
 from __future__ import annotations
 
@@ -7,50 +7,16 @@ import re
 import shutil
 import subprocess
 
-from .config import log, TEMPLATES_DIR, KERNEL_PATH, BOOT_ARGS, GUEST_MAC
+from .config import log, TEMPLATES_DIR
 from ._snapshot import create_golden_snapshot
 from ._template_registry import register_template_artifact, update_template_artifact_status
+from . import _oci_pull
+from . import _oci_cache
 
 
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "template"
-
-
-def _generate_dockerfile(base_image: str, steps: list[dict], flint_injection: bool = True) -> str:
-    lines = [f"FROM {base_image}", ""]
-    for step in steps:
-        kind = step["type"]
-        if kind == "run":
-            lines.append(f"RUN {step['cmd']}")
-        elif kind == "apt_install":
-            pkgs = " ".join(step["packages"])
-            lines.append(f"RUN apt-get update && apt-get install -y {pkgs} && rm -rf /var/lib/apt/lists/*")
-        elif kind == "pip_install":
-            pkgs = " ".join(step["packages"])
-            lines.append(f"RUN pip install --no-cache-dir {pkgs}")
-        elif kind == "npm_install":
-            pkgs = " ".join(step["packages"])
-            lines.append(f"RUN npm install -g {pkgs}")
-        elif kind == "copy":
-            lines.append(f"COPY {step['src']} {step['dest']}")
-        elif kind == "workdir":
-            lines.append(f"WORKDIR {step['path']}")
-        elif kind == "env":
-            for k, v in step["envs"].items():
-                lines.append(f"ENV {k}={v}")
-        elif kind == "git_clone":
-            lines.append(f"RUN git clone {step['repo']} {step.get('dest', '')}")
-
-    if flint_injection:
-        lines.append("")
-        lines.append("# Flint injection (always last)")
-        lines.append("RUN apt-get update && apt-get install -y iproute2 || apk add iproute2 || true")
-        lines.append("COPY flintd /usr/local/bin/flintd")
-        lines.append("COPY init-net.sh /etc/init-net.sh")
-        lines.append("RUN chmod +x /usr/local/bin/flintd /etc/init-net.sh")
-
-    return "\n".join(lines) + "\n"
 
 
 def _build_flintd(output_path: str) -> None:
@@ -80,78 +46,22 @@ def _build_flintd(output_path: str) -> None:
     log.info("Built flintd from %s", source_dir)
 
 
-def _find_init_net_sh() -> str:
-    """Locate init-net.sh — check assets/ then the source rootfs."""
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    candidate = os.path.join(project_root, "assets", "init-net.sh")
-    if os.path.exists(candidate):
-        return candidate
-    # Fallback: extract from the default rootfs (it's at /etc/init-net.sh inside ext4)
-    raise FileNotFoundError(
-        "init-net.sh not found in assets/. Place it at assets/init-net.sh."
-    )
-
-
-def _docker_build(template_id: str, dockerfile_content: str, context_dir: str) -> str:
-    tag = f"flint-template:{template_id}"
-    dockerfile_path = os.path.join(context_dir, "Dockerfile")
-    with open(dockerfile_path, "w") as f:
-        f.write(dockerfile_content)
-
-    log.info("Building Docker image %s ...", tag)
-    subprocess.run(
-        ["docker", "build", "-t", tag, "-f", dockerfile_path, context_dir],
-        check=True,
-    )
-    return tag
-
-
-def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
-    log.info("Extracting rootfs from %s (%d MB) ...", image_tag, size_mb)
-
-    # Create empty ext4 image
-    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
-    subprocess.run(["mkfs.ext4", "-F", rootfs_path], check=True, capture_output=True)
-
-    # Mount, export docker filesystem, unmount
-    mount_dir = f"/tmp/flint-rootfs-mount-{os.getpid()}"
-    os.makedirs(mount_dir, exist_ok=True)
-    try:
-        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
-
-        # Create container, export, extract
-        result = subprocess.run(
-            ["docker", "create", image_tag],
-            check=True, capture_output=True, text=True,
-        )
-        container_id = result.stdout.strip()
-        try:
-            export_proc = subprocess.Popen(
-                ["docker", "export", container_id],
-                stdout=subprocess.PIPE,
-            )
-            subprocess.run(
-                ["tar", "-x", "-C", mount_dir],
-                stdin=export_proc.stdout,
-                check=True,
-            )
-            export_proc.wait()
-        finally:
-            subprocess.run(["docker", "rm", container_id], capture_output=True)
-    finally:
-        subprocess.run(["umount", mount_dir], capture_output=True)
-        shutil.rmtree(mount_dir, ignore_errors=True)
-
-    log.info("Rootfs extracted to %s", rootfs_path)
-
-
 def build_template(
     name: str,
-    dockerfile_content: str,
+    image_ref: str,
     *,
     rootfs_size_mb: int = 500,
+    inject_flint: bool = True,
 ) -> str:
-    """Full build pipeline: Docker build -> rootfs extraction -> golden snapshot -> register.
+    """Full build pipeline: OCI pull -> rootfs extraction -> golden snapshot -> register.
+
+    Pulls the OCI image referenced by *image_ref* (e.g., ``ubuntu:22.04``
+    or ``ghcr.io/jverre/flint/base:latest``), extracts it into an ext4
+    rootfs, creates a Firecracker snapshot, and registers the template.
+
+    If *inject_flint* is True, the flintd guest agent and init-net.sh
+    are injected into the rootfs. Set to False for images that already
+    include them (e.g., pre-built Flint base images from ghcr.io).
 
     Returns template_id.
     """
@@ -167,28 +77,30 @@ def build_template(
         template_dir,
         status="building",
         rootfs_size_mb=rootfs_size_mb,
+        image_ref=image_ref,
     )
 
     try:
-        # Prepare build context directory
-        context_dir = f"/tmp/flint-build-{template_id}"
-        os.makedirs(context_dir, exist_ok=True)
-
-        # Copy flintd binary and init-net.sh into context
-        _build_flintd(os.path.join(context_dir, "flintd"))
-        init_net = _find_init_net_sh()
-        shutil.copy2(init_net, os.path.join(context_dir, "init-net.sh"))
-
-        # Save Dockerfile for reproducibility
-        with open(f"{template_dir}/Dockerfile", "w") as f:
-            f.write(dockerfile_content)
-
-        # Docker build
-        image_tag = _docker_build(template_id, dockerfile_content, context_dir)
-
-        # Extract rootfs
         rootfs_path = f"{template_dir}/rootfs.ext4"
-        _extract_rootfs(image_tag, rootfs_path, rootfs_size_mb)
+
+        # Check OCI cache — skip pull if digest matches
+        digest = _oci_pull.resolve_digest(image_ref)
+        cached = _oci_cache.get(image_ref, digest)
+
+        if cached:
+            _oci_cache.copy_cached_rootfs(cached, rootfs_path)
+            log.info("Template %s: using cached rootfs (digest=%s)", template_id, digest[:16])
+        else:
+            # Pull and extract OCI image
+            digest = _oci_pull.pull_and_extract(
+                image_ref,
+                rootfs_path,
+                size_mb=rootfs_size_mb,
+                inject_flint=inject_flint,
+            )
+            # Store in cache
+            _oci_cache.put(image_ref, digest, rootfs_path)
+            _oci_cache.cleanup()
 
         # Create golden snapshot for this template
         ns_name = f"fc-tmpl-{template_id[:12]}"
@@ -200,14 +112,10 @@ def build_template(
             tap_name=tap_name,
         )
 
-        # Update status
+        # Update status with digest
         update_template_artifact_status(template_id, "linux-firecracker", "ready")
 
-        # Cleanup
-        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
-        shutil.rmtree(context_dir, ignore_errors=True)
-
-        log.info("Template %s built successfully", template_id)
+        log.info("Template %s built successfully (image=%s)", template_id, image_ref)
         return template_id
 
     except Exception:

@@ -64,14 +64,31 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Install Firecracker + kernel
         run: sudo bash scripts/install-deps.sh
-      - name: Download Alpine minirootfs
+      - name: Install crane
+        run: |
+          curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin crane
+      - name: Pull base image and build rootfs
         run: |
           sudo mkdir -p /root/firecracker-vm
-          curl -fsSL -o /tmp/alpine.tar.gz \
-            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
-      - name: Build rootfs
-        run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+          truncate -s 200M /root/firecracker-vm/rootfs.ext4
+          mkfs.ext4 -q /root/firecracker-vm/rootfs.ext4
+          MOUNT_DIR="/tmp/flint-rootfs-ci"
+          mkdir -p "$MOUNT_DIR"
+          sudo mount /root/firecracker-vm/rootfs.ext4 "$MOUNT_DIR"
+          if crane export --platform linux/amd64 ghcr.io/jverre/flint/base:latest - 2>/dev/null | sudo tar -x -C "$MOUNT_DIR"; then
+            echo "Rootfs pulled from ghcr.io"
+          else
+            echo "ghcr.io pull failed, falling back to setup-rootfs.sh"
+            sudo umount "$MOUNT_DIR"
+            rm -f /root/firecracker-vm/rootfs.ext4
+            curl -fsSL -o /tmp/alpine.tar.gz \
+              https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
+            sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
+            sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+            exit 0
+          fi
+          sudo umount "$MOUNT_DIR"
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
       - name: Run tests

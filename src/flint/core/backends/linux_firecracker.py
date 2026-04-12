@@ -27,10 +27,12 @@ from flint.core._template_registry import (
 from flint.core.config import (
     AGENT_PORT,
     DATA_DIR,
+    DEFAULT_BASE_IMAGE,
     DEFAULT_TEMPLATE_ID,
     GOLDEN_DIR,
     GOLDEN_TAP,
     GUEST_IP,
+    SOURCE_ROOTFS,
     TEMPLATES_DIR,
     log,
 )
@@ -46,15 +48,60 @@ class LinuxFirecrackerBackend(HostBackend):
         _ensure_bridge()
 
     def ensure_default_template(self) -> None:
-        if not golden_snapshot_exists():
-            shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
+        if golden_snapshot_exists():
+            register_template_artifact(
+                DEFAULT_TEMPLATE_ID,
+                "Default (Alpine)",
+                self.kind,
+                GOLDEN_DIR,
+                status="ready",
+            )
+            return
+
+        shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
+
+        # Try pulling the base image from ghcr.io via crane
+        try:
+            from flint.core._oci_pull import pull_and_extract
+            rootfs_path = os.path.join(GOLDEN_DIR, "rootfs.ext4")
+            os.makedirs(GOLDEN_DIR, exist_ok=True)
+            log.info("Pulling default base image from %s ...", DEFAULT_BASE_IMAGE)
+            digest = pull_and_extract(
+                DEFAULT_BASE_IMAGE,
+                rootfs_path,
+                size_mb=200,
+                inject_flint=False,  # ghcr.io base image already has flintd
+            )
+            create_golden_snapshot(source_rootfs=rootfs_path, snapshot_dir=GOLDEN_DIR)
+            register_template_artifact(
+                DEFAULT_TEMPLATE_ID,
+                "Default (Alpine)",
+                self.kind,
+                GOLDEN_DIR,
+                status="ready",
+                image_ref=DEFAULT_BASE_IMAGE,
+                image_digest=digest,
+            )
+            return
+        except Exception as exc:
+            log.warning("OCI pull failed, falling back to local rootfs: %s", exc)
+
+        # Fallback: use local SOURCE_ROOTFS if available
+        if os.path.exists(SOURCE_ROOTFS):
             create_golden_snapshot()
-        register_template_artifact(
-            DEFAULT_TEMPLATE_ID,
-            "Default (Alpine)",
-            self.kind,
-            GOLDEN_DIR,
-            status="ready",
+            register_template_artifact(
+                DEFAULT_TEMPLATE_ID,
+                "Default (Alpine)",
+                self.kind,
+                GOLDEN_DIR,
+                status="ready",
+            )
+            return
+
+        raise RuntimeError(
+            f"Cannot create default template: crane pull from {DEFAULT_BASE_IMAGE} failed "
+            f"and local rootfs not found at {SOURCE_ROOTFS}. "
+            "Install crane (bash scripts/install-crane.sh) or run setup-rootfs.sh."
         )
 
     def start_pool(self) -> None:
@@ -415,8 +462,10 @@ class LinuxFirecrackerBackend(HostBackend):
         )
         return "alive", entry
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        template_id = _build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+    def build_template(
+        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+    ) -> dict:
+        template_id = _build_template(name, image_ref, rootfs_size_mb=rootfs_size_mb, inject_flint=inject_flint)
         return {"template_id": template_id, "status": "building"}
 
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:

@@ -415,20 +415,23 @@ _build_threads: dict[str, threading.Thread] = {}
 @app.post("/templates/build")
 def build_template_endpoint(body: dict):
     name = body.get("name")
-    dockerfile = body.get("dockerfile")
+    image_ref = body.get("image_ref")
     rootfs_size_mb = body.get("rootfs_size_mb", 500)
-    if not name or not dockerfile:
-        raise HTTPException(status_code=400, detail="name and dockerfile are required")
+    inject_flint = body.get("inject_flint", True)
+    if not name or not image_ref:
+        raise HTTPException(status_code=400, detail="name and image_ref are required")
 
     from flint.core._template_build import _slugify
     template_id = _slugify(name)
-    print(f"POST /templates/build — building {template_id}...")
+    print(f"POST /templates/build — building {template_id} from {image_ref}...")
 
     daemon = _get_daemon()
 
     def _run_build():
         try:
-            daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+            daemon.backend.build_template(
+                name, image_ref, rootfs_size_mb=rootfs_size_mb, inject_flint=inject_flint,
+            )
             print(f"Template {template_id} built successfully")
         except Exception as e:
             print(f"Template {template_id} build failed: {e}")

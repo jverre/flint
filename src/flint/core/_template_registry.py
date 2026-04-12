@@ -88,6 +88,8 @@ def register_template_artifact(
     *,
     status: str = "ready",
     rootfs_size_mb: int | None = None,
+    image_ref: str | None = None,
+    image_digest: str | None = None,
 ) -> None:
     registry = _load_registry()
     existing = _normalize_entry(registry.get(template_id, {"name": name, "created_at": time.time()}))
@@ -95,11 +97,17 @@ def register_template_artifact(
     existing["status"] = status
     existing["template_dir"] = template_dir if backend_kind == "linux-firecracker" else existing.get("template_dir", template_dir)
     existing["rootfs_size_mb"] = rootfs_size_mb if rootfs_size_mb is not None else existing.get("rootfs_size_mb")
+    if image_ref is not None:
+        existing["image_ref"] = image_ref
+    if image_digest is not None:
+        existing["image_digest"] = image_digest
     artifacts = dict(existing.get("artifacts") or {})
     artifacts[backend_kind] = {
         "template_dir": template_dir,
         "status": status,
         "rootfs_size_mb": rootfs_size_mb,
+        "image_ref": image_ref,
+        "image_digest": image_digest,
     }
     existing["artifacts"] = artifacts
     registry[template_id] = existing
@@ -186,6 +194,19 @@ def template_snapshot_exists(template_id: str, backend_kind: str = "linux-firecr
     except KeyError:
         return False
     return all(os.path.exists(f"{tdir}/{f}") for f in ("rootfs.ext4", "vmstate", "mem"))
+
+
+def find_template_by_digest(digest: str, backend_kind: str = "linux-firecracker") -> str | None:
+    """Find an existing template whose OCI image digest matches. Returns template_id or None."""
+    registry = _load_registry()
+    for tid, entry in registry.items():
+        entry = _normalize_entry(entry)
+        if entry.get("image_digest") == digest:
+            artifacts = entry.get("artifacts") or {}
+            artifact = artifacts.get(backend_kind) or {}
+            if artifact.get("status") == "ready":
+                return tid
+    return None
 
 
 def registered_template_ids() -> list[str]:
