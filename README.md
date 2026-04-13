@@ -163,22 +163,44 @@ print(sandbox.timings)
 
 ## 📦 Templates
 
-Build custom VM templates by pulling OCI images directly from any registry.
-Images are fetched with [crane](https://github.com/google/go-containerregistry)
-— no Docker daemon required.
+Build custom VM templates two ways: pull a pre-built OCI image from any
+registry (no builder needed), or declaratively layer packages and commands
+on top of a base image (uses a local builder).
+
+### 1. Pre-built OCI image — no builder required
+
+Images are fetched with [crane](https://github.com/google/go-containerregistry).
+No Docker daemon on the host.
 
 ```python
 from flint import Template, Sandbox
 
 template = (
-    Template("python-data-science")
-    .from_oci_image("python:3.12-slim")
+    Template("my-env")
+    .from_oci_image("python:3.11-slim")
     .build()
 )
 
-# Create a sandbox from the template
 sandbox = Sandbox(template_id=template.template_id)
 ```
+
+### 2. Fluent builds — requires docker/podman/buildah
+
+```python
+template = (
+    Template("python-data-science")
+    .from_python_image("3.11-slim")
+    .apt_install("git", "curl")
+    .pip_install("numpy", "pandas")
+    .set_workdir("/workspace")
+    .build()
+)
+```
+
+Flint detects `docker`, `podman`, or `buildah` (in that order) and uses
+whichever is available to build the layered image, then exports the flat
+rootfs and snapshots it. If none are installed, `.build()` raises a clear
+error — pre-built images via `from_oci_image()` still work fine.
 
 **Base image methods:**
 
@@ -189,16 +211,29 @@ sandbox = Sandbox(template_id=template.template_id)
 | `.from_python_image(tag)` | `python:<tag>` |
 | `.from_node_image(tag)` | `node:<tag>` |
 | `.from_alpine_image(tag)` | `alpine:<tag>` |
+| `.from_dockerfile(dockerfile)` | Full Dockerfile string (requires local builder) |
 
-Pass `inject_flint=False` for pre-built Flint images (e.g.,
-`ghcr.io/jverre/flint/base:latest`) that already contain `flintd` and
-`init-net.sh`.
+**Operation methods** (require a local builder):
 
-Call `.build()` to build the template via the daemon. It pulls the image,
-extracts the flattened filesystem into an ext4 rootfs, injects `flintd`
-(if requested), snapshots the boot state, and caches everything for the
-next build. Blocks until the template is ready and returns a `TemplateInfo`
-with `template_id`, `name`, and `status`.
+| Method | Description |
+|--------|-------------|
+| `.apt_install(*packages)` | Install apt packages |
+| `.apk_install(*packages)` | Install Alpine packages |
+| `.pip_install(*packages)` | Install pip packages |
+| `.npm_install(*packages)` | Install npm packages (global) |
+| `.run_cmd(cmd)` | Run an arbitrary shell command |
+| `.set_workdir(path)` | Set the working directory |
+| `.set_envs(**envs)` | Set environment variables |
+| `.git_clone(repo, dest)` | Clone a git repository |
+
+Pass `inject_flint=False` on `from_oci_image()` for pre-built Flint images
+(e.g., `ghcr.io/jverre/flint/base:latest`) that already contain `flintd`
+and `init-net.sh`.
+
+`.build()` blocks until the template is ready and returns a `TemplateInfo`
+with `template_id`, `name`, and `status`. Results are cached by image
+digest (registry pulls) or Dockerfile content hash (fluent builds), so
+identical builds are near-instant on the second call.
 
 ## 💻 TUI
 
@@ -282,7 +317,7 @@ The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/templates/build` | Build a template from an OCI image reference |
+| `POST` | `/templates/build` | Build a template from an OCI image ref or Dockerfile |
 | `GET` | `/templates` | List all templates |
 | `GET` | `/templates/{template_id}` | Get template details |
 | `DELETE` | `/templates/{template_id}` | Delete a template |

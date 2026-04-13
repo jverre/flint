@@ -36,15 +36,22 @@ By default the pool keeps 8 images ready (`POOL_TARGET_SIZE = 8`) with 4 backgro
 
 Custom templates work the same way. When you call `Template.build()`, Flint:
 
-1. Pulls the OCI image you specified via crane (no Docker daemon)
-2. Flattens the image layers into an ext4 rootfs
+1. Obtains a flat rootfs tarball:
+   - For `from_oci_image()` / base-image shorthands with no fluent ops:
+     `crane` pulls the image from the registry (no Docker daemon).
+   - For fluent builds (`apt_install`, `pip_install`, ...) or
+     `from_dockerfile()`: Flint generates a Dockerfile, builds it with
+     the first available local builder (`podman`, `buildah`, or
+     `docker`), then `<builder> export` emits a flat rootfs tarball.
+2. Flattens that tarball into an ext4 rootfs
 3. Injects `flintd` and `init-net.sh` into the rootfs (unless disabled)
 4. Boots a VM with that rootfs
 5. Waits for `flintd` to be healthy
 6. Takes a snapshot - this becomes the template's golden snapshot
 
-Image pulls are cached at `{FLINT_DATA_DIR}/.oci-cache` keyed by digest,
-so rebuilding the same image is near instant.
+Results are cached at `{FLINT_DATA_DIR}/.oci-cache`, keyed by image digest
+(registry pulls) or a SHA-256 hash of the Dockerfile (local builds), so
+rebuilding the same template is near instant.
 
 After that, `Sandbox(template_id=...)` is just as fast as the default template.
 

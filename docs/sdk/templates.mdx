@@ -3,55 +3,69 @@ title: "Templates"
 description: "Build custom sandbox environments from OCI images."
 ---
 
-By default, sandboxes use a minimal Alpine Linux rootfs pulled from
-`ghcr.io/jverre/flint/base:latest`. If you need Python packages, system
-libraries, or a specific runtime pre-installed, you can build a custom
-template from any OCI image.
+Sandboxes use a minimal Alpine Linux rootfs by default
+(`ghcr.io/jverre/flint/base:latest`). If you need Python packages, system
+libraries, or a specific runtime pre-installed, build a custom template.
 
-Templates work by pulling an OCI image directly from a registry (using
-[crane](https://github.com/google/go-containerregistry) — no Docker daemon),
-extracting the flattened filesystem into an ext4 image, injecting the Flint
-guest agent, and creating a golden snapshot from it. Once built, you can
-create sandboxes from your template just like the default one — with the
-same fast startup time.
+Flint supports two build modes:
+
+1. **Pull a pre-built OCI image** — no Docker daemon required on the host.
+   Flint uses [crane](https://github.com/google/go-containerregistry) to
+   fetch the image directly from the registry.
+2. **Declarative fluent builds** (`apt_install`, `pip_install`, ...) —
+   requires a local image builder (`docker`, `podman`, or `buildah`).
+   Flint generates a Dockerfile, builds the image locally, exports the
+   flattened filesystem, and snapshots it.
 
 ## Building a template
 
 <Tabs>
-  <Tab title="Python SDK">
+  <Tab title="Pre-built image (no builder)">
+    ```python
+    from flint import Template, Sandbox
+
+    template = (Template("my-env")
+        .from_oci_image("python:3.11-slim")
+        .build())
+
+    sandbox = Sandbox(template_id=template.template_id)
+    ```
+  </Tab>
+  <Tab title="Fluent build (local builder)">
     ```python
     from flint import Template, Sandbox
 
     template = (Template("my-python-env")
-        .from_oci_image("python:3.11-slim")
+        .from_python_image("3.11-slim")
+        .pip_install("numpy", "pandas", "scikit-learn")
         .build())
 
     sandbox = Sandbox(template_id=template.template_id)
     result = sandbox.run_code("import numpy; print(numpy.__version__)")
     ```
 
-    The `Template` class uses a fluent builder - each method returns `self` so you can chain calls.
-
-    **Constructor**
-
-    <ParamField path="name" type="str" required>
-      Human-readable name for this template.
-    </ParamField>
-
-    <ParamField path="rootfs_size_mb" type="int" default="500">
-      Size of the rootfs image in MB. Increase this if your base image is large.
-    </ParamField>
+    Flint picks up the first available builder (`podman`, `buildah`, or
+    `docker`) and uses it to build the Dockerfile. If none is installed,
+    `.build()` fails with a clear error.
   </Tab>
   <Tab title="REST API">
     `POST /templates/build`
 
+    Pass exactly one of `image_ref` (pull from registry) or `dockerfile`
+    (build locally).
+
     ```bash
+    # Pull a pre-built image — no builder needed
+    curl -X POST http://localhost:9100/templates/build \
+      -H "Content-Type: application/json" \
+      -d '{"name": "my-env", "image_ref": "python:3.11-slim"}'
+
+    # Build a Dockerfile locally — requires docker/podman/buildah
     curl -X POST http://localhost:9100/templates/build \
       -H "Content-Type: application/json" \
       -d '{
         "name": "my-python-env",
-        "image_ref": "python:3.11-slim",
-        "rootfs_size_mb": 500
+        "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas"
       }'
     ```
 
@@ -59,8 +73,13 @@ same fast startup time.
       Human-readable name.
     </ParamField>
 
-    <ParamField body="image_ref" type="string" required>
-      OCI image reference (e.g. `python:3.11-slim`, `ghcr.io/org/img:tag`).
+    <ParamField body="image_ref" type="string">
+      OCI image reference. Mutually exclusive with `dockerfile`.
+    </ParamField>
+
+    <ParamField body="dockerfile" type="string">
+      Full Dockerfile contents. Mutually exclusive with `image_ref`.
+      Fails with HTTP 400 if no builder is available.
     </ParamField>
 
     <ParamField body="rootfs_size_mb" type="int" default="500">
@@ -72,7 +91,7 @@ same fast startup time.
       `/etc/init-net.sh` (e.g. pre-built Flint base images).
     </ParamField>
 
-    **Response** `200` - returns immediately, build happens in background
+    **Response** `200` — returns immediately, build runs in the background:
 
     ```json
     {"template_id": "tpl_abc123", "status": "building"}
@@ -94,19 +113,35 @@ Pick one:
 .from_python_image("3.11-slim")                     # shorthand for python:3.11-slim
 .from_node_image("20-slim")                         # shorthand for node:20-slim
 .from_alpine_image("3.19")                          # shorthand for alpine:3.19
+.from_dockerfile("FROM ubuntu:22.04\nRUN apt ...")  # full Dockerfile string
 ```
 
-To customise a base image (install packages, add files, set env vars),
-build your own OCI image and push it to any registry — then reference it
-with `.from_oci_image(...)`. You can use GitHub Actions, Buildkit, Kaniko,
-or any OCI image builder; Flint only needs the final image to be pullable.
+## Operation methods
+
+These append RUN/ENV/WORKDIR layers on top of the base image. **They all
+require a local builder on the host** (docker, podman, or buildah):
+
+```python
+.apt_install("git", "curl", "build-essential")
+.apk_install("git", "curl")            # Alpine
+.pip_install("numpy", "pandas")
+.npm_install("typescript", "ts-node")
+.run_cmd("curl -fsSL https://example.com/install.sh | sh")
+.set_workdir("/app")
+.set_envs(NODE_ENV="production", DEBUG="false")
+.git_clone("https://github.com/example/repo", "/app/repo")
+```
+
+If you don't have a builder installed, stick to `from_oci_image()` with
+an image that already contains what you need — or build and push your own
+image via CI (GitHub Actions, Buildkit, Kaniko, etc.) and reference it.
 
 ## TemplateInfo
 
 `build()` blocks until the template is ready and returns a `TemplateInfo`:
 
 ```python
-info.template_id  # "tpl_abc123" - use with Sandbox(template_id=...)
+info.template_id  # "tpl_abc123" — use with Sandbox(template_id=...)
 info.name         # "my-python-env"
 info.status       # "ready"
 ```
@@ -148,13 +183,18 @@ info.status       # "ready"
 
 ## Caching
 
-Pulls are cached locally by image digest under `{FLINT_DATA_DIR}/.oci-cache`.
-Building the same `image_ref` twice hits the cache on the second call and
-skips the network fetch. The cache is LRU-evicted once it exceeds 20 entries.
+Builds are cached under `{FLINT_DATA_DIR}/.oci-cache`, keyed by:
 
-## A note on build time
+- **Registry pulls** — the resolved image digest.
+- **Fluent / Dockerfile builds** — a SHA-256 hash of the generated
+  Dockerfile plus base image.
 
-First build of a template pulls the image and creates a golden snapshot
-— usually 10-30 seconds depending on image size. Cached rebuilds are near
+Identical rebuilds hit the cache and skip both the pull and the build.
+Cache is LRU-evicted once it exceeds 20 entries.
+
+## Build time
+
+First build of a template pulls/builds the image and creates a golden
+snapshot (10-60 seconds depending on size). Cached rebuilds are near
 instant. Once built, `Sandbox(template_id=...)` is just as fast as the
 default template.

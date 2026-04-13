@@ -11,24 +11,38 @@ Starts a template build in the background and returns immediately. Poll `GET /te
 
 **Request body**
 
+Pass exactly one of `image_ref` (pull from registry — no host builder
+needed) or `dockerfile` (build locally — requires docker/podman/buildah).
+
 ```json
+// Pull a pre-built image
 {
   "name": "my-python-env",
   "image_ref": "python:3.11-slim",
   "rootfs_size_mb": 500,
   "inject_flint": true
 }
+
+// Build a Dockerfile locally
+{
+  "name": "my-python-env",
+  "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
+  "rootfs_size_mb": 500
+}
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | required | Human-readable name |
-| `image_ref` | string | required | OCI image reference (e.g. `python:3.11-slim`, `ghcr.io/org/img:tag`) |
+| `image_ref` | string | — | OCI image reference. Mutually exclusive with `dockerfile`. |
+| `dockerfile` | string | — | Full Dockerfile contents. Mutually exclusive with `image_ref`. Returns `400` if no builder is installed. |
 | `rootfs_size_mb` | int | `500` | Rootfs image size in MB |
 | `inject_flint` | bool | `true` | Copy `flintd` and `init-net.sh` into the rootfs. Set to `false` for pre-built Flint images. |
 
-Images are pulled directly from the registry using
-[crane](https://github.com/google/go-containerregistry) (no Docker daemon).
+Images referenced via `image_ref` are pulled with
+[crane](https://github.com/google/go-containerregistry) (no Docker
+daemon). Builds from `dockerfile` use whichever builder is available on
+the host (`podman`, `buildah`, or `docker`).
 
 **Response** `200`
 

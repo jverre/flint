@@ -194,18 +194,26 @@ class DaemonClient:
     # ── Template methods ───────────────────────────────────────────────────
 
     def build_template(
-        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+        self,
+        name: str,
+        *,
+        image_ref: str | None = None,
+        dockerfile: str | None = None,
+        rootfs_size_mb: int = 500,
+        inject_flint: bool = True,
     ) -> dict:
-        resp = self._http.post(
-            "/templates/build",
-            json={
-                "name": name,
-                "image_ref": image_ref,
-                "rootfs_size_mb": rootfs_size_mb,
-                "inject_flint": inject_flint,
-            },
-            timeout=600.0,
-        )
+        if (image_ref is None) == (dockerfile is None):
+            raise ValueError("Pass exactly one of image_ref or dockerfile")
+        payload: dict = {
+            "name": name,
+            "rootfs_size_mb": rootfs_size_mb,
+            "inject_flint": inject_flint,
+        }
+        if image_ref is not None:
+            payload["image_ref"] = image_ref
+        else:
+            payload["dockerfile"] = dockerfile
+        resp = self._http.post("/templates/build", json=payload, timeout=600.0)
         resp.raise_for_status()
         return resp.json()
 

@@ -35,6 +35,51 @@ def resolve_digest(image_ref: str) -> str:
     return result.stdout.strip()
 
 
+def _make_ext4(rootfs_path: str, size_mb: int) -> None:
+    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
+    subprocess.run(["mkfs.ext4", "-F", rootfs_path], check=True, capture_output=True)
+
+
+def _with_mounted_rootfs(rootfs_path: str):
+    """Context helper: mount rootfs and yield the mount point."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        mount_dir = f"/tmp/flint-oci-mount-{os.getpid()}"
+        os.makedirs(mount_dir, exist_ok=True)
+        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
+        try:
+            yield mount_dir
+        finally:
+            subprocess.run(["umount", mount_dir], capture_output=True)
+            shutil.rmtree(mount_dir, ignore_errors=True)
+
+    return _cm()
+
+
+def extract_tar_to_rootfs(
+    tar_path: str,
+    rootfs_path: str,
+    *,
+    size_mb: int = 500,
+    inject_flint: bool = True,
+) -> None:
+    """Create an ext4 rootfs and extract a flat filesystem tarball into it.
+
+    Used by the local-build path (docker/podman/buildah → docker export).
+    """
+    _make_ext4(rootfs_path, size_mb)
+    with _with_mounted_rootfs(rootfs_path) as mount_dir:
+        subprocess.run(
+            ["tar", "-xf", tar_path, "-C", mount_dir],
+            check=True,
+        )
+        if inject_flint:
+            _inject_flint_into_rootfs(mount_dir)
+    log.info("Rootfs extracted to %s (%d MB)", rootfs_path, size_mb)
+
+
 def pull_and_extract(
     image_ref: str,
     rootfs_path: str,
@@ -59,16 +104,8 @@ def pull_and_extract(
     digest = resolve_digest(image_ref)
     log.info("Pulling %s (digest=%s)", image_ref, digest[:20])
 
-    # Create empty ext4 image
-    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
-    subprocess.run(["mkfs.ext4", "-F", rootfs_path], check=True, capture_output=True)
-
-    # Mount, export image layers, extract
-    mount_dir = f"/tmp/flint-oci-mount-{os.getpid()}"
-    os.makedirs(mount_dir, exist_ok=True)
-    try:
-        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
-
+    _make_ext4(rootfs_path, size_mb)
+    with _with_mounted_rootfs(rootfs_path) as mount_dir:
         # crane export flattens all layers into a single tar stream
         crane_proc = subprocess.Popen(
             [crane, "export", "--platform", platform, image_ref, "-"],
@@ -85,10 +122,6 @@ def pull_and_extract(
 
         if inject_flint:
             _inject_flint_into_rootfs(mount_dir)
-
-    finally:
-        subprocess.run(["umount", mount_dir], capture_output=True)
-        shutil.rmtree(mount_dir, ignore_errors=True)
 
     log.info("Rootfs extracted to %s (%d MB)", rootfs_path, size_mb)
     return digest

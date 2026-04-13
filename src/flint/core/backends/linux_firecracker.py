@@ -439,9 +439,21 @@ class LinuxFirecrackerBackend(HostBackend):
         return "alive", entry
 
     def build_template(
-        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+        self,
+        name: str,
+        *,
+        image_ref: str | None = None,
+        dockerfile: str | None = None,
+        rootfs_size_mb: int = 500,
+        inject_flint: bool = True,
     ) -> dict:
-        template_id = _build_template(name, image_ref, rootfs_size_mb=rootfs_size_mb, inject_flint=inject_flint)
+        template_id = _build_template(
+            name,
+            image_ref=image_ref,
+            dockerfile=dockerfile,
+            rootfs_size_mb=rootfs_size_mb,
+            inject_flint=inject_flint,
+        )
         return {"template_id": template_id, "status": "building"}
 
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:

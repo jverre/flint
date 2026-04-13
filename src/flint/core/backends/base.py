@@ -92,7 +92,13 @@ class HostBackend(ABC):
 
     @abstractmethod
     def build_template(
-        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+        self,
+        name: str,
+        *,
+        image_ref: str | None = None,
+        dockerfile: str | None = None,
+        rootfs_size_mb: int = 500,
+        inject_flint: bool = True,
     ) -> dict:
         pass
 

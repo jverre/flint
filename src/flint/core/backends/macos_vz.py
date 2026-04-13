@@ -427,7 +427,13 @@ class MacOSVirtualizationBackend(HostBackend):
         return "dead", None
 
     def build_template(
-        self, name: str, image_ref: str, rootfs_size_mb: int = 500, inject_flint: bool = True,
+        self,
+        name: str,
+        *,
+        image_ref: str | None = None,
+        dockerfile: str | None = None,
+        rootfs_size_mb: int = 500,
+        inject_flint: bool = True,
     ) -> dict:
         template_id = name.lower().replace(" ", "-")
         template_dir = os.path.join(TEMPLATES_DIR, template_id, self.kind)
@@ -439,7 +445,7 @@ class MacOSVirtualizationBackend(HostBackend):
             template_dir,
             status="failed",
             rootfs_size_mb=rootfs_size_mb,
-            image_ref=image_ref,
+            image_ref=image_ref or "dockerfile",
         )
         update_template_artifact_status(template_id, self.kind, "failed")
         raise NotImplementedError(

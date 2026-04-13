@@ -416,21 +416,46 @@ _build_threads: dict[str, threading.Thread] = {}
 def build_template_endpoint(body: dict):
     name = body.get("name")
     image_ref = body.get("image_ref")
+    dockerfile = body.get("dockerfile")
     rootfs_size_mb = body.get("rootfs_size_mb", 500)
     inject_flint = body.get("inject_flint", True)
-    if not name or not image_ref:
-        raise HTTPException(status_code=400, detail="name and image_ref are required")
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if (image_ref is None) == (dockerfile is None):
+        raise HTTPException(
+            status_code=400,
+            detail="pass exactly one of image_ref or dockerfile",
+        )
+
+    # Fail fast at request time if a Dockerfile build is requested but no
+    # builder is installed — gives the caller a clear error instead of a
+    # background failure.
+    if dockerfile is not None:
+        from flint.core._image_build import detect_builder
+        if detect_builder() is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Dockerfile builds require docker, podman, or buildah on the host. "
+                    "Install one of these, or use a pre-built image reference instead."
+                ),
+            )
 
     from flint.core._template_build import _slugify
     template_id = _slugify(name)
-    print(f"POST /templates/build — building {template_id} from {image_ref}...")
+    source = image_ref or f"Dockerfile ({len(dockerfile)} bytes)"
+    print(f"POST /templates/build — building {template_id} from {source}...")
 
     daemon = _get_daemon()
 
     def _run_build():
         try:
             daemon.backend.build_template(
-                name, image_ref, rootfs_size_mb=rootfs_size_mb, inject_flint=inject_flint,
+                name,
+                image_ref=image_ref,
+                dockerfile=dockerfile,
+                rootfs_size_mb=rootfs_size_mb,
+                inject_flint=inject_flint,
             )
             print(f"Template {template_id} built successfully")
         except Exception as e:
