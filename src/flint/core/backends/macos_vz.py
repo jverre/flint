@@ -32,7 +32,14 @@ from flint.core.config import (
 )
 from flint.core.types import SandboxState
 
-from .base import BackendBootResult, HostBackend
+from .base import ALIVE, DEAD, PAUSED, Backend, BackendBootResult
+from .capabilities import (
+    ExecRequest,
+    ExecResult,
+    FileInfo,
+    ProcessHandle,
+    ProcessSpec,
+)
 
 
 @dataclass
@@ -50,6 +57,9 @@ class _MacVMHandle:
     boot_config_path: str = ""
     state_path: str = ""
     process_id: int = field(default_factory=os.getpid)
+    # The VZVirtualMachineConfiguration used to boot this VM. Needed for
+    # save/restore validation since VZVirtualMachine doesn't expose it back.
+    config: Any = None
     # Keep references to ObjC objects so PyObjC doesn't GC them (closing pipe fds).
     _objc_refs: list[Any] = field(default_factory=list)
 
@@ -109,7 +119,13 @@ class _BackendThread:
         raise value
 
 
-class MacOSVirtualizationBackend(HostBackend):
+class MacOSVirtualizationBackend(Backend):
+    """Apple Virtualization.framework backend for Apple Silicon hosts.
+
+    Provides shell, files, PTY, pause/resume by proxying to the in-guest
+    flintd HTTP agent over the VZ NAT network.
+    """
+
     kind = "macos-vz-arm64"
 
     def __init__(self) -> None:
@@ -151,20 +167,14 @@ class MacOSVirtualizationBackend(HostBackend):
                 },
             )
 
-    def start_pool(self) -> None:
-        return None
-
-    def stop_pool(self) -> None:
-        return None
-
     def create(
         self,
         *,
         template_id: str,
-        allow_internet_access: bool,
-        use_pool: bool,
-        use_pyroute2: bool,
+        options=None,
     ) -> BackendBootResult:
+        # macOS VZ ignores all VM-flavor options today (no internet toggle, no pool).
+        _ = options
         if template_id != DEFAULT_TEMPLATE_ID:
             raise NotImplementedError("Custom macOS templates are not implemented yet.")
 
@@ -249,6 +259,8 @@ class MacOSVirtualizationBackend(HostBackend):
         if handle is None:
             raise RuntimeError("macOS VM handle not found")
 
+        # VZ requires the VM be paused (suspended) before its state can be saved.
+        self._runtime.call(lambda: self._suspend_vm(handle))
         self._runtime.call(lambda: self._save_vm_state(handle))
         self._runtime.call(lambda: self._stop_vm(handle))
         handle.close()
@@ -316,41 +328,116 @@ class MacOSVirtualizationBackend(HostBackend):
             },
         )
 
-    def proxy_guest_request(self, entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
-        url = f"{entry.agent_url}{path}"
-        req = urllib.request.Request(url, data=body, method=method)
-        if body is not None:
-            req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+    # ── SupportsShell ────────────────────────────────────────────────────
 
-    async def bridge_terminal(self, entry, websocket) -> None:
+    def exec(self, entry, request: ExecRequest) -> ExecResult:
+        body = json.dumps({
+            "cmd": request.cmd,
+            "env": request.env or {},
+            "cwd": request.cwd or "",
+            "timeout": int(request.timeout),
+        }).encode()
+        status, resp = self._proxy(entry, "POST", "/exec", body, timeout=request.timeout + 5)
+        return _decode_exec_result(status, resp)
+
+    # ── SupportsFiles ────────────────────────────────────────────────────
+
+    def read_file(self, entry, path: str) -> bytes:
+        status, resp = self._proxy(entry, "GET", f"/files?path={_q(path)}")
+        if status != 200:
+            raise _agent_error("read_file", status, resp)
+        return resp
+
+    def write_file(self, entry, path: str, data: bytes, mode: str = "0644") -> None:
+        status, resp = self._proxy(entry, "POST", f"/files?path={_q(path)}&mode={mode}", data)
+        if status not in (200, 201):
+            raise _agent_error("write_file", status, resp)
+
+    def stat_file(self, entry, path: str) -> FileInfo:
+        status, resp = self._proxy(entry, "GET", f"/files/stat?path={_q(path)}")
+        if status != 200:
+            raise _agent_error("stat_file", status, resp)
+        return _decode_file_info(json.loads(resp))
+
+    def list_files(self, entry, path: str) -> list[FileInfo]:
+        status, resp = self._proxy(entry, "GET", f"/files/list?path={_q(path)}")
+        if status != 200:
+            raise _agent_error("list_files", status, resp)
+        payload = json.loads(resp)
+        items = payload.get("entries", []) if isinstance(payload, dict) else payload
+        return [_decode_file_info(e) for e in items]
+
+    def mkdir(self, entry, path: str, parents: bool = True) -> None:
+        status, resp = self._proxy(
+            entry, "POST",
+            f"/files/mkdir?path={_q(path)}&parents={'true' if parents else 'false'}",
+        )
+        if status not in (200, 201):
+            raise _agent_error("mkdir", status, resp)
+
+    def delete_file(self, entry, path: str, recursive: bool = False) -> None:
+        status, resp = self._proxy(
+            entry, "DELETE",
+            f"/files?path={_q(path)}&recursive={'true' if recursive else 'false'}",
+        )
+        if status not in (200, 204):
+            raise _agent_error("delete_file", status, resp)
+
+    # ── SupportsPty ──────────────────────────────────────────────────────
+
+    def create_process(self, entry, spec: ProcessSpec) -> ProcessHandle:
+        body = json.dumps({
+            "cmd": spec.cmd,
+            "pty": spec.pty,
+            "cols": spec.cols,
+            "rows": spec.rows,
+            "env": spec.env or {},
+            "cwd": spec.cwd or "",
+        }).encode()
+        status, resp = self._proxy(entry, "POST", "/processes", body)
+        if status != 201:
+            raise _agent_error("create_process", status, resp)
+        return ProcessHandle(pid=int(json.loads(resp)["pid"]))
+
+    def list_processes(self, entry) -> list[dict]:
+        status, resp = self._proxy(entry, "GET", "/processes")
+        if status != 200:
+            raise _agent_error("list_processes", status, resp)
+        payload = json.loads(resp)
+        return payload.get("processes", payload) if isinstance(payload, dict) else payload
+
+    def send_process_input(self, entry, pid: int, data: bytes) -> None:
+        status, resp = self._proxy(entry, "POST", f"/processes/{pid}/input", data, timeout=5)
+        if status not in (200, 204):
+            raise _agent_error("send_process_input", status, resp)
+
+    def signal_process(self, entry, pid: int, signal: int) -> None:
+        body = json.dumps({"signal": signal}).encode()
+        status, resp = self._proxy(entry, "POST", f"/processes/{pid}/signal", body, timeout=5)
+        if status not in (200, 204):
+            raise _agent_error("signal_process", status, resp)
+
+    def resize_process(self, entry, pid: int, cols: int, rows: int) -> None:
+        body = json.dumps({"cols": cols, "rows": rows}).encode()
+        status, resp = self._proxy(entry, "POST", f"/processes/{pid}/resize", body, timeout=5)
+        if status not in (200, 204):
+            raise _agent_error("resize_process", status, resp)
+
+    async def attach_terminal(self, entry, websocket) -> None:
         await websocket.accept()
 
-        create_body = json.dumps({
-            "cmd": ["/bin/sh", "-i"],
-            "pty": True,
-            "cols": 120,
-            "rows": 40,
-        }).encode()
-        status, resp_body = await asyncio.get_event_loop().run_in_executor(
-            None,
-            self.proxy_guest_request,
-            entry,
-            "POST",
-            "/processes",
-            create_body,
-            65,
-        )
-        if status != 201:
+        try:
+            handle = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self.create_process,
+                entry,
+                ProcessSpec(cmd=["/bin/sh", "-i"], pty=True, cols=120, rows=40),
+            )
+        except Exception:
             await websocket.close(code=1011, reason="Failed to create PTY process")
             return
 
-        proc_info = json.loads(resp_body)
-        guest_pid = proc_info["pid"]
+        guest_pid = handle.pid
         loop = asyncio.get_event_loop()
         closed = False
 
@@ -381,33 +468,30 @@ class MacOSVirtualizationBackend(HostBackend):
         try:
             while True:
                 data = await websocket.receive_bytes()
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/input",
-                    data,
-                    5,
-                )
+                await loop.run_in_executor(None, self.send_process_input, entry, guest_pid, data)
         except Exception:
             pass
         finally:
             closed = True
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/signal",
-                    json.dumps({"signal": 9}).encode(),
-                    2,
-                )
+                await loop.run_in_executor(None, self.signal_process, entry, guest_pid, 9)
             except Exception:
                 pass
 
-    def check_entry_alive(self, entry) -> tuple[bool, str | None]:
+    # ── Internal: HTTP transport ────────────────────────────────────────
+
+    def _proxy(self, entry, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
+        url = f"{entry.agent_url}{path}"
+        req = urllib.request.Request(url, data=body, method=method)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def health(self, entry) -> tuple[bool, str | None]:
         handle = self._coerce_handle(entry)
         if handle is None:
             return False, "VM handle not found"
@@ -420,13 +504,14 @@ class MacOSVirtualizationBackend(HostBackend):
         except Exception as exc:
             return False, str(exc)
 
-    def recover_row(self, row: dict):
+    def recover(self, row: dict) -> tuple[str, None]:
         pause_state_ref = row.get("pause_state_ref")
         if pause_state_ref and os.path.exists(pause_state_ref):
-            return "paused", None
-        return "dead", None
+            return PAUSED, None
+        return DEAD, None
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+    def build_template(self, name: str, source, **kwargs) -> dict:
+        rootfs_size_mb = int(kwargs.get("rootfs_size_mb", 500))
         template_id = name.lower().replace(" ", "-")
         template_dir = os.path.join(TEMPLATES_DIR, template_id, self.kind)
         os.makedirs(template_dir, exist_ok=True)
@@ -465,7 +550,7 @@ class MacOSVirtualizationBackend(HostBackend):
         resume_state_path: str | None,
     ) -> _MacVMHandle:
         import Virtualization as VZ
-        from Foundation import NSFileHandle, NSURL
+        from Foundation import NSDate, NSFileHandle, NSRunLoop, NSURL
 
         config = VZ.VZVirtualMachineConfiguration.alloc().init()
 
@@ -533,6 +618,7 @@ class MacOSVirtualizationBackend(HostBackend):
             machine_id_path=machine_id_path,
             boot_config_path=os.path.join(runtime_dir, "boot.json"),
             state_path=state_path,
+            config=config,
             # Prevent PyObjC from GC'ing these (which closes the pipe fds).
             _objc_refs=[config, in_handle, out_handle, serial_attachment, attachment],
         )
@@ -576,7 +662,28 @@ class MacOSVirtualizationBackend(HostBackend):
             start_event.set()
 
         if resume_state_path:
-            vm.restoreMachineStateFromURL_completionHandler_(NSURL.fileURLWithPath_(resume_state_path), _start_completion)
+            # restore -> VM is left in paused state -> resume to actually run.
+            restore_event = threading.Event()
+            restore_errors: dict[str, Any] = {}
+
+            def _restore_done(error_obj=None) -> None:
+                if error_obj is not None:
+                    restore_errors["restore"] = error_obj
+                restore_event.set()
+
+            vm.restoreMachineStateFromURL_completionHandler_(
+                NSURL.fileURLWithPath_(resume_state_path), _restore_done
+            )
+            restore_deadline = time.monotonic() + VZ_READY_TIMEOUT
+            while not restore_event.is_set() and time.monotonic() < restore_deadline:
+                NSRunLoop.currentRunLoop().runUntilDate_(
+                    NSDate.dateWithTimeIntervalSinceNow_(0.1)
+                )
+            if not restore_event.is_set():
+                raise RuntimeError("Timed out restoring macOS VM state")
+            if restore_errors.get("restore") is not None:
+                raise RuntimeError(f"Failed to restore macOS VM state: {restore_errors['restore']}")
+            vm.resumeWithCompletionHandler_(_start_completion)
         else:
             vm.startWithCompletionHandler_(_start_completion)
 
@@ -646,6 +753,31 @@ class MacOSVirtualizationBackend(HostBackend):
         if errors.get("stop") is not None:
             raise RuntimeError(f"Failed to stop macOS VM: {errors['stop']}")
 
+    def _suspend_vm(self, handle: _MacVMHandle) -> None:
+        from Foundation import NSRunLoop, NSDate
+
+        event = threading.Event()
+        errors: dict[str, Any] = {}
+
+        def _done(error_obj=None) -> None:
+            if error_obj is not None:
+                errors["pause"] = error_obj
+            event.set()
+
+        vm = handle.vm
+        if hasattr(vm, "canPause") and not vm.canPause():
+            raise RuntimeError("macOS VM cannot be paused in its current state")
+        vm.pauseWithCompletionHandler_(_done)
+        deadline = time.monotonic() + 10
+        while not event.is_set() and time.monotonic() < deadline:
+            NSRunLoop.currentRunLoop().runUntilDate_(
+                NSDate.dateWithTimeIntervalSinceNow_(0.1)
+            )
+        if not event.is_set():
+            raise RuntimeError("Timed out pausing macOS VM")
+        if errors.get("pause") is not None:
+            raise RuntimeError(f"Failed to pause macOS VM: {errors['pause']}")
+
     def _save_vm_state(self, handle: _MacVMHandle) -> None:
         from Foundation import NSRunLoop, NSDate, NSURL
 
@@ -657,7 +789,9 @@ class MacOSVirtualizationBackend(HostBackend):
                 errors["save"] = error_obj
             event.set()
 
-        config = handle.vm.configuration() if callable(getattr(handle.vm, "configuration", None)) else handle.vm.configuration()
+        config = handle.config
+        if config is None:
+            raise RuntimeError("VM handle is missing its configuration; cannot validate save/restore support")
         valid, error = config.validateSaveRestoreSupportWithError_(None)
         if not valid:
             raise RuntimeError(f"macOS VM save/restore unsupported: {error}")
@@ -713,3 +847,45 @@ class MacOSVirtualizationBackend(HostBackend):
     @staticmethod
     def _default_assets_ready() -> bool:
         return os.path.exists(VZ_KERNEL_PATH) and os.path.exists(VZ_ROOTFS_PATH)
+
+
+# ── Module-private decoders ────────────────────────────────────────────────
+
+
+def _q(s: str) -> str:
+    import urllib.parse as _u
+    return _u.quote(s, safe="/")
+
+
+def _agent_error(op: str, status: int, body: bytes) -> RuntimeError:
+    try:
+        payload = json.loads(body) if body else {}
+        detail = payload.get("error") or payload.get("detail") or body.decode(errors="replace")
+    except Exception:
+        detail = body.decode(errors="replace")
+    return RuntimeError(f"{op} failed (status {status}): {detail}")
+
+
+def _decode_exec_result(status: int, body: bytes) -> ExecResult:
+    try:
+        payload = json.loads(body) if body else {}
+    except Exception:
+        payload = {}
+    if status >= 400 and "exit_code" not in payload:
+        return ExecResult(stdout="", stderr=body.decode(errors="replace"), exit_code=-1)
+    return ExecResult(
+        stdout=payload.get("stdout", ""),
+        stderr=payload.get("stderr", ""),
+        exit_code=int(payload.get("exit_code", -1)),
+    )
+
+
+def _decode_file_info(payload: dict) -> FileInfo:
+    return FileInfo(
+        name=payload.get("name", ""),
+        path=payload.get("path", ""),
+        size=int(payload.get("size", 0)),
+        is_dir=bool(payload.get("is_dir", False)),
+        mode=str(payload.get("mode", "")),
+        modified_at=float(payload.get("modified_at", 0.0)),
+    )

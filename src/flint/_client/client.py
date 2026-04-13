@@ -7,6 +7,23 @@ import httpx
 import websockets.sync.client as ws_sync
 
 from flint.core.config import DAEMON_URL
+from flint.errors import BackendCapabilityMissing
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Raise ``BackendCapabilityMissing`` on 409, otherwise normal HTTP error."""
+    if resp.status_code == 409:
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and payload.get("error") == "capability_missing":
+            raise BackendCapabilityMissing(
+                capability=payload.get("capability", "?"),
+                backend=payload.get("backend", "?"),
+                message=payload.get("detail"),
+            )
+    resp.raise_for_status()
 
 DEFAULT_URL = DAEMON_URL
 
@@ -61,33 +78,53 @@ class DaemonClient:
         self._terminals.clear()
         self._http.close()
 
-    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> dict:
-        body = None
+    def create(
+        self,
+        *,
+        backend: str | None = None,
+        template_id: str = "default",
+        options: dict | None = None,
+        network_policy: dict | None = None,
+        # legacy convenience flags (collapsed into options)
+        allow_internet_access: bool | None = None,
+        use_pool: bool | None = None,
+        use_pyroute2: bool | None = None,
+    ) -> dict:
+        opts = dict(options or {})
+        if allow_internet_access is not None:
+            opts.setdefault("allow_internet_access", allow_internet_access)
+        if use_pool is not None:
+            opts.setdefault("use_pool", use_pool)
+        if use_pyroute2 is not None:
+            opts.setdefault("use_pyroute2", use_pyroute2)
+
+        body: dict = {}
         if network_policy is not None:
-            body = {"network_policy": network_policy}
-        resp = self._http.post(
-            "/vms",
-            params={"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2},
-            json=body,
-        )
-        resp.raise_for_status()
+            body["network_policy"] = network_policy
+        if opts:
+            body["options"] = opts
+        if backend:
+            body["backend"] = backend
+
+        resp = self._http.post("/vms", params={"template_id": template_id}, json=body or None)
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def kill(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
         resp = self._http.delete(f"/vms/{vm_id}")
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def list(self) -> list[dict]:
         resp = self._http.get("/vms")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vms"]
 
     def get(self, vm_id: str) -> dict | None:
         resp = self._http.get(f"/vms/{vm_id}")
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def connect_terminal(self, vm_id: str, on_output: Callable[[bytes], None]) -> None:
@@ -120,7 +157,7 @@ class DaemonClient:
             json={"cmd": cmd, "timeout": int(timeout)},
             timeout=timeout + 10,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     def run_code(self, vm_id: str, code: str, runtime: str | None = None, timeout: float = 60) -> dict:
@@ -135,7 +172,7 @@ class DaemonClient:
     def read_file(self, vm_id: str, path: str) -> bytes:
         """Read a file from the VM."""
         resp = self._http.get(f"/vms/{vm_id}/files", params={"path": path})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.content
 
     def write_file(self, vm_id: str, path: str, content: bytes, mode: str = "0644") -> None:
@@ -145,12 +182,12 @@ class DaemonClient:
             params={"path": path, "mode": mode},
             content=content,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def list_files(self, vm_id: str, path: str) -> list[dict]:
         """List files in a directory on the VM."""
         resp = self._http.get(f"/vms/{vm_id}/files/list", params={"path": path})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["entries"]
 
     # ── Network policy ─────────────────────────────────────────────────
@@ -158,12 +195,12 @@ class DaemonClient:
     def update_network_policy(self, vm_id: str, policy: dict) -> None:
         """Update the network policy (credential injection rules) for a sandbox."""
         resp = self._http.put(f"/vms/{vm_id}/network-policy", json=policy)
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def get_network_policy(self, vm_id: str) -> dict | None:
         """Get the current network policy for a sandbox."""
         resp = self._http.get(f"/vms/{vm_id}/network-policy")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json().get("network_policy")
 
     # ── Sandbox lifecycle ────────────────────────────────────────────────
@@ -171,11 +208,11 @@ class DaemonClient:
     def pause(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
         resp = self._http.post(f"/vms/{vm_id}/pause")
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def resume(self, vm_id: str) -> dict:
         resp = self._http.post(f"/vms/{vm_id}/resume")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def set_timeout(self, vm_id: str, timeout_seconds: float, policy: str = "kill") -> None:
@@ -183,7 +220,7 @@ class DaemonClient:
             f"/vms/{vm_id}",
             json={"timeout_seconds": timeout_seconds, "timeout_policy": policy},
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     # ── Template methods ───────────────────────────────────────────────────
 
@@ -193,24 +230,59 @@ class DaemonClient:
             json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb},
             timeout=600.0,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     def list_templates(self) -> list[dict]:
         resp = self._http.get("/templates")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["templates"]
 
     def get_template(self, template_id: str) -> dict | None:
         resp = self._http.get(f"/templates/{template_id}")
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["template"]
 
     def delete_template(self, template_id: str) -> None:
         resp = self._http.delete(f"/templates/{template_id}")
-        resp.raise_for_status()
+        _raise_for_status(resp)
+
+    # ── JS / Worker capabilities ────────────────────────────────────────────
+
+    def eval_js(self, vm_id: str, code: str, timeout: float = 30) -> dict:
+        resp = self._http.post(
+            f"/vms/{vm_id}/eval",
+            json={"code": code, "timeout": timeout},
+            timeout=timeout + 10,
+        )
+        _raise_for_status(resp)
+        return resp.json()
+
+    def fetch(self, vm_id: str, *, method: str, url: str, headers: dict | None = None, body: bytes | None = None) -> dict:
+        payload = {"method": method, "url": url, "headers": headers or {}}
+        if body is not None:
+            import base64 as _b64
+            payload["body_b64"] = _b64.b64encode(body).decode()
+        resp = self._http.post(f"/vms/{vm_id}/fetch", json=payload)
+        _raise_for_status(resp)
+        return resp.json()
+
+    def kv_get(self, vm_id: str, key: str) -> bytes | None:
+        resp = self._http.get(f"/vms/{vm_id}/kv/{key}")
+        if resp.status_code == 404:
+            return None
+        _raise_for_status(resp)
+        return resp.content
+
+    def kv_put(self, vm_id: str, key: str, value: bytes) -> None:
+        resp = self._http.put(f"/vms/{vm_id}/kv/{key}", content=value)
+        _raise_for_status(resp)
+
+    def kv_delete(self, vm_id: str, key: str) -> None:
+        resp = self._http.delete(f"/vms/{vm_id}/kv/{key}")
+        _raise_for_status(resp)
 
     @staticmethod
     def is_daemon_running(base_url: str = DEFAULT_URL) -> bool:

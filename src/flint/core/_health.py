@@ -55,7 +55,10 @@ class HealthMonitor:
             if entry.state != SandboxState.RUNNING:
                 continue
 
-            alive, detail = self._manager._backend.check_entry_alive(entry)
+            try:
+                alive, detail = self._manager.backend_for_entry(entry).health(entry)
+            except Exception as exc:
+                alive, detail = False, str(exc)
 
             if alive:
                 if self._store:

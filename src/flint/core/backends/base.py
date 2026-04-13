@@ -1,12 +1,28 @@
+"""Backend lifecycle interface.
+
+Backends implement only lifecycle here. Operational capabilities (shell, files,
+PTY, JS eval, etc.) are declared by also implementing the relevant Protocols
+in :mod:`flint.core.backends.capabilities`.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
+
+from .capabilities import derive_capabilities
 
 
 @dataclass
 class BackendBootResult:
+    """Returned by :meth:`Backend.create` and :meth:`SupportsPause.resume`.
+
+    Backends populate the fields they care about; everything else stays at its
+    default. The manager copies these onto the ``_SandboxEntry`` and persists
+    them via ``StateStore``.
+    """
+
     process: Any = None
     pid: int = -1
     vm_dir: str = ""
@@ -24,77 +40,54 @@ class BackendBootResult:
     backend_metadata: dict[str, Any] = field(default_factory=dict)
 
 
-class HostBackend(ABC):
+# Recovery liveness states returned by ``Backend.recover``.
+ALIVE = "alive"
+PAUSED = "paused"
+DEAD = "dead"
+
+
+class Backend(ABC):
+    """Lifecycle contract every backend must satisfy.
+
+    See :mod:`flint.core.backends.capabilities` for opt-in operational
+    surface (shell, files, PTY, JS eval, ...).
+    """
+
     kind: str
 
     @abstractmethod
     def ensure_runtime_ready(self) -> None:
-        pass
+        """Validate or initialize host-side prerequisites (binaries, kernel modules, etc)."""
 
     @abstractmethod
     def ensure_default_template(self) -> None:
-        pass
-
-    @abstractmethod
-    def start_pool(self) -> None:
-        pass
-
-    @abstractmethod
-    def stop_pool(self) -> None:
-        pass
+        """Make sure the default template artifact for this backend exists on disk."""
 
     @abstractmethod
     def create(
         self,
         *,
         template_id: str,
-        allow_internet_access: bool,
-        use_pool: bool,
-        use_pyroute2: bool,
+        options: Mapping[str, Any] | None = None,
     ) -> BackendBootResult:
-        pass
+        """Boot a sandbox from a template. ``options`` is backend-specific."""
 
     @abstractmethod
-    def kill(self, entry) -> None:
-        pass
+    def kill(self, entry: Any) -> None:
+        """Terminate a sandbox and clean up its resources."""
 
     @abstractmethod
-    def pause(self, entry, state_store) -> None:
-        pass
+    def health(self, entry: Any) -> tuple[bool, str | None]:
+        """Return ``(alive, reason_or_None)`` for the running sandbox."""
 
     @abstractmethod
-    def resume(self, row: dict) -> BackendBootResult:
-        pass
+    def recover(self, row: dict) -> tuple[str, Any]:
+        """After daemon restart, decide what to do with a persisted row.
 
-    @abstractmethod
-    def proxy_guest_request(
-        self,
-        entry,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        timeout: float = 65,
-    ) -> tuple[int, bytes]:
-        pass
+        Returns ``(ALIVE, entry)``, ``(PAUSED, None)``, or ``(DEAD, None)``.
+        """
 
-    @abstractmethod
-    async def bridge_terminal(self, entry, websocket) -> None:
-        pass
-
-    @abstractmethod
-    def check_entry_alive(self, entry) -> tuple[bool, str | None]:
-        pass
-
-    @abstractmethod
-    def recover_row(self, row: dict):
-        """Return ('alive' | 'paused' | 'dead', entry_or_none)."""
-        pass
-
-    @abstractmethod
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        pass
-
-    @abstractmethod
-    def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
-        pass
-
+    # Capabilities are auto-derived from the protocols this instance satisfies.
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return derive_capabilities(self)

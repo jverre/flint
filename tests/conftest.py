@@ -83,7 +83,7 @@ def sandbox():
     health = resp.json()
     if not health.get("golden_snapshot_ready", False):
         pytest.skip(
-            f"Active backend {health.get('backend_kind', 'unknown')} is not ready for sandbox creation on this host."
+            f"Active backend {health.get('default_backend', 'unknown')} is not ready for sandbox creation on this host."
         )
     sb = Sandbox()
     yield sb
@@ -99,4 +99,4 @@ def backend_health(_ensure_daemon):
 
 @pytest.fixture(scope="session")
 def backend_kind(backend_health):
-    return backend_health["backend_kind"]
+    return backend_health["default_backend"]

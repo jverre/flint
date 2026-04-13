@@ -108,22 +108,37 @@ class Sandbox:
         self,
         vm_id: str | None = None,
         *,
+        backend: str | None = None,
         template_id: str = "default",
         allow_internet_access: bool = True,
         use_pool: bool = True,
         use_pyroute2: bool = True,
         network_policy: dict | None = None,
+        options: dict | None = None,
     ) -> None:
         client = _get_client()
         if vm_id is None:
-            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
+            opts = dict(options or {})
+            opts.setdefault("allow_internet_access", allow_internet_access)
+            opts.setdefault("use_pool", use_pool)
+            opts.setdefault("use_pyroute2", use_pyroute2)
+            vm = client.create(
+                backend=backend,
+                template_id=template_id,
+                options=opts,
+                network_policy=network_policy,
+            )
             self._id = vm["vm_id"]
             self._timings: dict[str, float] = vm.get("timings", {})
             self._ready_time_ms: float | None = vm.get("ready_time_ms")
+            self._capabilities: frozenset[str] = frozenset(vm.get("capabilities", []))
+            self._backend_kind: str = vm.get("backend_kind", "")
         else:
             self._id = vm_id
             self._timings = {}
             self._ready_time_ms = None
+            self._capabilities = frozenset()
+            self._backend_kind = ""
         self._template_id = template_id
         self._commands = Commands(self._id)
         self._pty = Pty(self._id)
@@ -156,6 +171,24 @@ class Sandbox:
     def ready_time_ms(self) -> float | None:
         """Total time-to-ready in ms as measured by the daemon (None for reconnected VMs)."""
         return self._ready_time_ms
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Capability names supported by this sandbox's backend (e.g. ``{"shell", "files"}``)."""
+        if not self._capabilities:
+            data = self._fetch()
+            if data:
+                self._capabilities = frozenset(data.get("capabilities", []))
+                self._backend_kind = data.get("backend_kind", self._backend_kind)
+        return self._capabilities
+
+    @property
+    def backend_kind(self) -> str:
+        if not self._backend_kind:
+            data = self._fetch()
+            if data:
+                self._backend_kind = data.get("backend_kind", "")
+        return self._backend_kind
 
     @property
     def commands(self) -> Commands:
@@ -250,6 +283,8 @@ class Sandbox:
         sb._id = vm_id
         sb._timings = {}
         sb._ready_time_ms = None
+        sb._capabilities = frozenset()
+        sb._backend_kind = ""
         sb._commands = Commands(vm_id)
         sb._pty = Pty(vm_id)
         return sb

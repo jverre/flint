@@ -41,7 +41,16 @@ class RecoveryEngine:
 
         for row in active:
             vm_id = row["vm_id"]
-            probe, entry = self._manager._backend.recover_row(row)
+            backend_kind = row.get("backend_kind") or self._manager.default_kind
+            try:
+                backend = self._manager.backend_for(backend_kind)
+            except Exception:
+                log.warning("[%s] backend %s unavailable; marking dead", vm_id[:8], backend_kind)
+                self._store.transition_state(vm_id, SandboxState.DEAD, detail=f"backend {backend_kind} unavailable")
+                report.dead_cleaned += 1
+                continue
+
+            probe, entry = backend.recover(row)
 
             if probe == "alive" and entry is not None:
                 with self._manager._lock:

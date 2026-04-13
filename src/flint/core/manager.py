@@ -6,8 +6,31 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-from .backends.base import HostBackend
-from .config import log, DEFAULT_TEMPLATE_ID
+from flint.errors import BackendCapabilityMissing, SandboxNotFound
+
+from .backends import default_backend_kind, get_backend
+from .backends.base import Backend
+from .backends.capabilities import (
+    EvalRequest,
+    EvalResult,
+    ExecRequest,
+    ExecResult,
+    FetchRequest,
+    FetchResponse,
+    FileInfo,
+    ProcessHandle,
+    ProcessSpec,
+    SupportsFiles,
+    SupportsJsEval,
+    SupportsKv,
+    SupportsMediatedFetch,
+    SupportsPause,
+    SupportsPool,
+    SupportsPty,
+    SupportsShell,
+    SupportsTemplateBuild,
+)
+from .config import DEFAULT_TEMPLATE_ID, log
 from .types import _SandboxEntry, SandboxState
 
 if TYPE_CHECKING:
@@ -15,7 +38,6 @@ if TYPE_CHECKING:
 
 
 def _policy_has_transforms(policy: dict) -> bool:
-    """Check if a network policy contains any transform rules."""
     allow = policy.get("allow", {})
     for domain_rules in allow.values():
         for rule in domain_rules:
@@ -25,10 +47,6 @@ def _policy_has_transforms(policy: dict) -> bool:
 
 
 def _extract_transform_rules(policy: dict) -> dict:
-    """Extract domain -> headers mapping from a network policy.
-
-    Returns a dict like: {"api.openai.com": {"Authorization": "Bearer sk-..."}, ...}
-    """
     rules: dict[str, dict[str, str]] = {}
     allow = policy.get("allow", {})
     for domain, domain_rules in allow.items():
@@ -42,25 +60,60 @@ def _extract_transform_rules(policy: dict) -> dict:
 
 
 class SandboxManager:
-    """Owns all sandbox state and lifecycle. No TUI dependencies."""
+    """Owns sandbox state and dispatches operations to per-kind backends.
 
-    def __init__(self, backend: HostBackend, state_store: StateStore | None = None) -> None:
-        self._backend = backend
+    A single manager handles multiple backend kinds. The backend instance for a
+    given sandbox is determined by ``entry.backend_kind``. Backends are created
+    lazily via :func:`flint.core.backends.get_backend` and cached.
+    """
+
+    def __init__(self, state_store: StateStore | None = None) -> None:
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
         self._state_store = state_store
+        self._backends: dict[str, Backend] = {}
+        self._default_kind: str | None = None
 
-    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> str:
-        """Start an interactive VM from a template snapshot. Returns the vm_id."""
-        boot = self._backend.create(
-            template_id=template_id,
-            allow_internet_access=allow_internet_access,
-            use_pool=use_pool,
-            use_pyroute2=use_pyroute2,
-        )
+    # ── Backend resolution ──────────────────────────────────────────────
+
+    def backend_for(self, kind: str) -> Backend:
+        b = self._backends.get(kind)
+        if b is None:
+            b = get_backend(kind)
+            self._backends[kind] = b
+        return b
+
+    def backend_for_entry(self, entry: _SandboxEntry) -> Backend:
+        return self.backend_for(entry.backend_kind)
+
+    @property
+    def default_kind(self) -> str:
+        if self._default_kind is None:
+            self._default_kind = default_backend_kind()
+        return self._default_kind
+
+    @default_kind.setter
+    def default_kind(self, kind: str) -> None:
+        self._default_kind = kind
+
+    def loaded_backends(self) -> dict[str, Backend]:
+        return dict(self._backends)
+
+    # ── Lifecycle ───────────────────────────────────────────────────────
+
+    def create(
+        self,
+        *,
+        backend: str | None = None,
+        template_id: str = DEFAULT_TEMPLATE_ID,
+        options: dict | None = None,
+        network_policy: dict | None = None,
+    ) -> str:
+        kind = backend or self.default_kind
+        b = self.backend_for(kind)
+        boot = b.create(template_id=template_id, options=options or {})
 
         vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
-        agent_url = boot.agent_url
 
         entry = _SandboxEntry(
             vm_id=vm_id,
@@ -70,40 +123,39 @@ class SandboxManager:
             socket_path=boot.socket_path,
             ns_name=boot.ns_name,
             guest_ip=boot.guest_ip,
-            agent_url=agent_url,
+            agent_url=boot.agent_url,
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=template_id,
             chroot_base=boot.chroot_base,
-            backend_kind=self._backend.kind,
+            backend_kind=b.kind,
             backend_vm_ref=boot.backend_vm_ref or vm_id,
             runtime_dir=boot.runtime_dir or boot.vm_dir,
             guest_arch=boot.guest_arch,
             transport_ref=boot.transport_ref,
             backend_metadata=dict(boot.backend_metadata),
             t_instance_start=boot.t_total,
-            ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
+            ready_time_ms=(time.monotonic() - boot.t_total) * 1000 if boot.t_total else None,
             timings=boot.timings,
             network_policy=network_policy,
         )
 
-        # Warmup: send a quick exec to measure time-to-interactive.
-        t0 = time.monotonic()
-        try:
-            body = json.dumps({"cmd": ["echo", "benchmark"], "timeout": 5}).encode()
-            self._backend.proxy_guest_request(entry, "POST", "/exec", body, timeout=10)
-        except Exception:
-            pass
-        entry.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
+        # Warmup ping to measure time-to-interactive — only if the backend has shell.
+        if isinstance(b, SupportsShell):
+            t0 = time.monotonic()
+            try:
+                b.exec(entry, ExecRequest(cmd=["echo", "benchmark"], timeout=5))
+            except Exception:
+                pass
+            entry.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
 
         with self._lock:
             self._sandboxes[vm_id] = entry
 
-        # Persist to state store if available
         if self._state_store:
             self._state_store.insert_sandbox(
                 vm_id=vm_id,
-                pid=boot.process.pid,
+                pid=boot.pid,
                 vm_dir=boot.vm_dir,
                 socket_path=boot.socket_path,
                 ns_name=boot.ns_name,
@@ -121,17 +173,16 @@ class SandboxManager:
                 backend_meta_json=entry.backend_metadata,
             )
 
-        # Persist network policy if provided
         if network_policy and self._state_store:
             self._state_store.set_network_policy(vm_id, json.dumps(network_policy))
 
-        # Start credential proxy if network policy has transforms
         if network_policy:
             self._apply_network_policy(entry, network_policy)
 
-        total_ms = (time.monotonic() - boot.t_total) * 1000
-        parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
-        log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
+        if boot.t_total:
+            total_ms = (time.monotonic() - boot.t_total) * 1000
+            parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
+            log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
 
         return vm_id
 
@@ -141,30 +192,26 @@ class SandboxManager:
         if not entry:
             return
 
-        # Stop credential proxy before tearing down the VM
         if entry.proxy:
             try:
                 entry.proxy.stop()
             except Exception:
                 pass
 
-        self._backend.kill(entry)
+        self.backend_for_entry(entry).kill(entry)
 
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
 
     def pause(self, sandbox_id: str) -> None:
-        """Pause a running sandbox: snapshot state to disk, kill process."""
-        from ._firecracker import _fc_patch, _fc_put, _fc_status_ok
-
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        entry = self._require_entry(sandbox_id)
         if entry.state != SandboxState.RUNNING:
             raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
+        b = self.backend_for_entry(entry)
+        if not isinstance(b, SupportsPause):
+            raise BackendCapabilityMissing(capability="pause", backend=b.kind)
 
-        self._backend.pause(entry, self._state_store)
+        b.pause(entry, self._state_store)
 
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
@@ -172,19 +219,21 @@ class SandboxManager:
         log.debug("[%s] paused", sandbox_id[:8])
 
     def resume(self, sandbox_id: str) -> str:
-        """Resume a paused sandbox from its snapshot."""
         if not self._state_store:
             raise RuntimeError("StateStore required for resume")
 
         row = self._state_store.get_sandbox(sandbox_id)
         if not row:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found in state store")
+            raise SandboxNotFound(sandbox_id)
         if row["state"] != SandboxState.PAUSED.value:
             raise RuntimeError(f"Sandbox {sandbox_id} is not paused (state={row['state']})")
 
-        boot = self._backend.resume(row)
+        b = self.backend_for(row.get("backend_kind") or self.default_kind)
+        if not isinstance(b, SupportsPause):
+            raise BackendCapabilityMissing(capability="pause", backend=b.kind)
 
-        # 6. Restore network policy from SQLite
+        boot = b.resume(row)
+
         network_policy = None
         policy_json = self._state_store.get_network_policy(sandbox_id)
         if policy_json:
@@ -193,7 +242,6 @@ class SandboxManager:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # 7. Create entry and insert into in-memory dict
         entry = _SandboxEntry(
             vm_id=sandbox_id,
             process=boot.process,
@@ -208,7 +256,7 @@ class SandboxManager:
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
             chroot_base=boot.chroot_base,
             network_policy=network_policy,
-            backend_kind=row.get("backend_kind") or self._backend.kind,
+            backend_kind=b.kind,
             backend_vm_ref=boot.backend_vm_ref or sandbox_id,
             runtime_dir=boot.runtime_dir or boot.vm_dir,
             guest_arch=boot.guest_arch or row.get("guest_arch") or "",
@@ -219,7 +267,6 @@ class SandboxManager:
         with self._lock:
             self._sandboxes[sandbox_id] = entry
 
-        # 8. Persist state transition
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
             self._state_store.update_sandbox(
@@ -232,7 +279,6 @@ class SandboxManager:
                 backend_meta_json=json.dumps(entry.backend_metadata),
             )
 
-        # 9. Re-apply credential injection proxy if policy has transforms
         if network_policy:
             self._apply_network_policy(entry, network_policy)
 
@@ -240,61 +286,184 @@ class SandboxManager:
         return sandbox_id
 
     def set_timeout(self, sandbox_id: str, timeout_seconds: float, policy: str = "kill") -> None:
-        """Set or update the timeout for a sandbox."""
         if not self._state_store:
             raise RuntimeError("StateStore required for set_timeout")
         timeout_at = time.time() + timeout_seconds
         self._state_store.set_timeout(sandbox_id, timeout_at, policy)
 
+    # ── Introspection ───────────────────────────────────────────────────
+
     def list_dicts(self) -> list[dict]:
-        """Return JSON-serializable dicts for all VMs."""
         with self._lock:
-            return [entry.to_dict() for entry in self._sandboxes.values()]
+            return [self._entry_to_dict(e) for e in self._sandboxes.values()]
 
     def get_dict(self, sandbox_id: str) -> dict | None:
-        """Return JSON-serializable dict for a single VM, or None."""
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
         if entry is None:
             return None
-        return entry.to_dict()
+        return self._entry_to_dict(entry)
+
+    def _entry_to_dict(self, entry: _SandboxEntry) -> dict:
+        d = entry.to_dict()
+        try:
+            d["capabilities"] = sorted(self.backend_for_entry(entry).capabilities)
+        except Exception:
+            d["capabilities"] = []
+        return d
 
     def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
-        """Return the raw entry for a VM. None if not found."""
         with self._lock:
             return self._sandboxes.get(sandbox_id)
 
     def vm_ids(self) -> list[str]:
-        """Return list of all VM IDs."""
         with self._lock:
             return list(self._sandboxes.keys())
 
-    def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
-        """Update the network policy (credential injection rules) for a sandbox."""
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
+    def _require_entry(self, sandbox_id: str) -> _SandboxEntry:
+        entry = self.get_entry(sandbox_id)
         if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+            raise SandboxNotFound(sandbox_id)
+        return entry
 
+    def _require_capability(self, entry: _SandboxEntry, capability: str, proto):
+        b = self.backend_for_entry(entry)
+        if not isinstance(b, proto):
+            raise BackendCapabilityMissing(capability=capability, backend=b.kind)
+        return b
+
+    # ── Capability-typed dispatch ───────────────────────────────────────
+
+    def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "shell", SupportsShell)
+        return b.exec(entry, request)
+
+    def read_file(self, sandbox_id: str, path: str) -> bytes:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        return b.read_file(entry, path)
+
+    def write_file(self, sandbox_id: str, path: str, data: bytes, mode: str = "0644") -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        b.write_file(entry, path, data, mode)
+
+    def stat_file(self, sandbox_id: str, path: str) -> FileInfo:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        return b.stat_file(entry, path)
+
+    def list_files(self, sandbox_id: str, path: str) -> list[FileInfo]:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        return b.list_files(entry, path)
+
+    def mkdir(self, sandbox_id: str, path: str, parents: bool = True) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        b.mkdir(entry, path, parents)
+
+    def delete_file(self, sandbox_id: str, path: str, recursive: bool = False) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "files", SupportsFiles)
+        b.delete_file(entry, path, recursive)
+
+    def create_process(self, sandbox_id: str, spec: ProcessSpec) -> ProcessHandle:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        return b.create_process(entry, spec)
+
+    def list_processes(self, sandbox_id: str) -> list[dict]:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        return b.list_processes(entry)
+
+    def send_process_input(self, sandbox_id: str, pid: int, data: bytes) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        b.send_process_input(entry, pid, data)
+
+    def signal_process(self, sandbox_id: str, pid: int, signal: int) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        b.signal_process(entry, pid, signal)
+
+    def resize_process(self, sandbox_id: str, pid: int, cols: int, rows: int) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        b.resize_process(entry, pid, cols, rows)
+
+    async def attach_terminal(self, sandbox_id: str, websocket) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "pty", SupportsPty)
+        await b.attach_terminal(entry, websocket)
+
+    def eval_js(self, sandbox_id: str, request: EvalRequest) -> EvalResult:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "js_eval", SupportsJsEval)
+        return b.eval_js(entry, request)
+
+    def fetch(self, sandbox_id: str, request: FetchRequest) -> FetchResponse:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "fetch", SupportsMediatedFetch)
+        return b.fetch(entry, request)
+
+    def kv_get(self, sandbox_id: str, key: str) -> bytes | None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "kv", SupportsKv)
+        return b.kv_get(entry, key)
+
+    def kv_put(self, sandbox_id: str, key: str, value: bytes) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "kv", SupportsKv)
+        b.kv_put(entry, key, value)
+
+    def kv_delete(self, sandbox_id: str, key: str) -> None:
+        entry = self._require_entry(sandbox_id)
+        b = self._require_capability(entry, "kv", SupportsKv)
+        b.kv_delete(entry, key)
+
+    # ── Backend-fanout helpers ──────────────────────────────────────────
+
+    def start_pools(self) -> None:
+        for b in self._backends.values():
+            if isinstance(b, SupportsPool):
+                try:
+                    b.start_pool()
+                except Exception:
+                    log.exception("start_pool failed for %s", b.kind)
+
+    def stop_pools(self) -> None:
+        for b in self._backends.values():
+            if isinstance(b, SupportsPool):
+                try:
+                    b.stop_pool()
+                except Exception:
+                    log.exception("stop_pool failed for %s", b.kind)
+
+    def template_builder_for(self, backend_kind: str) -> "SupportsTemplateBuild":
+        b = self.backend_for(backend_kind)
+        if not isinstance(b, SupportsTemplateBuild):
+            raise BackendCapabilityMissing(capability="template_build", backend=b.kind)
+        return b
+
+    # ── Network policy ──────────────────────────────────────────────────
+
+    def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
+        entry = self._require_entry(sandbox_id)
         entry.network_policy = policy
-
         if self._state_store:
             self._state_store.set_network_policy(sandbox_id, json.dumps(policy))
-
         self._apply_network_policy(entry, policy)
 
     def get_network_policy(self, sandbox_id: str) -> dict | None:
-        """Get the current network policy for a sandbox."""
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        entry = self._require_entry(sandbox_id)
         return entry.network_policy
 
     def _apply_network_policy(self, entry: _SandboxEntry, policy: dict) -> None:
-        """Start, update, or stop the credential proxy based on the policy."""
+        from ._netns import _remove_proxy_redirect, _setup_proxy_redirect
         from ._proxy import CredentialProxy
-        from ._netns import _setup_proxy_redirect, _remove_proxy_redirect
 
         has_transforms = _policy_has_transforms(policy)
 
@@ -312,26 +481,3 @@ class SandboxManager:
                 entry.proxy.stop()
                 entry.proxy = None
                 _remove_proxy_redirect(entry.ns_name)
-
-    @property
-    def backend_kind(self) -> str:
-        return self._backend.kind
-
-    def agent_request(
-        self,
-        sandbox_id: str,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        timeout: float = 65,
-    ) -> tuple[int, bytes]:
-        entry = self.get_entry(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        return self._backend.proxy_guest_request(entry, method, path, body, timeout)
-
-    async def bridge_terminal(self, sandbox_id: str, websocket) -> None:
-        entry = self.get_entry(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        await self._backend.bridge_terminal(entry, websocket)
