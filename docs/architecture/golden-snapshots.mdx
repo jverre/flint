@@ -9,12 +9,15 @@ Loading a snapshot is much faster than booting because the kernel and init proce
 
 ## How it works
 
-When you run `setup-rootfs.sh` or start the daemon for the first time, Flint:
+When you start the daemon for the first time, Flint:
 
-1. Boots a Firecracker VM with the Alpine rootfs and kernel
-2. Waits for `flintd` (the guest agent) to become healthy
-3. Pauses the VM and saves the full memory state to disk - this is the golden snapshot
-4. All future sandboxes load from this snapshot instead of booting fresh
+1. Pulls the default base image (`ghcr.io/jverre/flint/base:latest`) from
+   GitHub Container Registry via [crane](https://github.com/google/go-containerregistry)
+   and extracts it into an ext4 rootfs
+2. Boots a Firecracker VM with that rootfs and the kernel
+3. Waits for `flintd` (the guest agent) to become healthy
+4. Pauses the VM and saves the full memory state to disk - this is the golden snapshot
+5. All future sandboxes load from this snapshot instead of booting fresh
 
 The snapshot lives at `/microvms/.golden/`. It includes:
 
@@ -33,11 +36,15 @@ By default the pool keeps 8 images ready (`POOL_TARGET_SIZE = 8`) with 4 backgro
 
 Custom templates work the same way. When you call `Template.build()`, Flint:
 
-1. Builds a Docker image from your Dockerfile
-2. Extracts the filesystem from the image
-3. Boots a VM with that filesystem
-4. Waits for `flintd` to be healthy
-5. Takes a snapshot - this becomes the template's golden snapshot
+1. Pulls the OCI image you specified via crane (no Docker daemon)
+2. Flattens the image layers into an ext4 rootfs
+3. Injects `flintd` and `init-net.sh` into the rootfs (unless disabled)
+4. Boots a VM with that rootfs
+5. Waits for `flintd` to be healthy
+6. Takes a snapshot - this becomes the template's golden snapshot
+
+Image pulls are cached at `{FLINT_DATA_DIR}/.oci-cache` keyed by digest,
+so rebuilding the same image is near instant.
 
 After that, `Sandbox(template_id=...)` is just as fast as the default template.
 

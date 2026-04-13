@@ -32,7 +32,6 @@ from flint.core.config import (
     GOLDEN_DIR,
     GOLDEN_TAP,
     GUEST_IP,
-    SOURCE_ROOTFS,
     TEMPLATES_DIR,
     log,
 )
@@ -60,48 +59,25 @@ class LinuxFirecrackerBackend(HostBackend):
 
         shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
 
-        # Try pulling the base image from ghcr.io via crane
-        try:
-            from flint.core._oci_pull import pull_and_extract
-            rootfs_path = os.path.join(GOLDEN_DIR, "rootfs.ext4")
-            os.makedirs(GOLDEN_DIR, exist_ok=True)
-            log.info("Pulling default base image from %s ...", DEFAULT_BASE_IMAGE)
-            digest = pull_and_extract(
-                DEFAULT_BASE_IMAGE,
-                rootfs_path,
-                size_mb=200,
-                inject_flint=False,  # ghcr.io base image already has flintd
-            )
-            create_golden_snapshot(source_rootfs=rootfs_path, snapshot_dir=GOLDEN_DIR)
-            register_template_artifact(
-                DEFAULT_TEMPLATE_ID,
-                "Default (Alpine)",
-                self.kind,
-                GOLDEN_DIR,
-                status="ready",
-                image_ref=DEFAULT_BASE_IMAGE,
-                image_digest=digest,
-            )
-            return
-        except Exception as exc:
-            log.warning("OCI pull failed, falling back to local rootfs: %s", exc)
-
-        # Fallback: use local SOURCE_ROOTFS if available
-        if os.path.exists(SOURCE_ROOTFS):
-            create_golden_snapshot()
-            register_template_artifact(
-                DEFAULT_TEMPLATE_ID,
-                "Default (Alpine)",
-                self.kind,
-                GOLDEN_DIR,
-                status="ready",
-            )
-            return
-
-        raise RuntimeError(
-            f"Cannot create default template: crane pull from {DEFAULT_BASE_IMAGE} failed "
-            f"and local rootfs not found at {SOURCE_ROOTFS}. "
-            "Install crane (bash scripts/install-crane.sh) or run setup-rootfs.sh."
+        from flint.core._oci_pull import pull_and_extract
+        rootfs_path = os.path.join(GOLDEN_DIR, "rootfs.ext4")
+        os.makedirs(GOLDEN_DIR, exist_ok=True)
+        log.info("Pulling default base image from %s ...", DEFAULT_BASE_IMAGE)
+        digest = pull_and_extract(
+            DEFAULT_BASE_IMAGE,
+            rootfs_path,
+            size_mb=200,
+            inject_flint=False,  # ghcr.io base image already has flintd
+        )
+        create_golden_snapshot(source_rootfs=rootfs_path, snapshot_dir=GOLDEN_DIR)
+        register_template_artifact(
+            DEFAULT_TEMPLATE_ID,
+            "Default (Alpine)",
+            self.kind,
+            GOLDEN_DIR,
+            status="ready",
+            image_ref=DEFAULT_BASE_IMAGE,
+            image_digest=digest,
         )
 
     def start_pool(self) -> None:

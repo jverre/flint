@@ -27,7 +27,6 @@ log.setLevel(logging.DEBUG)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-SOURCE_ROOTFS = "/root/firecracker-vm/rootfs.ext4"
 KERNEL_PATH = "/root/firecracker-vm/vmlinux"
 BOOT_ARGS = "console=ttyS0 quiet loglevel=0 reboot=k panic=1 pci=off random.trust_cpu=on mitigations=off nokaslr raid=noautodetect init=/etc/init-net.sh"
 GUEST_MAC = "06:00:AC:10:00:02"

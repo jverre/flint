@@ -4,7 +4,7 @@ import subprocess
 import threading
 import uuid
 
-from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, SOURCE_ROOTFS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID
+from .config import log, POOL_DIR, POOL_TARGET_SIZE, POOL_WORKERS, GOLDEN_DIR, DEFAULT_TEMPLATE_ID
 from ._snapshot import golden_snapshot_exists
 
 _pool_lock = threading.Lock()
@@ -46,11 +46,8 @@ def _pool_refill_loop():
             # Refill default template
             with _pool_lock:
                 default_count = sum(1 for e in _pool_entries if e["template_id"] == DEFAULT_TEMPLATE_ID and e["state"] in ("ready", "copying"))
-            if default_count < POOL_TARGET_SIZE:
-                if golden_snapshot_exists():
-                    _copy_one_to_pool(f"{GOLDEN_DIR}/rootfs.ext4", DEFAULT_TEMPLATE_ID)
-                else:
-                    _copy_one_to_pool(SOURCE_ROOTFS, DEFAULT_TEMPLATE_ID)
+            if default_count < POOL_TARGET_SIZE and golden_snapshot_exists():
+                _copy_one_to_pool(f"{GOLDEN_DIR}/rootfs.ext4", DEFAULT_TEMPLATE_ID)
                 filled = True
 
             # Refill non-default templates

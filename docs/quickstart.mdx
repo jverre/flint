@@ -46,11 +46,12 @@ description: "Start a sandbox and run your first command."
     ```
   </Step>
 
-  <Step title="Build the base rootfs">
-    This builds the Alpine Linux rootfs with the `flintd` guest agent. You only need to do this once.
+  <Step title="Install crane">
+    Flint pulls container images directly from OCI registries (no Docker
+    daemon). Install [crane](https://github.com/google/go-containerregistry):
 
     ```bash
-    sudo bash setup-rootfs.sh
+    sudo bash scripts/install-crane.sh
     ```
   </Step>
 
@@ -61,7 +62,10 @@ description: "Start a sandbox and run your first command."
     sudo flint start
     ```
 
-    You should see it print `Golden snapshot ready` when it's good to go.
+    On first run it pulls the default base image
+    (`ghcr.io/jverre/flint/base:latest`) from GitHub Container Registry
+    and creates the golden snapshot. You should see `Golden snapshot ready`
+    when it's good to go.
   </Step>
 
   <Step title="Run your first sandbox">

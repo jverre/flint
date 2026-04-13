@@ -1,11 +1,19 @@
 ---
 title: "Templates"
-description: "Build custom sandbox environments from Docker images."
+description: "Build custom sandbox environments from OCI images."
 ---
 
-By default, sandboxes use a minimal Alpine Linux rootfs. If you need Python packages, system libraries, or a specific runtime pre-installed, you can build a custom template.
+By default, sandboxes use a minimal Alpine Linux rootfs pulled from
+`ghcr.io/jverre/flint/base:latest`. If you need Python packages, system
+libraries, or a specific runtime pre-installed, you can build a custom
+template from any OCI image.
 
-Templates work by building a Docker image, extracting the filesystem, and creating a new golden snapshot from it. Once built, you can create sandboxes from your template just like the default one - with the same fast startup time.
+Templates work by pulling an OCI image directly from a registry (using
+[crane](https://github.com/google/go-containerregistry) — no Docker daemon),
+extracting the flattened filesystem into an ext4 image, injecting the Flint
+guest agent, and creating a golden snapshot from it. Once built, you can
+create sandboxes from your template just like the default one — with the
+same fast startup time.
 
 ## Building a template
 
@@ -15,8 +23,7 @@ Templates work by building a Docker image, extracting the filesystem, and creati
     from flint import Template, Sandbox
 
     template = (Template("my-python-env")
-        .from_python_image("3.11-slim")
-        .pip_install("numpy", "pandas", "scikit-learn")
+        .from_oci_image("python:3.11-slim")
         .build())
 
     sandbox = Sandbox(template_id=template.template_id)
@@ -32,7 +39,7 @@ Templates work by building a Docker image, extracting the filesystem, and creati
     </ParamField>
 
     <ParamField path="rootfs_size_mb" type="int" default="500">
-      Size of the rootfs image in MB. Increase this if you're installing large packages.
+      Size of the rootfs image in MB. Increase this if your base image is large.
     </ParamField>
   </Tab>
   <Tab title="REST API">
@@ -43,7 +50,7 @@ Templates work by building a Docker image, extracting the filesystem, and creati
       -H "Content-Type: application/json" \
       -d '{
         "name": "my-python-env",
-        "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
+        "image_ref": "python:3.11-slim",
         "rootfs_size_mb": 500
       }'
     ```
@@ -52,12 +59,17 @@ Templates work by building a Docker image, extracting the filesystem, and creati
       Human-readable name.
     </ParamField>
 
-    <ParamField body="dockerfile" type="string" required>
-      Full Dockerfile contents.
+    <ParamField body="image_ref" type="string" required>
+      OCI image reference (e.g. `python:3.11-slim`, `ghcr.io/org/img:tag`).
     </ParamField>
 
     <ParamField body="rootfs_size_mb" type="int" default="500">
       Rootfs image size in MB.
+    </ParamField>
+
+    <ParamField body="inject_flint" type="bool" default="true">
+      When `false`, the image is assumed to already contain `flintd` and
+      `/etc/init-net.sh` (e.g. pre-built Flint base images).
     </ParamField>
 
     **Response** `200` - returns immediately, build happens in background
@@ -75,31 +87,19 @@ Templates work by building a Docker image, extracting the filesystem, and creati
 Pick one:
 
 ```python
-.from_ubuntu_image("22.04")
-.from_python_image("3.11-slim")
-.from_node_image("20-slim")
-.from_alpine_image("3.19")
-.from_image("myregistry/myimage:tag")       # any Docker image
-.from_dockerfile("FROM ubuntu:22.04\n...")  # raw Dockerfile
+.from_oci_image("python:3.11-slim")                 # any OCI reference
+.from_oci_image("ghcr.io/org/custom:latest",
+                inject_flint=False)                 # pre-built Flint image
+.from_ubuntu_image("22.04")                         # shorthand for ubuntu:22.04
+.from_python_image("3.11-slim")                     # shorthand for python:3.11-slim
+.from_node_image("20-slim")                         # shorthand for node:20-slim
+.from_alpine_image("3.19")                          # shorthand for alpine:3.19
 ```
 
-## Installing packages
-
-```python
-.apt_install("git", "curl", "build-essential")
-.pip_install("numpy", "pandas")
-.npm_install("typescript", "ts-node")
-```
-
-## Other operations
-
-```python
-.run_cmd("curl -fsSL https://example.com/install.sh | sh")
-.copy("./local-file.txt", "/app/file.txt")
-.set_workdir("/app")
-.set_envs(NODE_ENV="production", DEBUG="false")
-.git_clone("https://github.com/example/repo", "/app/repo")
-```
+To customise a base image (install packages, add files, set env vars),
+build your own OCI image and push it to any registry — then reference it
+with `.from_oci_image(...)`. You can use GitHub Actions, Buildkit, Kaniko,
+or any OCI image builder; Flint only needs the final image to be pullable.
 
 ## TemplateInfo
 
@@ -146,28 +146,15 @@ info.status       # "ready"
   </Tab>
 </Tabs>
 
-## Full example - Node.js environment
+## Caching
 
-```python
-from flint import Template, Sandbox
-
-template = (Template("node-app", rootfs_size_mb=800)
-    .from_node_image("20-slim")
-    .apt_install("git")
-    .npm_install("express", "axios")
-    .set_workdir("/app")
-    .set_envs(NODE_ENV="production")
-    .build())
-
-sandbox = Sandbox(template_id=template.template_id)
-result = sandbox.run_code(
-    "const express = require('express'); console.log('express loaded')",
-    runtime="node"
-)
-print(result.stdout)  # express loaded
-sandbox.kill()
-```
+Pulls are cached locally by image digest under `{FLINT_DATA_DIR}/.oci-cache`.
+Building the same `image_ref` twice hits the cache on the second call and
+skips the network fetch. The cache is LRU-evicted once it exceeds 20 entries.
 
 ## A note on build time
 
-Building a template can take anywhere from 30 seconds to a few minutes depending on what you're installing. The `build()` call blocks until it's done. Templates are cached after that though, so `Sandbox(template_id=...)` is just as fast as the default template.
+First build of a template pulls the image and creates a golden snapshot
+— usually 10-30 seconds depending on image size. Cached rebuilds are near
+instant. Once built, `Sandbox(template_id=...)` is just as fast as the
+default template.

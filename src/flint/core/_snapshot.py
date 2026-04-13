@@ -5,7 +5,7 @@ import time
 import urllib.request
 
 from .config import (
-    log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
+    log, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
     GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, DATA_DIR,
 )
 from ._netns import _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _enter_netns, _restore_netns
@@ -27,7 +27,8 @@ def _golden_cleanup(process, ns_name, vm_dir):
 
 
 def create_golden_snapshot(
-    source_rootfs: str = SOURCE_ROOTFS,
+    *,
+    source_rootfs: str,
     snapshot_dir: str = GOLDEN_DIR,
     ns_name: str = GOLDEN_NS,
     tap_name: str = GOLDEN_TAP,

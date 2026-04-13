@@ -14,16 +14,21 @@ Starts a template build in the background and returns immediately. Poll `GET /te
 ```json
 {
   "name": "my-python-env",
-  "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
-  "rootfs_size_mb": 500
+  "image_ref": "python:3.11-slim",
+  "rootfs_size_mb": 500,
+  "inject_flint": true
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | required | Human-readable name |
-| `dockerfile` | string | required | Full Dockerfile contents |
+| `image_ref` | string | required | OCI image reference (e.g. `python:3.11-slim`, `ghcr.io/org/img:tag`) |
 | `rootfs_size_mb` | int | `500` | Rootfs image size in MB |
+| `inject_flint` | bool | `true` | Copy `flintd` and `init-net.sh` into the rootfs. Set to `false` for pre-built Flint images. |
+
+Images are pulled directly from the registry using
+[crane](https://github.com/google/go-containerregistry) (no Docker daemon).
 
 **Response** `200`
 

@@ -76,18 +76,7 @@ jobs:
           MOUNT_DIR="/tmp/flint-rootfs-ci"
           mkdir -p "$MOUNT_DIR"
           sudo mount /root/firecracker-vm/rootfs.ext4 "$MOUNT_DIR"
-          if crane export --platform linux/amd64 ghcr.io/jverre/flint/base:latest - 2>/dev/null | sudo tar -x -C "$MOUNT_DIR"; then
-            echo "Rootfs pulled from ghcr.io"
-          else
-            echo "ghcr.io pull failed, falling back to setup-rootfs.sh"
-            sudo umount "$MOUNT_DIR"
-            rm -f /root/firecracker-vm/rootfs.ext4
-            curl -fsSL -o /tmp/alpine.tar.gz \
-              https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-            sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
-            sudo -E env "PATH=$PATH" bash setup-rootfs.sh
-            exit 0
-          fi
+          crane export --platform linux/amd64 ghcr.io/jverre/flint/base:latest - | sudo tar -x -C "$MOUNT_DIR"
           sudo umount "$MOUNT_DIR"
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer

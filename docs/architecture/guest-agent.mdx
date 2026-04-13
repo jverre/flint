@@ -40,7 +40,13 @@ cd guest/flintd
 GOOS=linux GOARCH=amd64 go build -o flintd .
 ```
 
-The `setup-rootfs.sh` script does this automatically when building the base rootfs.
+The default base image (`ghcr.io/jverre/flint/base:latest`) is built from
+`images/base/Dockerfile` by the `publish-image.yml` workflow on every push
+to `main`, which compiles `flintd` and bakes it into an Alpine image.
+
+For custom templates, Flint injects the host-side `flintd` binary into the
+pulled rootfs automatically at build time — unless you pass
+`inject_flint=False` (for images that already contain `flintd`).
 
 ## Health check
 

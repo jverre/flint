@@ -163,17 +163,16 @@ print(sandbox.timings)
 
 ## 📦 Templates
 
-Build custom VM templates with a fluent builder API:
+Build custom VM templates by pulling OCI images directly from any registry.
+Images are fetched with [crane](https://github.com/google/go-containerregistry)
+— no Docker daemon required.
 
 ```python
 from flint import Template, Sandbox
 
 template = (
     Template("python-data-science")
-    .from_ubuntu_image("22.04")
-    .apt_install("python3", "python3-pip")
-    .pip_install("numpy", "pandas")
-    .set_workdir("/workspace")
+    .from_oci_image("python:3.12-slim")
     .build()
 )
 
@@ -185,27 +184,21 @@ sandbox = Sandbox(template_id=template.template_id)
 
 | Method | Description |
 |--------|-------------|
-| `.from_ubuntu_image(tag)` | Ubuntu base image |
-| `.from_python_image(tag)` | Python base image |
-| `.from_node_image(tag)` | Node.js base image |
-| `.from_alpine_image(tag)` | Alpine base image |
-| `.from_image(image)` | Any Docker image |
-| `.from_dockerfile(dockerfile)` | Raw Dockerfile string |
+| `.from_oci_image(ref, inject_flint=True)` | Any OCI image (Docker Hub, ghcr.io, private registries) |
+| `.from_ubuntu_image(tag)` | `ubuntu:<tag>` |
+| `.from_python_image(tag)` | `python:<tag>` |
+| `.from_node_image(tag)` | `node:<tag>` |
+| `.from_alpine_image(tag)` | `alpine:<tag>` |
 
-**Operation methods:**
+Pass `inject_flint=False` for pre-built Flint images (e.g.,
+`ghcr.io/jverre/flint/base:latest`) that already contain `flintd` and
+`init-net.sh`.
 
-| Method | Description |
-|--------|-------------|
-| `.apt_install(*packages)` | Install apt packages |
-| `.pip_install(*packages)` | Install pip packages |
-| `.npm_install(*packages)` | Install npm packages |
-| `.run_cmd(cmd)` | Run a shell command |
-| `.copy(src, dest)` | Copy files into the image |
-| `.set_workdir(path)` | Set the working directory |
-| `.set_envs(**envs)` | Set environment variables |
-| `.git_clone(repo, dest)` | Clone a git repository |
-
-Call `.build()` to build the template via the daemon. It blocks until the template is ready and returns a `TemplateInfo` with `template_id`, `name`, and `status`.
+Call `.build()` to build the template via the daemon. It pulls the image,
+extracts the flattened filesystem into an ext4 rootfs, injects `flintd`
+(if requested), snapshots the boot state, and caches everything for the
+next build. Blocks until the template is ready and returns a `TemplateInfo`
+with `template_id`, `name`, and `status`.
 
 ## 💻 TUI
 
@@ -289,7 +282,7 @@ The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/templates/build` | Build a template from a Dockerfile |
+| `POST` | `/templates/build` | Build a template from an OCI image reference |
 | `GET` | `/templates` | List all templates |
 | `GET` | `/templates/{template_id}` | Get template details |
 | `DELETE` | `/templates/{template_id}` | Delete a template |
@@ -449,27 +442,27 @@ To verify what is installed:
 sudo flint install-deps --check
 ```
 
-### 2. Build the rootfs image
+### 2. Install crane
 
-Flint uses an Alpine-based rootfs with the `flintd` guest agent. The `setup-rootfs.sh` script builds it:
+Flint pulls container images directly from OCI registries (no Docker
+daemon). Install [crane](https://github.com/google/go-containerregistry):
 
 ```bash
-sudo ./setup-rootfs.sh
+sudo bash scripts/install-crane.sh
 ```
 
-This creates a 200 MB ext4 image at `/root/firecracker-vm/rootfs.ext4`.
+### 3. Start the daemon
 
-### 3. Verify
-
-You should have:
-
-```
-/root/firecracker-vm/
-├── vmlinux        # Uncompressed Linux kernel
-└── rootfs.ext4    # Alpine rootfs with flintd guest agent
+```bash
+flint start
 ```
 
-Once these are in place, `flint start` will create the golden snapshot automatically on first run.
+On first run the daemon pulls the default base image
+(`ghcr.io/jverre/flint/base:latest`) from GitHub Container Registry,
+extracts it into an ext4 rootfs at `{FLINT_DATA_DIR}/.golden/rootfs.ext4`,
+and creates the golden snapshot. Subsequent starts reuse the snapshot.
+
+Override the base image with `FLINT_BASE_IMAGE=ghcr.io/you/your-base:tag`.
 
 ---
 
