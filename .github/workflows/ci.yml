@@ -68,16 +68,22 @@ jobs:
         run: |
           curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
             | sudo tar -xz -C /usr/local/bin crane
-      - name: Pull base image and build rootfs
+      - name: Build base image and extract rootfs
+        # Build the base image from source rather than pulling from ghcr.io —
+        # that way PR runs are self-contained and don't depend on publish-image.yml
+        # (which only runs on push to main) having populated the registry.
         run: |
           sudo mkdir -p /root/firecracker-vm
           truncate -s 200M /root/firecracker-vm/rootfs.ext4
           mkfs.ext4 -q /root/firecracker-vm/rootfs.ext4
           MOUNT_DIR="/tmp/flint-rootfs-ci"
           mkdir -p "$MOUNT_DIR"
+          docker build -f images/base/Dockerfile -t flint-base:ci .
+          CID=$(docker create flint-base:ci)
           sudo mount /root/firecracker-vm/rootfs.ext4 "$MOUNT_DIR"
-          crane export --platform linux/amd64 ghcr.io/jverre/flint/base:latest - | sudo tar -x -C "$MOUNT_DIR"
+          docker export "$CID" | sudo tar -x -C "$MOUNT_DIR"
           sudo umount "$MOUNT_DIR"
+          docker rm "$CID"
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
       - name: Run tests
