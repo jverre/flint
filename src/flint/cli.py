@@ -14,7 +14,8 @@ def cli():
 @click.option("--port", default=None, type=int, help="Daemon port (default: 9100)")
 @click.option("--data-dir", default=None, type=str, help="Data directory for VMs (default: /microvms)")
 @click.option("--state-dir", default=None, type=str, help="State directory for daemon files (default: /tmp/flint)")
-def start(port, data_dir, state_dir):
+@click.option("--backend", default=None, type=str, help="Backend plugin to use (e.g. firecracker, cloud-hypervisor, macos-vz)")
+def start(port, data_dir, state_dir, backend):
     """Start the Flint manager daemon."""
     if port is not None:
         os.environ["FLINT_PORT"] = str(port)
@@ -22,6 +23,17 @@ def start(port, data_dir, state_dir):
         os.environ["FLINT_DATA_DIR"] = data_dir
     if state_dir is not None:
         os.environ["FLINT_STATE_DIR"] = state_dir
+    if backend is not None:
+        os.environ["FLINT_BACKEND"] = backend
+        from flint.core.backends import get_backend, names, BackendNotFound
+        try:
+            get_backend(backend)
+        except BackendNotFound:
+            click.echo(
+                f"Error: unknown backend {backend!r}. Available: {', '.join(names()) or '(none installed)'}",
+                err=True,
+            )
+            raise SystemExit(2)
     # On macOS, ensure the Python binary has the virtualization entitlement.
     # This may os.execv() — the call never returns in that case.
     import platform
@@ -30,6 +42,29 @@ def start(port, data_dir, state_dir):
         ensure_vz_entitlement()
     from flint.daemon.server import FlintDaemon
     FlintDaemon().run()
+
+
+@cli.group()
+def backends():
+    """Inspect available backend plugins."""
+    pass
+
+
+@backends.command("list")
+def backends_list():
+    """List installed backend plugins and their preflight status."""
+    from flint.core.backends import available
+    infos = available()
+    if not infos:
+        click.echo("No backend plugins installed.")
+        return
+    for info in infos:
+        status = "ok" if info.preflight_ok else "not-ready"
+        display = info.display_name or info.name
+        click.echo(f"  {info.name:20s} {display:40s} [{status}]")
+        if not info.preflight_ok:
+            for problem in info.preflight_problems:
+                click.echo(f"      - {problem}")
 
 
 @cli.command()

@@ -81,6 +81,14 @@ HEALTH_CHECK_INTERVAL = 5.0         # seconds between health probes
 DEFAULT_SANDBOX_TIMEOUT = 300       # seconds before auto-cleanup (5 min)
 ERROR_CLEANUP_DELAY = 60            # seconds to keep error-state sandboxes before cleanup
 
+# ── Cloud-Hypervisor backend ─────────────────────────────────────────────
+CH_BINARY         = os.environ.get("FLINT_CH_BINARY", "/usr/local/bin/cloud-hypervisor")
+CH_CPU_COUNT      = int(os.environ.get("FLINT_CH_CPU_COUNT", "1"))
+CH_MEMORY_BYTES   = int(os.environ.get("FLINT_CH_MEMORY_BYTES", str(128 * 1024 * 1024)))
+CH_GOLDEN_DIR     = os.environ.get("FLINT_CH_GOLDEN_DIR", f"{DATA_DIR}/.golden-ch")
+CH_SLICE          = os.environ.get("FLINT_CH_SLICE", "flint.slice")
+CH_UID            = int(os.environ.get("FLINT_CH_UID", str(JAILER_UID)))
+
 # ── macOS Virtualization.framework backend ───────────────────────────────
 VZ_KERNEL_PATH = os.environ.get("FLINT_VZ_KERNEL_PATH", os.path.join(DATA_DIR, "vz", "vmlinux"))
 VZ_ROOTFS_PATH = os.environ.get("FLINT_VZ_ROOTFS_PATH", os.path.join(DATA_DIR, "vz", "rootfs.img"))
