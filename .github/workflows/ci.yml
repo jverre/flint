@@ -108,6 +108,23 @@ jobs:
         run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
+      - name: Probe backend plugin
+        run: |
+          set -euxo pipefail
+          uv run flint backends list
+          FLINT_BACKEND=${FLINT_BACKEND} uv run python -c "
+          import os
+          from flint.core.backends import resolve_backend
+          b = resolve_backend()
+          print('resolved:', b.name, b.kind)
+          print('preflight:', b.preflight())
+          "
       - name: Run tests
         run: sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/ -v -m "not slow"
         timeout-minutes: 10
+      - name: Dump daemon log on failure
+        if: failure()
+        run: |
+          echo "=== daemon log ==="
+          cat /tmp/flint-test-daemon.log || echo "(no log)"
+          echo "=== end daemon log ==="
