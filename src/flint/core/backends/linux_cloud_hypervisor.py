@@ -127,9 +127,6 @@ class LinuxCloudHypervisorBackend(HostBackend):
         )
 
     def start_pool(self) -> None:
-        # CH currently doesn't use a pre-warmed pool — fresh boot is fast
-        # enough for the test matrix, and the pool infra is keyed by
-        # firecracker-specific chroot staging.
         pass
 
     def stop_pool(self) -> None:

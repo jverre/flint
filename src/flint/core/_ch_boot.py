@@ -15,15 +15,15 @@ the pipeline simple and robust. Per-sandbox pause/resume uses
 from __future__ import annotations
 
 import os
-import platform
 import shutil
-import signal
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
 
 from . import _cloud_hypervisor as _ch
+from ._boot import _RecoveredProcess as _RecoveredChProcess, _timed
+from ._firecracker import _wait_for_agent
 from ._netns import (
     _delete_netns,
     _popen_in_ns,
@@ -35,11 +35,8 @@ from .config import (
     CH_CPU_COUNT,
     CH_MEMORY_BYTES,
     CH_GOLDEN_DIR,
-    CH_SLICE,
-    CH_UID,
     DATA_DIR,
     DEFAULT_TEMPLATE_ID,
-    GUEST_IP,
     GUEST_MAC,
     KERNEL_PATH,
     SOURCE_ROOTFS,
@@ -75,36 +72,6 @@ class ChBootResult:
     veth_ip: str = ""
     timings: dict[str, float] = field(default_factory=dict)
     t_total: float = 0.0
-
-
-class _RecoveredChProcess:
-    def __init__(self, pid: int) -> None:
-        self.pid = pid
-
-    def kill(self) -> None:
-        try:
-            os.kill(self.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-    def wait(self, timeout: float | None = None) -> None:
-        deadline = time.monotonic() + (timeout or 10)
-        while time.monotonic() < deadline:
-            try:
-                os.kill(self.pid, 0)
-                time.sleep(0.1)
-            except ProcessLookupError:
-                return
-
-
-def _timed(timings: dict, key: str):
-    class _Timer:
-        def __enter__(self):
-            self.t0 = time.monotonic()
-            return self
-        def __exit__(self, *_):
-            timings[key] = (time.monotonic() - self.t0) * 1000
-    return _Timer()
 
 
 def _build_vm_config(rootfs_path: str, tap_name: str) -> dict:
@@ -147,13 +114,17 @@ def _popen_cloud_hypervisor(
     )
 
 
-def _wait_for_agent(ns_name: str, retries: int = 500) -> str:
-    """Wait for flintd guest agent to become healthy. Returns agent_url."""
-    # Delegate to the FC helper — it's hypervisor-agnostic (it only uses the
-    # netns + GUEST_IP + AGENT_PORT constants) and already battle-tested.
-    from ._firecracker import _wait_for_agent as _fc_wait
-
-    return _fc_wait(ns_name, retries=retries)
+def _log_tail(path: str, nbytes: int = 2000) -> str:
+    """Return the last ``nbytes`` of ``path`` without loading the whole file."""
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-nbytes, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            return f.read().decode(errors="replace")
+    except OSError:
+        return ""
 
 
 def ch_boot_fresh(
@@ -244,12 +215,9 @@ def ch_boot_fresh(
         )
 
     except Exception:
-        try:
-            with open(log_path) as f:
-                tail = f.read()[-2000:]
-                log.error("ch boot failed — cloud-hypervisor log:\n%s", tail)
-        except OSError:
-            pass
+        tail = _log_tail(log_path)
+        if tail:
+            log.error("ch boot failed — cloud-hypervisor log:\n%s", tail)
         if process is not None:
             try:
                 process.kill()
@@ -322,11 +290,10 @@ def ch_resume_from_pause(
         else:
             _setup_netns_subprocess(ns_name, tap_name, internet=allow_internet_access)
 
-    if os.path.exists(socket_path):
-        try:
-            os.unlink(socket_path)
-        except OSError:
-            pass
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
 
     process = _popen_cloud_hypervisor(ns_name, socket_path, log_path)
 
@@ -342,12 +309,9 @@ def ch_resume_from_pause(
         with _timed(timings, "agent_connect_ms"):
             agent_url = _wait_for_agent(ns_name)
     except Exception:
-        try:
-            with open(log_path) as f:
-                tail = f.read()[-2000:]
-                log.error("ch resume failed — cloud-hypervisor log:\n%s", tail)
-        except OSError:
-            pass
+        tail = _log_tail(log_path)
+        if tail:
+            log.error("ch resume failed — cloud-hypervisor log:\n%s", tail)
         try:
             process.kill()
             process.wait(timeout=2)
@@ -371,14 +335,19 @@ def ch_resume_from_pause(
 
 def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_ROOTFS) -> None:
     """Install the default CH template (just a rootfs copy, no snapshot)."""
-    if not os.path.exists(source_rootfs):
-        raise RuntimeError(f"source rootfs not found: {source_rootfs}")
+    try:
+        source_size = os.path.getsize(source_rootfs)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"source rootfs not found: {source_rootfs}") from exc
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "rootfs.ext4")
-    if os.path.exists(dest) and os.path.getsize(dest) == os.path.getsize(source_rootfs):
-        return
+    try:
+        if os.path.getsize(dest) == source_size:
+            return
+    except FileNotFoundError:
+        pass
     subprocess.run(["cp", "--reflink=auto", source_rootfs, dest], check=True)
-    log.info("CH golden rootfs installed: %s (%d bytes)", dest, os.path.getsize(dest))
+    log.info("CH golden rootfs installed: %s (%d bytes)", dest, source_size)
 
 
 def ch_golden_ready(dest_dir: str = CH_GOLDEN_DIR) -> bool:
