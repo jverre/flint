@@ -190,3 +190,145 @@ def test_cli_start_rejects_unknown_backend():
     result = CliRunner().invoke(cli, ["start", "--backend", "does-not-exist"])
     assert result.exit_code != 0
     assert "does-not-exist" in result.output
+
+
+def test_ch_backend_metadata():
+    from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
+
+    assert LinuxCloudHypervisorBackend.name == "cloud-hypervisor"
+    assert LinuxCloudHypervisorBackend.kind == "linux-cloud-hypervisor"
+    assert LinuxCloudHypervisorBackend.display_name
+    assert "linux" in LinuxCloudHypervisorBackend.supported_platforms
+
+
+def test_ch_lifecycle_methods_raise_not_implemented():
+    """CH is a skeleton today — lifecycle calls must raise a clear error,
+    not silently return garbage. Lift these asserts when the boot pipeline lands."""
+    from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
+
+    backend = LinuxCloudHypervisorBackend()
+
+    with pytest.raises(NotImplementedError):
+        backend.create(
+            template_id="default",
+            allow_internet_access=False,
+            use_pool=False,
+            use_pyroute2=False,
+        )
+    with pytest.raises(NotImplementedError):
+        backend.pause(entry=None, state_store=None)
+    with pytest.raises(NotImplementedError):
+        backend.resume({})
+    with pytest.raises(NotImplementedError):
+        backend.build_template("x", "FROM alpine")
+
+
+def test_ch_recover_row_returns_dead():
+    """Recovery for a WIP backend should never claim a stale row is alive."""
+    from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
+
+    state, entry = LinuxCloudHypervisorBackend().recover_row({"vm_id": "x", "pid": 1})
+    assert state == "dead"
+    assert entry is None
+
+
+def test_ch_kind_registered_for_state_store_lookup():
+    """State-store rows persist `backend_kind="linux-cloud-hypervisor"`;
+    `get_backend` must resolve that long form too."""
+    backend = get_backend("linux-cloud-hypervisor")
+    assert backend.name == "cloud-hypervisor"
+    assert backend.kind == "linux-cloud-hypervisor"
+
+
+def test_ch_api_client_builds_http_request(monkeypatch):
+    """Smoke-test the HTTP-over-UDS protocol wrapper: verify it sends a
+    well-formed request and decodes the status code correctly. We replace the
+    socket with an in-memory fake so the test needs no real CH binary."""
+    import io
+    import flint.core._cloud_hypervisor as ch
+
+    sent: dict[str, bytes] = {}
+
+    class FakeSocket:
+        def __init__(self, *a, **kw):
+            self._buf = io.BytesIO()
+
+        def connect(self, path):
+            sent["path"] = path
+
+        def sendall(self, data):
+            sent["data"] = data
+
+        def recv(self, n):
+            if self._buf.tell() == 0:
+                self._buf.write(b"HTTP/1.1 204 No Content\r\n\r\n")
+                self._buf.seek(0)
+            return self._buf.read(n)
+
+        def settimeout(self, t): pass
+        def close(self): pass
+
+    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
+
+    status, body = ch.ch_put("/fake/sock", "/api/v1/vm.boot")
+    assert status == 204
+    assert ch.ch_status_ok(status)
+    assert sent["path"] == "/fake/sock"
+    assert sent["data"].startswith(b"PUT /api/v1/vm.boot HTTP/1.1\r\n")
+    assert b"Host: localhost" in sent["data"]
+
+
+def test_ch_api_client_serializes_json_body(monkeypatch):
+    import flint.core._cloud_hypervisor as ch
+
+    sent: dict[str, bytes] = {}
+
+    class FakeSocket:
+        def __init__(self, *a, **kw): pass
+        def connect(self, path): pass
+        def sendall(self, data): sent["data"] = data
+        def recv(self, n):
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        def settimeout(self, t): pass
+        def close(self): pass
+
+    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
+
+    ch.ch_put("/x", "/api/v1/vm.snapshot", {"destination_url": "file:///tmp/snap"})
+    data = sent["data"]
+    assert b"Content-Type: application/json" in data
+    assert b'"destination_url": "file:///tmp/snap"' in data
+
+
+def test_ch_api_client_rejects_error_status(monkeypatch):
+    """Helper wrappers (vm_create etc.) must raise on a non-2xx response."""
+    import flint.core._cloud_hypervisor as ch
+
+    class FakeSocket:
+        def __init__(self, *a, **kw): pass
+        def connect(self, p): pass
+        def sendall(self, d): pass
+        def recv(self, n):
+            return b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nnope!"
+        def settimeout(self, t): pass
+        def close(self): pass
+
+    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
+
+    with pytest.raises(RuntimeError, match="vm.boot"):
+        ch.vm_boot("/x")
+    with pytest.raises(RuntimeError, match="vm.create"):
+        ch.vm_create("/x", {"cpus": {"boot_vcpus": 1}})
+
+
+def test_ch_api_client_exposes_full_verb_surface():
+    """The protocol surface the plugin relies on must be importable."""
+    import flint.core._cloud_hypervisor as ch
+
+    for name in (
+        "ch_put", "ch_post", "ch_get", "ch_status_ok",
+        "wait_for_api_socket",
+        "vm_create", "vm_boot", "vm_pause", "vm_resume",
+        "vm_snapshot", "vm_restore", "vmm_shutdown",
+    ):
+        assert callable(getattr(ch, name)), name
