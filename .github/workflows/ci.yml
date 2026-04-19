@@ -117,7 +117,7 @@ jobs:
           sudo curl -fsSL \
             -o /root/firecracker-vm/vmlinux \
             "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin"
-          ls -la /root/firecracker-vm/vmlinux
+          sudo ls -la /root/firecracker-vm/vmlinux
           echo "install-ch-kernel:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs
         run: |
