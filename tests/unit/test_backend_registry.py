@@ -161,12 +161,13 @@ def test_fc_template_artifact_valid(tmp_path):
 
 
 def test_ch_template_artifact_valid(tmp_path):
+    """The CH default template is fresh-boot from rootfs.ext4 — no pre-baked
+    snapshot files are required for the artifact to count as valid."""
     from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
 
     backend = LinuxCloudHypervisorBackend()
     assert backend.template_artifact_valid(str(tmp_path)) is False
-    for f in ("rootfs.ext4", "config.json", "state.json", "memory-ranges"):
-        (tmp_path / f).write_bytes(b"")
+    (tmp_path / "rootfs.ext4").write_bytes(b"")
     assert backend.template_artifact_valid(str(tmp_path)) is True
 
 
@@ -201,35 +202,87 @@ def test_ch_backend_metadata():
     assert "linux" in LinuxCloudHypervisorBackend.supported_platforms
 
 
-def test_ch_lifecycle_methods_raise_not_implemented():
-    """CH is a skeleton today — lifecycle calls must raise a clear error,
-    not silently return garbage. Lift these asserts when the boot pipeline lands."""
+def test_ch_create_requires_golden_rootfs(monkeypatch, tmp_path):
+    """Calling create() when the CH golden rootfs is missing must raise a
+    clear RuntimeError instead of crashing deeper in the boot pipeline."""
     from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
 
-    backend = LinuxCloudHypervisorBackend()
+    monkeypatch.setenv("FLINT_CH_GOLDEN_DIR", str(tmp_path / "absent"))
+    import importlib
+    import flint.core.config as _cfg
+    importlib.reload(_cfg)
 
-    with pytest.raises(NotImplementedError):
+    # Re-import the plugin so it picks up the new golden-dir constant.
+    import flint.core.backends.linux_cloud_hypervisor as _mod
+    importlib.reload(_mod)
+
+    backend = _mod.LinuxCloudHypervisorBackend()
+    with pytest.raises(RuntimeError, match="golden"):
         backend.create(
             template_id="default",
             allow_internet_access=False,
             use_pool=False,
             use_pyroute2=False,
         )
-    with pytest.raises(NotImplementedError):
-        backend.pause(entry=None, state_store=None)
-    with pytest.raises(NotImplementedError):
-        backend.resume({})
-    with pytest.raises(NotImplementedError):
-        backend.build_template("x", "FROM alpine")
 
 
-def test_ch_recover_row_returns_dead():
-    """Recovery for a WIP backend should never claim a stale row is alive."""
+def test_ch_recover_row_returns_dead_for_missing_pid():
+    """Recovery of a row whose PID no longer exists must report 'dead'."""
     from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
 
-    state, entry = LinuxCloudHypervisorBackend().recover_row({"vm_id": "x", "pid": 1})
+    # PID 999999 is well above typical /proc/sys/kernel/pid_max on Linux CI
+    # runners and is extremely unlikely to be assigned.
+    state, entry = LinuxCloudHypervisorBackend().recover_row(
+        {"vm_id": "x", "pid": 999999, "vm_dir": "", "state": "Running"}
+    )
     assert state == "dead"
     assert entry is None
+
+
+def test_ch_recover_row_returns_paused_for_paused_row():
+    """Paused rows never need a live PID probe — they come back as paused."""
+    from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
+
+    state, entry = LinuxCloudHypervisorBackend().recover_row(
+        {"vm_id": "x", "pid": 0, "vm_dir": "", "state": "Paused"}
+    )
+    assert state == "paused"
+    assert entry is None
+
+
+def test_ch_backend_metadata_ns_and_tap_names():
+    """ns/tap helpers must use the ``ch-`` prefix so FC and CH can coexist
+    without colliding on the same host."""
+    from flint.core._ch_boot import _ch_ns_name, _ch_tap_name
+
+    ns = _ch_ns_name("abcdef12-0000-0000-0000-000000000000")
+    tap = _ch_tap_name("abcdef12-0000-0000-0000-000000000000")
+    assert ns.startswith("ch-")
+    assert tap.startswith("chtap-")
+
+
+def test_ch_build_vm_config_matches_ch_rest_schema():
+    """The config dict fed into ``vm.create`` must carry every field CH
+    requires to boot a disk+tap VM from a kernel payload."""
+    from flint.core._ch_boot import _build_vm_config
+
+    cfg = _build_vm_config("/vm/rootfs.ext4", "chtap-abcd1234")
+    assert cfg["cpus"]["boot_vcpus"] >= 1
+    assert cfg["memory"]["size"] > 0
+    assert cfg["payload"]["kernel"]
+    assert "root=/dev/vda" in cfg["payload"]["cmdline"]
+    assert cfg["disks"][0]["path"] == "/vm/rootfs.ext4"
+    assert cfg["net"][0]["tap"] == "chtap-abcd1234"
+    assert cfg["net"][0]["mac"]
+
+
+def test_ch_strip_ns_prefix_handles_fc_and_ch():
+    """The shared netns helpers key veth pair names by the vm-id suffix; the
+    split must work for both backends' prefixes."""
+    from flint.core._netns import _strip_ns_prefix
+
+    assert _strip_ns_prefix("fc-abcd1234") == "abcd1234"
+    assert _strip_ns_prefix("ch-abcd1234") == "abcd1234"
 
 
 def test_ch_kind_registered_for_state_store_lookup():

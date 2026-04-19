@@ -34,6 +34,22 @@ def _ns_name(vm_id: str) -> str:
     return f"fc-{vm_id[:8]}"
 
 
+def _strip_ns_prefix(ns_name: str) -> str:
+    """Return the vm-id suffix of a Flint netns name.
+
+    Flint wraps each VM's netns in a per-backend prefix (``fc-``, ``ch-``,
+    …) so the same vm-id doesn't collide across backends on the same host.
+    Shared veth/iptables helpers only need the suffix. Fall back to the
+    whole name if there's no recognized prefix.
+    """
+    for prefix in ("fc-", "ch-"):
+        if ns_name.startswith(prefix):
+            return ns_name[len(prefix):]
+    # Generic fallback: take everything after the first '-' if any.
+    _, _, rest = ns_name.partition("-")
+    return rest or ns_name
+
+
 def _create_netns(ns_name: str) -> None:
     try:
         pynetns.create(ns_name)
@@ -179,7 +195,7 @@ def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True)
     # Set up veth pair for internet access
     veth_ip = ""
     if internet:
-        veth_ip = _setup_veth_pair(ns_name, ns_name.removeprefix("fc-"))
+        veth_ip = _setup_veth_pair(ns_name, _strip_ns_prefix(ns_name))
     return veth_ip
 
 
@@ -199,7 +215,7 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
         return ""
 
     # Set up veth pair for internet access
-    vm_id_prefix = ns_name.removeprefix("fc-")
+    vm_id_prefix = _strip_ns_prefix(ns_name)
     _ensure_bridge()
 
     veth_host = f"vh-{vm_id_prefix}"
