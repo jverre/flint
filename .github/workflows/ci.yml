@@ -112,12 +112,16 @@ jobs:
           ls -la /root/firecracker-vm/vmlinux
       - name: Download Alpine minirootfs
         run: |
+          set -x
           sudo mkdir -p /root/firecracker-vm
           curl -fsSL -o /tmp/alpine.tar.gz \
-            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
+            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee /tmp/alpine-download.log
+          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee -a /tmp/alpine-download.log
+          sudo ls -la /root/firecracker-vm | tee -a /tmp/alpine-download.log
       - name: Build rootfs
-        run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+        run: |
+          sudo -E env "PATH=$PATH" bash -x setup-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
+          exit ${PIPESTATUS[0]}
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
       - name: Probe backend plugin
@@ -157,8 +161,16 @@ jobs:
             echo '--- /root/firecracker-vm ---'
             sudo ls -la /root/firecracker-vm 2>/dev/null || echo '(missing)'
             echo
-            echo '--- /root/firecracker-vm/rootfs ---'
-            sudo ls -la /root/firecracker-vm/rootfs 2>/dev/null || echo '(missing)'
+            echo '```'
+            echo
+            echo "#### Alpine download log"
+            echo '```'
+            tail -c 2000 /tmp/alpine-download.log 2>/dev/null || echo '(no alpine log)'
+            echo '```'
+            echo
+            echo "#### setup-rootfs.sh log (last 4000 chars)"
+            echo '```'
+            tail -c 4000 /tmp/build-rootfs.log 2>/dev/null || echo '(no build-rootfs log)'
             echo '```'
             echo
             echo "#### Probe log"
