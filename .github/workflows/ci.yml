@@ -89,9 +89,13 @@ jobs:
       - name: Install cloud-hypervisor
         if: matrix.backend == 'cloud-hypervisor'
         run: |
-          sudo curl -fsSL -o /usr/local/bin/cloud-hypervisor \
-            https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
-          sudo chmod +x /usr/local/bin/cloud-hypervisor
+          set -euxo pipefail
+          CH_VERSION="v46.0"
+          URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          curl -fsSL -o /tmp/cloud-hypervisor "$URL"
+          ls -la /tmp/cloud-hypervisor
+          file /tmp/cloud-hypervisor
+          sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
           /usr/local/bin/cloud-hypervisor --version
       - name: Download Alpine minirootfs
         run: |
