@@ -18,8 +18,8 @@ import os
 import platform
 import shutil
 
+from flint.core import config as _cfg
 from flint.core.config import (
-    CH_BINARY,
     CH_GOLDEN_DIR,
     log,
 )
@@ -38,9 +38,12 @@ class LinuxCloudHypervisorBackend(HostBackend):
         problems = super().preflight()
         if problems:
             return problems
-        if not os.path.exists(CH_BINARY) and not shutil.which("cloud-hypervisor"):
+        # Read CH_BINARY from the live config module so env-var overrides
+        # (e.g. in tests that reload config) are honored.
+        binary = _cfg.CH_BINARY
+        if not os.path.exists(binary) and not shutil.which("cloud-hypervisor"):
             problems.append(
-                f"cloud-hypervisor binary not found at {CH_BINARY} or on PATH"
+                f"cloud-hypervisor binary not found at {binary} or on PATH"
             )
         return problems
 
