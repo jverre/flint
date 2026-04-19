@@ -149,6 +149,18 @@ jobs:
             echo
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
+            echo "#### Filesystem state"
+            echo '```'
+            echo '--- /usr/local/bin ---'
+            ls -la /usr/local/bin 2>/dev/null | grep -E 'firecracker|jailer|cloud-hypervisor' || echo '(no relevant binaries)'
+            echo
+            echo '--- /root/firecracker-vm ---'
+            sudo ls -la /root/firecracker-vm 2>/dev/null || echo '(missing)'
+            echo
+            echo '--- /root/firecracker-vm/rootfs ---'
+            sudo ls -la /root/firecracker-vm/rootfs 2>/dev/null || echo '(missing)'
+            echo '```'
+            echo
             echo "#### Probe log"
             echo '```'
             tail -c 4000 /tmp/probe.log 2>/dev/null || echo '(no probe log)'

@@ -205,16 +205,13 @@ def test_ch_backend_metadata():
 def test_ch_create_requires_golden_rootfs(monkeypatch, tmp_path):
     """Calling create() when the CH golden rootfs is missing must raise a
     clear RuntimeError instead of crashing deeper in the boot pipeline."""
-    from flint.core.backends.linux_cloud_hypervisor import LinuxCloudHypervisorBackend
-
-    monkeypatch.setenv("FLINT_CH_GOLDEN_DIR", str(tmp_path / "absent"))
-    import importlib
-    import flint.core.config as _cfg
-    importlib.reload(_cfg)
-
-    # Re-import the plugin so it picks up the new golden-dir constant.
     import flint.core.backends.linux_cloud_hypervisor as _mod
-    importlib.reload(_mod)
+
+    # The plugin captures CH_GOLDEN_DIR from config at import time; patch the
+    # already-imported binding rather than reloading the module (a reload
+    # re-runs the `_register(...)` side effect, which collides with the class
+    # already in the registry).
+    monkeypatch.setattr(_mod, "CH_GOLDEN_DIR", str(tmp_path / "absent"))
 
     backend = _mod.LinuxCloudHypervisorBackend()
     with pytest.raises(RuntimeError, match="golden"):
