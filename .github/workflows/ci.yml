@@ -83,15 +83,21 @@ jobs:
         run: go get ./... && go mod tidy && go build -o r2nfs .
       - name: Enable KVM access
         run: |
+          echo "enable-kvm:start" >> /tmp/step-markers
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          echo "enable-kvm:end" >> /tmp/step-markers
       - name: Install Firecracker + kernel
         if: matrix.backend == 'firecracker'
-        run: sudo bash scripts/install-deps.sh
+        run: |
+          echo "install-fc:start" >> /tmp/step-markers
+          sudo bash scripts/install-deps.sh
+          echo "install-fc:end" >> /tmp/step-markers
       - name: Install cloud-hypervisor
         if: matrix.backend == 'cloud-hypervisor'
         run: |
+          echo "install-ch:start" >> /tmp/step-markers
           set -euxo pipefail
           CH_VERSION="v46.0"
           URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
@@ -100,9 +106,11 @@ jobs:
           file /tmp/cloud-hypervisor
           sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
           /usr/local/bin/cloud-hypervisor --version
+          echo "install-ch:end" >> /tmp/step-markers
       - name: Install kernel (for cloud-hypervisor)
         if: matrix.backend == 'cloud-hypervisor'
         run: |
+          echo "install-ch-kernel:start" >> /tmp/step-markers
           set -euxo pipefail
           sudo mkdir -p /root/firecracker-vm
           ARCH="$(uname -m)"
@@ -110,18 +118,24 @@ jobs:
             -o /root/firecracker-vm/vmlinux \
             "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin"
           ls -la /root/firecracker-vm/vmlinux
+          echo "install-ch-kernel:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs
         run: |
+          echo "alpine:start" >> /tmp/step-markers
           set -x
           sudo mkdir -p /root/firecracker-vm
           curl -fsSL -o /tmp/alpine.tar.gz \
             https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee /tmp/alpine-download.log
           sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee -a /tmp/alpine-download.log
           sudo ls -la /root/firecracker-vm | tee -a /tmp/alpine-download.log
+          echo "alpine:end" >> /tmp/step-markers
       - name: Build rootfs
         run: |
+          echo "build-rootfs:start" >> /tmp/step-markers
           sudo -E env "PATH=$PATH" bash -x setup-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
-          exit ${PIPESTATUS[0]}
+          rc=${PIPESTATUS[0]}
+          echo "build-rootfs:end:$rc" >> /tmp/step-markers
+          exit $rc
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
       - name: Probe backend plugin
@@ -153,6 +167,11 @@ jobs:
             echo
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
+            echo "#### Step markers"
+            echo '```'
+            cat /tmp/step-markers 2>/dev/null || echo '(no step markers)'
+            echo '```'
+            echo
             echo "#### Filesystem state"
             echo '```'
             echo '--- /usr/local/bin ---'
@@ -161,6 +180,8 @@ jobs:
             echo '--- /root/firecracker-vm ---'
             sudo ls -la /root/firecracker-vm 2>/dev/null || echo '(missing)'
             echo
+            echo '--- /tmp (relevant) ---'
+            ls -la /tmp 2>/dev/null | grep -E 'alpine|build-rootfs|probe|pytest|step-markers|flint' || echo '(no relevant tmp files)'
             echo '```'
             echo
             echo "#### Alpine download log"
