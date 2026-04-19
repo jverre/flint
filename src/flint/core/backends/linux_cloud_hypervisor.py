@@ -60,8 +60,22 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
     def ensure_default_template(self) -> None:
         os.makedirs(CH_GOLDEN_DIR, exist_ok=True)
+        # The full CH boot/snapshot pipeline isn't implemented yet — but we
+        # still register a placeholder "default" row so the template registry
+        # is discoverable from /templates and `golden_ready` correctly reports
+        # False. The FC leg of the artifact dict is untouched.
+        from flint.core._template_registry import register_template_artifact
+        from flint.core.config import DEFAULT_TEMPLATE_ID
+
+        register_template_artifact(
+            DEFAULT_TEMPLATE_ID,
+            "Default (Alpine)",
+            self.kind,
+            CH_GOLDEN_DIR,
+            status="pending",
+        )
         log.info(
-            "cloud-hypervisor default template is not yet auto-generated "
+            "cloud-hypervisor default template registered as pending "
             "(CH_GOLDEN_DIR=%s)",
             CH_GOLDEN_DIR,
         )
