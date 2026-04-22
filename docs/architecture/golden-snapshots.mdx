@@ -1,9 +1,13 @@
 ---
 title: "Golden snapshots"
-description: "How Flint achieves sub-100ms boot times."
+description: "How the Firecracker backend achieves sub-100ms boot times."
 ---
 
-The core trick behind Flint's fast startup is the golden snapshot. Instead of booting a VM from scratch every time - which takes seconds - Flint boots a VM once, snapshots it at the point where it's fully ready, and then loads that snapshot for every new sandbox.
+<Info>
+This page describes the **Firecracker** backend's boot strategy. Cloud-Hypervisor does a fresh boot against a prepared rootfs (no snapshot load); macOS-VZ uses Virtualization.framework's own start flow. Same `Sandbox` API, different mechanism underneath.
+</Info>
+
+The core trick behind the Firecracker backend's fast startup is the golden snapshot. Instead of booting a VM from scratch every time — which takes seconds — Flint boots a VM once, snapshots it at the point where it's fully ready, and then loads that snapshot for every new sandbox.
 
 Loading a snapshot is much faster than booting because the kernel and init process have already done all their work. The VM just resumes from a known-good state.
 

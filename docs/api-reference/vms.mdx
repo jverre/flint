@@ -87,7 +87,7 @@ curl -X POST "http://localhost:9100/vms?template_id=default"
 
 `DELETE /vms/{vm_id}`
 
-Terminates the Firecracker process and cleans up all resources.
+Terminates the hypervisor process and cleans up all resources.
 
 **Response** `200`
 
@@ -101,7 +101,7 @@ Terminates the Firecracker process and cleans up all resources.
 
 `POST /vms/{vm_id}/pause`
 
-Snapshots the VM state to disk and stops the Firecracker process. All memory and filesystem state is preserved.
+Snapshots the VM state to disk and stops the hypervisor process. All memory and filesystem state is preserved.
 
 Only works when the sandbox is in the `Running` state.
 

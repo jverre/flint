@@ -5,9 +5,9 @@ description: "Start a sandbox and run your first command."
 
 ## Prerequisites
 
-- Linux with KVM enabled (`/dev/kvm` must exist)
-- Python 3.11+
-- Root access (for installing binaries and managing VMs)
+- **Linux** with KVM enabled (`/dev/kvm` must exist) — or **macOS** on Apple Silicon with the Virtualization entitlement
+- Python 3.12+
+- Root access (for installing binaries and managing VMs on Linux)
 
 ## Installation
 
@@ -22,46 +22,56 @@ description: "Start a sandbox and run your first command."
     ```bash
     git clone https://github.com/jverre/flint
     cd flint
-    pip install -e .
+    uv sync
     ```
   </Step>
 
-  <Step title="Install Firecracker, jailer, and kernel">
-    This downloads and installs the Firecracker binaries and vmlinux kernel. You only need to do this once.
+  <Step title="Install a hypervisor (Linux only)">
+    Flint ships with two Linux backend plugins: **Firecracker** and **Cloud-Hypervisor**. Install either (or both) — you pick which one runs at daemon startup.
 
     ```bash
+    # Firecracker — ships with the install-deps helper (also installs the vmlinux kernel)
     sudo flint install-deps
+
+    # Cloud-Hypervisor — download the release binary
+    curl -fsSL -o /tmp/ch https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v46.0/cloud-hypervisor-static
+    sudo install -m 755 /tmp/ch /usr/local/bin/cloud-hypervisor
     ```
 
-    To pin a specific Firecracker version:
-
-    ```bash
-    sudo flint install-deps --version v1.10.1
-    ```
-
-    To verify what is installed:
-
-    ```bash
-    sudo flint install-deps --check
-    ```
+    On macOS, skip this step — `flint setup-macos` below handles it.
   </Step>
 
   <Step title="Build the base rootfs">
-    This builds the Alpine Linux rootfs with the `flintd` guest agent. You only need to do this once.
+    On Linux:
 
     ```bash
     sudo bash setup-rootfs.sh
     ```
+
+    On macOS:
+
+    ```bash
+    flint setup-macos
+    ```
+
+    You only need to do this once.
   </Step>
 
   <Step title="Start the daemon">
-    The daemon manages all VM lifecycle in the background. It listens on `localhost:9100` by default.
+    The daemon manages all VM lifecycle in the background. It listens on `localhost:9100` by default and auto-selects a backend based on your host:
 
     ```bash
     sudo flint start
     ```
 
-    You should see it print `Golden snapshot ready` when it's good to go.
+    To pick a specific backend:
+
+    ```bash
+    sudo flint start --backend cloud-hypervisor
+    # or: FLINT_BACKEND=cloud-hypervisor sudo flint start
+    ```
+
+    You should see it print `Golden snapshot ready` (Firecracker) or the equivalent ready marker for your backend.
   </Step>
 
   <Step title="Run your first sandbox">
@@ -82,15 +92,18 @@ description: "Start a sandbox and run your first command."
 
 When you called `Sandbox()`, the daemon:
 
-1. Grabbed a pre-copied rootfs from the pool
-2. Set up a network namespace with a TAP device
-3. Loaded the golden snapshot into a new Firecracker process
-4. Waited for the guest agent (`flintd`) to be healthy
+1. Picked the configured backend (Firecracker, Cloud-Hypervisor, or macOS-VZ)
+2. Grabbed a pre-copied rootfs from the pool
+3. Set up a network namespace with a TAP device (Linux) or internal network (macOS)
+4. Booted the VM — either by loading the golden snapshot (Firecracker) or doing a fast fresh boot (Cloud-Hypervisor, macOS-VZ)
+5. Waited for the guest agent (`flintd`) to be healthy
 
-The whole thing took somewhere between 50-150ms depending on your machine. The `commands.run()` call then proxied your shell command through `flintd` inside the VM.
+The whole thing took 50–150ms on Linux and a few hundred ms on macOS. The `commands.run()` call then proxied your shell command through `flintd` inside the VM.
 
 ## Next steps
 
-- [Python SDK](/sdk/sandbox) - everything the `Sandbox` class can do
-- [Templates](/sdk/templates) - create custom sandbox environments from Docker images
-- [TUI](/cli/app) - manage sandboxes interactively
+- [Python SDK](/sdk/sandbox) — everything the `Sandbox` class can do
+- [Agents](/sdk/agents) — deploy Hermes, OpenClaw, or your own AI agent in one call
+- [Templates](/sdk/templates) — create custom sandbox environments from Docker images
+- [Backends](/cli/backends) — choose and inspect hypervisor backends
+- [TUI](/cli/app) — manage sandboxes interactively

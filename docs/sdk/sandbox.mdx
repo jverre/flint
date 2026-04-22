@@ -83,7 +83,7 @@ description: "The main interface for creating and managing microVMs."
 ```python
 sandbox.id            # str - UUID of this VM
 sandbox.state         # str - current state
-sandbox.pid           # int - host PID of the Firecracker process
+sandbox.pid           # int - host PID of the hypervisor process
 sandbox.created_at    # float - creation timestamp (unix time)
 sandbox.ready_time_ms # float | None - total boot time in ms
 sandbox.timings       # dict[str, float] - per-step timing breakdown
@@ -129,7 +129,7 @@ print(sandbox.timings)
 
 ## pause
 
-Snapshot the VM state to disk. The Firecracker process is stopped but all memory and filesystem state is preserved.
+Snapshot the VM state to disk. The hypervisor process is stopped but all memory and filesystem state is preserved.
 
 <Tabs>
   <Tab title="Python SDK">

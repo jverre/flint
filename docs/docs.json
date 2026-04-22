@@ -47,6 +47,7 @@
             "group": "Python SDK",
             "pages": [
               "sdk/sandbox",
+              "sdk/agents",
               "sdk/commands",
               "sdk/pty",
               "sdk/templates"
@@ -62,6 +63,8 @@
             "pages": [
               "cli/overview",
               "cli/start",
+              "cli/backends",
+              "cli/agents",
               "cli/app",
               "cli/list",
               "cli/stop"
@@ -94,6 +97,7 @@
             "group": "How it works",
             "pages": [
               "architecture/overview",
+              "architecture/backends",
               "architecture/golden-snapshots",
               "architecture/networking",
               "architecture/guest-agent"
