@@ -1,12 +1,14 @@
 from textual.theme import Theme
 
-BACKGROUND_HEX = "#252b36"
-SURFACE_HEX = "#2c3340"
-PANEL_HEX = "#363f4f"
-BORDER_HEX = "#485162"
-BORDER_MUTED_HEX = "#353d4c"
-TEXT_HEX = "#d7dbe5"
-MUTED_HEX = "#97a0b3"
+# High-contrast dark palette — distinct shades between bg / surface / panel so
+# regions are visible on terminals that compress close hues.
+BACKGROUND_HEX = "#151922"
+SURFACE_HEX = "#1f2633"
+PANEL_HEX = "#2b3446"
+BORDER_HEX = "#5a6477"
+BORDER_MUTED_HEX = "#3b4354"
+TEXT_HEX = "#eef1f7"
+MUTED_HEX = "#9ea7ba"
 PRIMARY_HEX = "#7d96c3"
 SECONDARY_HEX = "#5d6f91"
 ACCENT_HEX = "#8eb5d9"
