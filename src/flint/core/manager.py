@@ -114,10 +114,6 @@ class SandboxManager:
                 timings_json=entry.timings,
                 chroot_base=boot.chroot_base,
                 backend_kind=entry.backend_kind,
-                backend_vm_ref=entry.backend_vm_ref,
-                runtime_dir=entry.runtime_dir,
-                guest_arch=entry.guest_arch,
-                transport_ref=entry.transport_ref,
                 backend_meta_json=entry.backend_metadata,
             )
 
@@ -211,8 +207,8 @@ class SandboxManager:
             backend_kind=row.get("backend_kind") or self._backend.kind,
             backend_vm_ref=boot.backend_vm_ref or sandbox_id,
             runtime_dir=boot.runtime_dir or boot.vm_dir,
-            guest_arch=boot.guest_arch or row.get("guest_arch") or "",
-            transport_ref=boot.transport_ref or row.get("transport_ref") or "",
+            guest_arch=boot.guest_arch,
+            transport_ref=boot.transport_ref,
             backend_metadata=dict(boot.backend_metadata),
         )
 
@@ -226,9 +222,6 @@ class SandboxManager:
                 sandbox_id,
                 pid=boot.pid,
                 daemon_pid=os.getpid(),
-                runtime_dir=entry.runtime_dir,
-                guest_arch=entry.guest_arch,
-                transport_ref=entry.transport_ref,
                 backend_meta_json=json.dumps(entry.backend_metadata),
             )
 

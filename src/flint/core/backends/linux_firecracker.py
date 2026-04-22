@@ -266,8 +266,8 @@ class LinuxFirecrackerBackend(HostBackend):
             chroot_base=chroot_base,
             backend_vm_ref=sandbox_id,
             runtime_dir=vm_dir,
-            guest_arch=row.get("guest_arch") or platform.machine().lower(),
-            transport_ref=row.get("transport_ref") or f"netns:{ns_name}",
+            guest_arch=platform.machine().lower(),
+            transport_ref=f"netns:{ns_name}",
             backend_metadata={
                 "socket_path": socket_path,
                 "ns_name": ns_name,
@@ -433,17 +433,17 @@ class LinuxFirecrackerBackend(HostBackend):
             vm_dir=vm_dir,
             socket_path=row["socket_path"],
             ns_name=ns_name,
-            guest_ip=row.get("guest_ip") or GUEST_IP,
+            guest_ip=GUEST_IP,
             agent_url=agent_url,
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
             chroot_base=row.get("chroot_base") or "",
             backend_kind=row.get("backend_kind") or self.kind,
-            backend_vm_ref=row.get("backend_vm_ref") or vm_id,
-            runtime_dir=row.get("runtime_dir") or vm_dir,
-            guest_arch=row.get("guest_arch") or "linux",
-            transport_ref=row.get("transport_ref") or f"netns:{ns_name}",
+            backend_vm_ref=vm_id,
+            runtime_dir=vm_dir,
+            guest_arch=platform.machine().lower(),
+            transport_ref=f"netns:{ns_name}",
         )
         return "alive", entry
 

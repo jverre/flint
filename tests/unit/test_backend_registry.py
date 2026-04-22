@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from flint.core.backends import (
@@ -132,6 +134,7 @@ def test_plugin_metadata_is_set():
         assert info.kind, "plugin missing kind"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="CH backend preflight is only reachable on Linux")
 def test_ch_backend_preflight_fails_when_binary_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("FLINT_CH_BINARY", str(tmp_path / "nope"))
     # Reimport the CH module so it picks up the overridden env var. The plugin
