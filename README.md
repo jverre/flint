@@ -327,18 +327,44 @@ agent = Agent.deploy("my-agent")
 
 ## 💻 TUI
 
-The TUI connects to the daemon and gives you an interactive terminal into each VM.
+A full dashboard for the daemon: VM list + tabbed detail view, live event stream (no polling), a fuzzy command palette, and dedicated screens for Volumes / Templates / Limits / Playground.
+
+<p align="center">
+  <img src="assets/tui-dashboard.png" alt="Flint dashboard — sidebar with filterable VM list, tabbed detail view (Overview · Terminal · Logs · Metrics · Exec) showing a live shell, WS-connected status in the footer" width="900">
+</p>
+
+### Home — sidebar + tabbed detail
+
+- **Sidebar**: VM list with status dots, filter input, multi-select (`space`), live updates from the daemon's event stream.
+- **Detail tabs** for the selected VM:
+  - **Overview** — metadata + boot-timing bar chart
+  - **Terminal** — interactive shell (VT100 via pyte)
+  - **Logs** — streaming kernel/agent log lines with regex filter + follow toggle
+  - **Metrics** — 1 Hz CPU% and RSS sparklines (last 60 samples)
+  - **Exec** — command history with re-run
+
+### Screens
+
+| Key | Screen | What it does |
+|-----|--------|--------------|
+| `Ctrl+P` | Command palette | Fuzzy-match screens + per-VM actions (kill / pause / resume / create) |
+| `Ctrl+V` | Volumes | Create / list / delete sparse image volumes |
+| `Ctrl+T` | Templates | Built templates + the agents catalog; launch or inspect |
+| `Ctrl+L` | Limits | View + edit daemon config overrides (pool size, timeouts, …) |
+| `Ctrl+G` | Playground | Spawn an ephemeral VM, run a script, auto-kill on exit |
+| `Ctrl+B` | Benchmark | Boot N VMs and chart per-step timings |
+| `?` | Keybindings | Auto-generated from the live binding table |
+
+### Home keybindings
 
 | Key | Action |
 |-----|--------|
-| `+` | New VM |
-| `Ctrl+D` | Delete VM |
-| `Ctrl+Up` | Previous VM |
-| `Ctrl+Down` | Next VM |
-| `Ctrl+B` | Run benchmark |
-| `Ctrl+K` | Show keybindings |
+| `+` / click `+ VM` | New VM |
+| `Ctrl+Up` / `Ctrl+Down` | Move selection |
+| `Space` | Toggle multi-select |
+| `Ctrl+D` | Kill the selected VM (or all multi-selected VMs, with a progress toast) |
 
-> **Tip:** The sidebar auto-refreshes. You can also manage VMs from the CLI while the TUI is running.
+> **Live state**: the TUI subscribes to `WS /events` and patches its cache on `vm.*` / `volume.*` events — no polling. The footer shows `ws: connected` / `ws: reconnecting…`. On a reconnect, the full list is refetched to re-sync.
 
 ## 🖥️ CLI
 
@@ -417,11 +443,29 @@ The daemon exposes a REST API and WebSocket endpoint on `localhost:9100`.
 | `GET` | `/templates/{template_id}` | Get template details |
 | `DELETE` | `/templates/{template_id}` | Delete a template |
 
-### Terminal / Health
+### Volumes
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/volumes` | List volumes |
+| `POST` | `/volumes` | Create a sparse image volume (`{name, size_gib}`) |
+| `DELETE` | `/volumes/{volume_id}` | Delete a volume |
+
+### Metrics / Config
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/vms/{vm_id}/metrics?window=N` | Last N (≤60) per-second CPU% / RSS samples |
+| `GET` | `/config` | Current config + persisted overrides |
+| `PATCH` | `/config` | Save config overrides (applied on next daemon restart) |
+
+### Streams / Health
 
 | Protocol | Endpoint | Description |
 |----------|----------|-------------|
 | `WS` | `/vms/{vm_id}/terminal` | Interactive terminal (binary WebSocket frames) |
+| `WS` | `/vms/{vm_id}/logs` | Kernel + daemon lifecycle log lines for one VM |
+| `WS` | `/events` | Daemon-wide event bus: `vm.created`, `vm.deleted`, `vm.state_changed`, `vm.paused`, `vm.resumed`, `volume.created`, `volume.deleted` |
 | `GET` | `/health` | Health check + golden snapshot status + backend info |
 
 ### Examples
