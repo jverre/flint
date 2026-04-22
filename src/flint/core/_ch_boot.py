@@ -186,7 +186,7 @@ def ch_boot_fresh(
             process = _popen_cloud_hypervisor(ns_name, socket_path, log_path)
 
         with _timed(timings, "wait_api_ready_ms"):
-            _ch.wait_for_api_socket(socket_path)
+            _ch.wait_for_api_socket(socket_path, process=process, log_path=log_path)
 
         with _timed(timings, "api_vm_create_ms"):
             _ch.vm_create(socket_path, _build_vm_config(rootfs_path, tap_name))
@@ -301,7 +301,7 @@ def ch_resume_from_pause(
     t_total = time.monotonic()
     try:
         with _timed(timings, "wait_api_ready_ms"):
-            _ch.wait_for_api_socket(socket_path)
+            _ch.wait_for_api_socket(socket_path, process=process, log_path=log_path)
         with _timed(timings, "api_vm_restore_ms"):
             _ch.vm_restore(socket_path, f"file://{pause_dir}")
         with _timed(timings, "api_vm_resume_ms"):

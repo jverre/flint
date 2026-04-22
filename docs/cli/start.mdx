@@ -19,8 +19,8 @@ flint start [OPTIONS]
 |--------|---------|-------------|
 | `--backend` | host default | Backend plugin (`firecracker`, `cloud-hypervisor`, `macos-vz`) |
 | `--port` | `9100` | Port to listen on |
-| `--data-dir` | `/microvms` (Linux), `~/Library/Application Support/flint/data` (macOS) | Directory for VM data (rootfs images, snapshots) |
-| `--state-dir` | `/tmp/flint` (Linux), `~/Library/Application Support/flint/state` (macOS) | Directory for daemon state (db, pid file, logs) |
+| `--data-dir` | `/var/lib/flint/data` (Linux), `~/Library/Application Support/flint/data` (macOS) | Directory for VM data (rootfs images, snapshots) |
+| `--state-dir` | `/var/lib/flint/state` (Linux), `~/Library/Application Support/flint/state` (macOS) | Directory for daemon state (db, pid file, logs) |
 
 These can also be set via environment variables: `FLINT_BACKEND`, `FLINT_PORT`, `FLINT_DATA_DIR`, `FLINT_STATE_DIR`.
 
