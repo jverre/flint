@@ -10,8 +10,8 @@ on:
     paths:
       - "agents/**"
   schedule:
-    # Weekly rebuild (Monday 06:00 UTC) to pull upstream updates
-    - cron: "0 6 * * 1"
+    # Daily rebuild (06:00 UTC) to pull upstream updates
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       agent:
