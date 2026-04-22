@@ -218,6 +218,41 @@ class DaemonClient:
         resp = self._http.delete(f"/templates/{template_id}")
         resp.raise_for_status()
 
+    # ── Volumes ───────────────────────────────────────────────────────────
+
+    def list_volumes(self) -> list[dict]:
+        resp = self._http.get("/volumes")
+        resp.raise_for_status()
+        return resp.json()["volumes"]
+
+    def create_volume(self, name: str, size_gib: int) -> dict:
+        resp = self._http.post("/volumes", json={"name": name, "size_gib": size_gib})
+        resp.raise_for_status()
+        return resp.json()["volume"]
+
+    def delete_volume(self, volume_id: str) -> None:
+        resp = self._http.delete(f"/volumes/{volume_id}")
+        resp.raise_for_status()
+
+    # ── Config / limits ────────────────────────────────────────────────────
+
+    def get_config(self) -> dict:
+        resp = self._http.get("/config")
+        resp.raise_for_status()
+        return resp.json()
+
+    def patch_config(self, overrides: dict) -> dict:
+        resp = self._http.patch("/config", json=overrides)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Metrics ───────────────────────────────────────────────────────────
+
+    def get_metrics(self, vm_id: str, window: int = 60) -> list[dict]:
+        resp = self._http.get(f"/vms/{vm_id}/metrics", params={"window": window})
+        resp.raise_for_status()
+        return resp.json()["samples"]
+
     @staticmethod
     def is_daemon_running(base_url: str = DEFAULT_URL) -> bool:
         try:

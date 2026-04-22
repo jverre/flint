@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import platform
@@ -101,6 +102,37 @@ VZ_READY_TIMEOUT = float(os.environ.get("FLINT_VZ_READY_TIMEOUT", "60"))
 # ── Storage backend ─────────────────────────────────────────────────────
 STORAGE_BACKEND = os.environ.get("FLINT_STORAGE_BACKEND", "local")  # "local" | "s3_files" | "r2"
 WORKSPACE_DIR = os.environ.get("FLINT_WORKSPACE_DIR", "/workspace")
+
+# ── Runtime-editable overrides ──────────────────────────────────────────
+CONFIG_OVERRIDES_PATH = f"{STATE_DIR}/config.json"
+CONFIG_FIELDS = {
+    "pool_target_size": ("POOL_TARGET_SIZE", int),
+    "default_sandbox_timeout": ("DEFAULT_SANDBOX_TIMEOUT", int),
+    "health_check_interval": ("HEALTH_CHECK_INTERVAL", float),
+    "error_cleanup_delay": ("ERROR_CLEANUP_DELAY", int),
+}
+
+
+def _apply_config_overrides() -> None:
+    """Load overrides from CONFIG_OVERRIDES_PATH and patch module globals."""
+    try:
+        with open(CONFIG_OVERRIDES_PATH) as f:
+            overrides = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    g = globals()
+    for key, value in overrides.items():
+        meta = CONFIG_FIELDS.get(key)
+        if not meta:
+            continue
+        const_name, typ = meta
+        try:
+            g[const_name] = typ(value)
+        except (TypeError, ValueError):
+            log.warning("Invalid override for %s: %r", key, value)
+
+
+_apply_config_overrides()
 
 # S3 Files backend
 S3_FILES_NFS_ENDPOINT = os.environ.get("FLINT_S3_FILES_NFS_ENDPOINT", "")
