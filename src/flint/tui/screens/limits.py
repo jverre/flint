@@ -20,14 +20,14 @@ FIELDS = [
 
 class LimitsScreen(Screen):
     CSS = """
-    LimitsScreen { background: $background; }
-    LimitsScreen #limits-header { height: 3; padding: 1 2; background: $surface; }
-    LimitsScreen #limits-title { color: $text-muted; }
+    LimitsScreen { background: $background; color: $text; }
+    LimitsScreen #limits-header { height: 3; padding: 1 2; background: $surface; color: $text; }
+    LimitsScreen #limits-title { color: $text; }
     LimitsScreen #limits-hint { color: $text-muted; padding-top: 0; }
-    LimitsScreen #limits-body { padding: 1 2; height: 1fr; }
+    LimitsScreen #limits-body { padding: 1 2; height: 1fr; background: $surface; color: $text; }
     LimitsScreen .field-row { height: 3; padding: 0 0 1 0; }
     LimitsScreen .field-label { width: 42; color: $text-muted; }
-    LimitsScreen .field-value { width: 1fr; padding: 0 1; }
+    LimitsScreen .field-value { width: 1fr; padding: 0 1; background: $panel; color: $text; }
     LimitsScreen #save-row { height: auto; padding-top: 1; }
     LimitsScreen #save-btn { margin-right: 1; }
     LimitsScreen #limits-status { padding: 1 0; color: $text-muted; }

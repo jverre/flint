@@ -12,12 +12,12 @@ from textual.widgets import DataTable, Input, Static
 
 class ExecHistoryPane(Vertical):
     DEFAULT_CSS = """
-    ExecHistoryPane { height: 1fr; padding: 0 1; background: $background; }
-    ExecHistoryPane #exec-toolbar { height: 1; padding: 0 1; background: $surface; }
-    ExecHistoryPane #exec-input { width: 1fr; border: none; background: transparent; }
-    ExecHistoryPane #exec-hint { width: auto; padding: 0 1; color: $text-muted; }
-    ExecHistoryPane #exec-output { height: auto; padding: 0 1 1 1; color: $text-muted; }
-    ExecHistoryPane DataTable { height: 1fr; }
+    ExecHistoryPane { height: 1fr; padding: 0; background: $surface; color: $text; }
+    ExecHistoryPane #exec-toolbar { height: 1; padding: 0 1; background: $panel; color: $text; }
+    ExecHistoryPane #exec-input { width: 1fr; border: none; background: $panel; color: $text; }
+    ExecHistoryPane #exec-hint { width: auto; padding: 0 1; color: $text-muted; background: $panel; }
+    ExecHistoryPane #exec-output { height: auto; padding: 0 1 1 1; color: $text-muted; background: $surface; }
+    ExecHistoryPane DataTable { height: 1fr; background: $surface; color: $text; }
     """
 
     BINDINGS = [

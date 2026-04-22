@@ -13,7 +13,12 @@ from .panes import OverviewPane, LogsPane, MetricsPane, ExecHistoryPane
 class ContentArea(Vertical):
     DEFAULT_CSS = """
     ContentArea { width: 1fr; height: 1fr; background: $background; }
-    ContentArea TabbedContent { height: 1fr; }
+    ContentArea TabbedContent { height: 1fr; background: $background; }
+    ContentArea Tabs { background: $surface; color: $text-muted; }
+    ContentArea Tabs > #tabs-list { background: $surface; }
+    ContentArea Tab { padding: 0 2; color: $text-muted; background: $surface; }
+    ContentArea Tab.-active { color: $text; background: $panel; text-style: bold; }
+    ContentArea Underline { color: $primary; background: $surface; }
     """
 
     _current_vm_id: str | None = None

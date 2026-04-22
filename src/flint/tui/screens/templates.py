@@ -44,11 +44,13 @@ class InspectModal(ModalScreen[None]):
 
 class TemplatesScreen(Screen):
     CSS = """
-    TemplatesScreen { background: $background; }
-    TemplatesScreen #templates-header { height: 3; padding: 1 2; background: $surface; }
-    TemplatesScreen #templates-title { color: $text-muted; }
+    TemplatesScreen { background: $background; color: $text; }
+    TemplatesScreen #templates-header { height: 3; padding: 1 2; background: $surface; color: $text; }
+    TemplatesScreen #templates-title { color: $text; }
     TemplatesScreen #templates-hint { color: $text-muted; padding-top: 0; }
-    TemplatesScreen DataTable { height: 1fr; padding: 0 2; }
+    TemplatesScreen DataTable { height: 1fr; padding: 0 2; background: $surface; color: $text; }
+    TemplatesScreen DataTable > .datatable--header { background: $panel; color: $text; text-style: bold; }
+    TemplatesScreen DataTable > .datatable--cursor { background: $primary 30%; color: $text; }
     """
 
     BINDINGS = [

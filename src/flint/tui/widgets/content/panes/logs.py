@@ -13,11 +13,11 @@ from flint._client.logs import LogStream
 
 class LogsPane(Vertical):
     DEFAULT_CSS = """
-    LogsPane { height: 1fr; padding: 0 1; background: $background; }
-    LogsPane #logs-toolbar { height: 1; padding: 0 1; background: $surface; }
-    LogsPane #logs-filter { width: 1fr; border: none; background: transparent; }
-    LogsPane #logs-follow-label { width: auto; padding: 0 1; color: $text-muted; }
-    LogsPane #logs-view { height: 1fr; padding: 0 1; background: transparent; }
+    LogsPane { height: 1fr; padding: 0; background: $surface; color: $text; }
+    LogsPane #logs-toolbar { height: 1; padding: 0 1; background: $panel; color: $text; }
+    LogsPane #logs-filter { width: 1fr; border: none; background: $panel; color: $text; }
+    LogsPane #logs-follow-label { width: auto; padding: 0 1; color: $text-muted; background: $panel; }
+    LogsPane #logs-view { height: 1fr; padding: 0 1; background: $surface; color: $text; }
     """
 
     _current_vm_id: str | None = None

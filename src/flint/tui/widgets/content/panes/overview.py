@@ -35,9 +35,9 @@ def _bar(ms: float, max_ms: float, width: int = 24) -> str:
 class OverviewPane(VerticalScroll):
     DEFAULT_CSS = """
     OverviewPane {
-        height: 1fr; padding: 1 2; background: $background;
+        height: 1fr; padding: 1 2; background: $surface; color: $text;
     }
-    OverviewPane Static { padding: 0; background: transparent; }
+    OverviewPane Static { padding: 0; background: transparent; color: $text; }
     .ov-header { color: $text-muted; padding-bottom: 1; }
     .ov-row { height: auto; }
     .ov-section { color: $text-muted; padding: 1 0 0 0; }

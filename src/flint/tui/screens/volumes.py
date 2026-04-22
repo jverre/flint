@@ -76,11 +76,13 @@ class NewVolumeModal(ModalScreen[tuple[str, int] | None]):
 
 class VolumesScreen(Screen):
     CSS = """
-    VolumesScreen { background: $background; }
-    VolumesScreen #volumes-header { height: 3; padding: 1 2; background: $surface; }
-    VolumesScreen #volumes-title { color: $text-muted; }
+    VolumesScreen { background: $background; color: $text; }
+    VolumesScreen #volumes-header { height: 3; padding: 1 2; background: $surface; color: $text; }
+    VolumesScreen #volumes-title { color: $text; }
     VolumesScreen #volumes-hint { color: $text-muted; padding-top: 0; }
-    VolumesScreen DataTable { height: 1fr; padding: 0 2; }
+    VolumesScreen DataTable { height: 1fr; padding: 0 2; background: $surface; color: $text; }
+    VolumesScreen DataTable > .datatable--header { background: $panel; color: $text; text-style: bold; }
+    VolumesScreen DataTable > .datatable--cursor { background: $primary 30%; color: $text; }
     """
 
     BINDINGS = [

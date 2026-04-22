@@ -43,8 +43,8 @@ def _fmt_bytes(b: float) -> str:
 
 class MetricsPane(VerticalScroll):
     DEFAULT_CSS = """
-    MetricsPane { height: 1fr; padding: 1 2; background: $background; }
-    MetricsPane Static { padding: 0; background: transparent; }
+    MetricsPane { height: 1fr; padding: 1 2; background: $surface; color: $text; }
+    MetricsPane Static { padding: 0; background: transparent; color: $text; }
     .mx-title { color: $text-muted; padding-top: 1; }
     """
 

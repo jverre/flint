@@ -14,19 +14,19 @@ RUNTIMES = [("shell", "shell"), ("python3", "python3"), ("node", "node")]
 
 class PlaygroundScreen(Screen):
     CSS = """
-    PlaygroundScreen { background: $background; }
-    PlaygroundScreen #pg-header { height: 3; padding: 1 2; background: $surface; }
-    PlaygroundScreen #pg-title { color: $text-muted; }
+    PlaygroundScreen { background: $background; color: $text; }
+    PlaygroundScreen #pg-header { height: 3; padding: 1 2; background: $surface; color: $text; }
+    PlaygroundScreen #pg-title { color: $text; }
     PlaygroundScreen #pg-hint { color: $text-muted; padding-top: 0; }
-    PlaygroundScreen #pg-toolbar { height: 3; padding: 1 2; background: $surface; }
+    PlaygroundScreen #pg-toolbar { height: 3; padding: 1 2; background: $surface; color: $text; }
     PlaygroundScreen #pg-toolbar > * { margin-right: 1; }
-    PlaygroundScreen #pg-template { width: 24; }
+    PlaygroundScreen #pg-template { width: 24; background: $panel; color: $text; }
     PlaygroundScreen #pg-runtime { width: 18; }
     PlaygroundScreen #pg-launch { min-width: 10; }
     PlaygroundScreen #pg-status { color: $text-muted; padding: 0 1; }
-    PlaygroundScreen #pg-body { height: 1fr; padding: 0 2; }
-    PlaygroundScreen TextArea { height: 50%; }
-    PlaygroundScreen #pg-output { height: 50%; background: $surface; padding: 0 1; }
+    PlaygroundScreen #pg-body { height: 1fr; padding: 0 2; background: $surface; color: $text; }
+    PlaygroundScreen TextArea { height: 50%; background: $background; color: $text; }
+    PlaygroundScreen #pg-output { height: 50%; background: $panel; color: $text; padding: 0 1; }
     """
 
     BINDINGS = [
