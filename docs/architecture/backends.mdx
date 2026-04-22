@@ -1,0 +1,83 @@
+---
+title: "Backend plugins"
+description: "The pluggable hypervisor layer."
+---
+
+Flint's hypervisor support is pluggable. The daemon itself is hypervisor-agnostic — it delegates every VM-level operation (boot, pause, resume, kill, recover, template-build) to a **backend plugin**. Three backends ship in the box, and third parties can add more.
+
+## The contract
+
+Every backend is a subclass of `flint.core.backends.base.BackendPlugin` with these class attributes:
+
+| Attribute | Purpose |
+|-----------|---------|
+| `name` | Short handle used in CLI / env var (e.g. `"firecracker"`) |
+| `kind` | Long ID persisted in state-store rows (e.g. `"linux-firecracker"`) |
+| `display_name` | Human-readable label for `flint backends list` |
+| `supported_platforms` | Tuple like `("linux",)` or `("darwin-arm64",)`. Used by default `preflight()`. |
+
+Plus a lifecycle method set:
+
+- `preflight()` — return a list of human-readable problem strings, empty if ready.
+- `template_artifact_valid(template_dir)` — does this dir contain a complete snapshot/rootfs for this backend?
+- `install_dependencies(**kwargs)` — optional hook for fetching binaries.
+- `ensure_runtime_ready()` — one-time host setup (e.g. create the `br-flint` bridge on Linux).
+- `ensure_default_template()` — build or register the default template on daemon startup.
+- `create`, `kill`, `pause`, `resume`, `recover_row` — per-sandbox lifecycle.
+- `build_template`, `delete_template_artifact` — template operations.
+
+See `src/flint/core/backends/base.py` in the repo for the full ABC.
+
+## Registration and discovery
+
+Backends register themselves in a process-wide registry (`src/flint/core/backends/registry.py`) through two mechanisms:
+
+1. **Built-in imports.** The three shipped backends (`linux_firecracker`, `linux_cloud_hypervisor`, `macos_vz`) import at daemon startup and self-register.
+2. **Entry points.** Any installed package with a `flint.backends` entry point is loaded by the registry at first call.
+
+```toml
+# Third-party package pyproject.toml
+[project.entry-points."flint.backends"]
+my-backend = "mypkg.backend:MyBackend"
+```
+
+After install, `flint backends list` picks it up automatically — no Flint patches needed.
+
+## Backend selection
+
+At daemon startup the registry picks one backend:
+
+1. If `--backend` or `FLINT_BACKEND` is set, use that one (error if not installed).
+2. Otherwise pick the first backend whose `supported_platforms` match the host. On Linux that's Firecracker (it's registered first); on macOS it's macOS-VZ.
+
+The chosen backend is carried on `SandboxManager._backend` and its `kind` is persisted on every state-store row, so recovery after a daemon crash can route each row to the right backend.
+
+## Shipped backends
+
+### Firecracker (`firecracker` / `linux-firecracker`)
+
+A Linux backend that runs the `firecracker` binary under `jailer` for additional sandboxing and boots each VM from a **golden snapshot** to hit sub-100ms starts. Pause/resume takes a full snapshot via the FC API and restores from it on resume. Runtime layout: one TAP device per VM inside a per-VM netns, all bridged via `br-flint`.
+
+Preflight checks: the FC binary, the jailer binary, and the vmlinux kernel image.
+
+### Cloud-Hypervisor (`cloud-hypervisor` / `linux-cloud-hypervisor`)
+
+Fresh-boot Linux backend. Instead of loading a snapshot, each sandbox boots from a prepared rootfs via Cloud-Hypervisor's REST API over a Unix socket. Pause/resume is a real CH API pause + restore from a per-VM pause directory. Uses the same `br-flint` bridge + netns + TAP infrastructure as Firecracker; no jailer — isolation comes from `--seccomp true` plus the netns.
+
+Preflight checks: the `cloud-hypervisor` binary and a kernel image.
+
+### macOS Virtualization.framework (`macos-vz` / `darwin-vz`)
+
+macOS-only backend built on Apple's Virtualization.framework. Each sandbox is a `VZVirtualMachine` managed in-process, not a subprocess. The Python binary running the daemon needs to be re-signed with the Virtualization entitlement — `flint start` handles this the first time by `os.execv()`-ing itself under a freshly signed copy.
+
+Preflight checks: host platform is `darwin-arm64`; VZ kernel and rootfs assets exist (managed by `flint setup-macos`).
+
+## State-store interaction
+
+Every row in the `sandboxes` SQLite table carries `backend_kind`. On daemon restart, the recovery loop walks each row, looks up the backend by `kind`, and calls `backend.recover_row(row)`. The backend probes the VM (PID + hypervisor socket) and either returns `("alive", entry)` with a reconstructed in-memory handle, `("paused", None)`, or `("dead", None)` (in which case the row is cleaned up).
+
+## Further reading
+
+- [CLI → Backends](/cli/backends) — `flint backends list` and how to pick a backend.
+- [CLI → start](/cli/start) — `--backend` flag and `FLINT_BACKEND` env var.
+- Source: `src/flint/core/backends/` in the Flint repo.

@@ -33,7 +33,7 @@ The PTY is connected to the process's stdin/stdout. Input you send to `/processe
 
 ## Building flintd
 
-`flintd` is a Go binary that gets compiled and baked into the rootfs at build time. The source lives in `guest/flintd/`. It's built for Linux/amd64 (since Firecracker VMs only run on x86_64) and compiled with static linking so it has no runtime dependencies inside the Alpine image.
+`flintd` is a Go binary that gets compiled and baked into the rootfs at build time. The source lives in `guest/flintd/`. It's built for Linux guests (typically `GOOS=linux GOARCH=amd64` on an x86_64 host, `arm64` on Apple Silicon) and compiled with static linking so it has no runtime dependencies inside the guest image.
 
 ```bash
 cd guest/flintd

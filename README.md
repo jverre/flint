@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Flint</h1>
-  <p align="center">Lightning-fast Firecracker microVM management with a Python SDK, interactive TUI, and REST API</p>
+  <p align="center">A cross-platform microVM runtime for Linux and macOS — one Python SDK, CLI, and REST API across every hypervisor</p>
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
 
 ---
 
-Flint spins up Firecracker microVMs in milliseconds from a pre-built golden snapshot. It runs as a daemon with a REST API, and ships with a Python SDK, terminal UI, and CLI for interactive VM management. Supports Linux (Firecracker) and macOS Apple Silicon (Virtualization.framework).
+Flint is a microVM runtime that spins up isolated VMs in milliseconds and gives you the same Python SDK, CLI, REST API, and interactive TUI on every platform it supports. The hypervisor underneath — Firecracker, Cloud-Hypervisor, or Apple's Virtualization.framework — is a pluggable backend; the rest of your stack doesn't have to know or care which one is running.
 
 https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428
 
@@ -596,4 +596,4 @@ Once these are in place, `flint start` will create the golden snapshot automatic
 
 ---
 
-Built on [Firecracker](https://jacquesverre.com/firecracker).
+Built on [Firecracker](https://firecracker-microvm.github.io/), [Cloud-Hypervisor](https://www.cloudhypervisor.org/), and Apple's [Virtualization.framework](https://developer.apple.com/documentation/virtualization).

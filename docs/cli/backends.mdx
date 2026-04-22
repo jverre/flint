@@ -1,0 +1,60 @@
+---
+title: "flint backends"
+description: "Inspect installed backend plugins and their readiness."
+---
+
+Flint drives VMs through pluggable **backend plugins**. Three backends ship in the box — `firecracker`, `cloud-hypervisor`, `macos-vz` — and third parties can publish more via the `flint.backends` entry-point group.
+
+Use `flint backends list` to see which backends are installed on your host and whether each one is ready to boot VMs.
+
+## Usage
+
+```bash
+flint backends list
+```
+
+## Example output
+
+```
+  firecracker          Firecracker (Linux)                      [ok]
+  cloud-hypervisor     Cloud-Hypervisor (Linux)                 [not-ready]
+      - cloud-hypervisor binary not found at /usr/local/bin/cloud-hypervisor or on PATH
+  macos-vz             macOS Virtualization.framework           [not-ready]
+      - host 'linux-x86_64' is not in supported_platforms (darwin)
+```
+
+Each row shows the backend's short `name` (what you pass to `flint start --backend`), a human-readable `display_name`, and a `[ok]` / `[not-ready]` status. When a backend is not ready, the preflight problems are listed on indented lines — missing binaries, unsupported platforms, missing kernel images, etc.
+
+## Built-in backends
+
+| Name | Platform | Notes |
+|------|----------|-------|
+| `firecracker` | Linux (KVM) | Default on Linux. Requires `firecracker` + `jailer` + a vmlinux kernel. Install with `sudo flint install-deps`. |
+| `cloud-hypervisor` | Linux (KVM) | Fresh-boot backend. Requires the `cloud-hypervisor` binary; kernel can be shared with Firecracker. |
+| `macos-vz` | macOS Apple Silicon | Default on macOS. Requires the Python binary to carry the Virtualization entitlement (handled by `flint start` on first run). Run `flint setup-macos` to install kernel + rootfs. |
+
+## Choosing a backend
+
+Without `--backend` or `FLINT_BACKEND`, the daemon picks a host default (Firecracker on Linux, macOS-VZ on macOS). Pick one explicitly with:
+
+```bash
+sudo flint start --backend cloud-hypervisor
+# or
+FLINT_BACKEND=cloud-hypervisor sudo flint start
+```
+
+## Publishing a third-party backend
+
+Backends are discovered by importing their Python class via the `flint.backends` entry-point group. To publish your own:
+
+1. Implement a subclass of `flint.core.backends.base.BackendPlugin` with a unique `name`, `kind` (for state-store rows), `display_name`, `supported_platforms`, `preflight()`, plus the lifecycle methods (`create`, `kill`, `pause`, `resume`, `recover_row`, …).
+2. In your package's `pyproject.toml`:
+
+   ```toml
+   [project.entry-points."flint.backends"]
+   my-backend = "mypkg.backend:MyBackend"
+   ```
+
+3. Install your package alongside Flint. `flint backends list` will pick it up automatically.
+
+See `src/flint/core/backends/base.py` in the Flint repo for the full ABC.

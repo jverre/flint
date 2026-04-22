@@ -1,0 +1,149 @@
+---
+title: "Agents"
+description: "Deploy pre-packaged AI agents from Python."
+---
+
+The `flint.agents` module deploys pre-packaged AI agents into isolated Flint microVMs. Each agent is defined in a catalog with a Docker image, default env vars, and a post-start command. Deploying an agent builds a template on first run (pulling the image from GHCR) and boots from a cached snapshot on every subsequent call.
+
+For the CLI equivalent, see [CLI → Agents](/cli/agents).
+
+## Quick start
+
+```python
+from flint.agents import Agent
+
+# Deploy Hermes with an API key in the env
+agent = Agent.deploy("hermes", env={"MODEL_API_KEY": "sk-..."})
+
+# Run a command inside the agent VM
+result = agent.exec("hermes --version")
+print(result.stdout)
+
+# Stop when done
+agent.stop()
+```
+
+The daemon must be running (`flint start`) before calling any `Agent` method.
+
+## The `Agent` class
+
+### `Agent.deploy(name, *, env=None, credentials=None, rootfs_size_mb=None, allow_internet_access=True, force_build=False)`
+
+Build (if needed) and deploy an agent in a fresh microVM. Returns an `Agent` instance whose `.sandbox` attribute is the underlying `Sandbox`.
+
+```python
+agent = Agent.deploy(
+    "openclaw",
+    env={"OPENCLAW_PORT": "5000"},
+    credentials={"api.openai.com": {"Authorization": "Bearer sk-..."}},
+)
+```
+
+Arguments:
+
+- `name` — catalog entry to deploy (`"hermes"`, `"openclaw"`, or any name registered via `register_agent`).
+- `env` — dict of environment variables to set in the agent's process. Overrides the catalog defaults.
+- `credentials` — network-policy credential map (see `set_credentials` below).
+- `rootfs_size_mb` — override the catalog's rootfs size.
+- `allow_internet_access` — disable outbound network if `False`.
+- `force_build` — rebuild the template even if a cached one exists.
+
+### `Agent.build(name, *, rootfs_size_mb=None, force=False)`
+
+Pre-build a template without deploying. Useful for warming the cache before a demo or at service startup.
+
+```python
+Agent.build("hermes")
+```
+
+### `Agent.build_all(*, force=False)`
+
+Build every agent in the catalog. Returns a list of `TemplateInfo`.
+
+```python
+for info in Agent.build_all():
+    print(info.template_id, info.status)
+```
+
+### `Agent.catalog()`
+
+Return all `AgentDefinition` entries in the catalog.
+
+```python
+for defn in Agent.catalog():
+    print(f"{defn.name}: {defn.description}")
+```
+
+## Instance methods
+
+### `agent.exec(cmd, *, timeout=30)`
+
+Run a shell command inside the agent's VM. Returns a `CommandResult` with `stdout`, `stderr`, `exit_code`.
+
+```python
+result = agent.exec("ls /app")
+print(result.stdout)
+```
+
+### `agent.set_credentials(credentials)`
+
+Wire HTTP credentials into the VM's outbound traffic via the network-policy transform system. The agent's code sees a transparent proxy; the actual key material never touches the VM disk or environment.
+
+```python
+agent.set_credentials({
+    "api.openai.com": {"Authorization": "Bearer sk-..."},
+    "api.anthropic.com": {"x-api-key": "sk-ant-..."},
+})
+```
+
+### `agent.logs()`
+
+Return recent output from the agent's post-start process.
+
+### `agent.pause()` / `agent.resume()`
+
+Snapshot the agent's VM to disk and restore it later. State is fully preserved.
+
+### `agent.stop()`
+
+Kill the underlying VM.
+
+### `agent.status()`
+
+Return an `AgentStatus` with the agent name, sandbox ID, sandbox state, and template ID.
+
+## <a name="custom-agents"></a>Custom agents
+
+Register your own agent by calling `register_agent` with an `AgentDefinition`:
+
+```python
+from flint.agents.catalog import AgentDefinition, register_agent
+from flint.agents import Agent
+
+register_agent(AgentDefinition(
+    name="my-agent",
+    description="My custom AI agent",
+    repo="https://github.com/me/my-agent.git",
+    version="latest",
+    license="MIT",
+    tags=["custom"],
+    rootfs_size_mb=2048,
+    dockerfile="""\
+FROM python:3.12-slim
+RUN pip install my-agent-package
+WORKDIR /app
+COPY flintd /usr/local/bin/flintd
+COPY init-net.sh /etc/init-net.sh
+RUN chmod +x /usr/local/bin/flintd /etc/init-net.sh
+""",
+    post_start_cmd="python -m my_agent &",
+))
+
+agent = Agent.deploy("my-agent")
+```
+
+The `COPY flintd` and `COPY init-net.sh` lines are required — they're how the Flint daemon bootstraps the guest agent and the per-VM network inside the image. When registering against a pre-built GHCR image, you can use the helper at `flint.agents.catalog._agent_dockerfile(docker_image)` to generate the Dockerfile tail automatically.
+
+## Pre-built images
+
+The built-in agents' Docker images are published to GitHub Container Registry at `ghcr.io/jverre/flint/agent-<name>:latest`. CI rebuilds them daily to pick up upstream changes, so `Agent.deploy("hermes")` always pulls a recent base image. If you want to pin a version, set `docker_image` on a custom `AgentDefinition`.

@@ -1,0 +1,96 @@
+---
+title: "flint agents"
+description: "Deploy and manage pre-packaged AI agents."
+---
+
+Flint ships with a catalog of pre-packaged AI agents that you can deploy into an isolated microVM with a single command. Agent Docker images are built and published to GHCR by CI, so a deploy pulls a ready-made image instead of building from source. After the first pull, subsequent deploys boot from a cached template snapshot in milliseconds.
+
+For the Python SDK equivalent, see [SDK → Agents](/sdk/agents).
+
+## Built-in agents
+
+| Agent | Description |
+|-------|-------------|
+| `hermes` | Self-improving AI agent by [Nous Research](https://nousresearch.com) with persistent memory and a learning loop |
+| `openclaw` | Autonomous AI agent framework for real-world task execution via messaging platforms |
+
+## <a name="list"></a>`flint agents list`
+
+List all available agents in the catalog.
+
+```bash
+flint agents list
+```
+
+Shows each agent's name, one-line description, source repository, license, and tags.
+
+## <a name="info"></a>`flint agents info <name>`
+
+Print detailed information about a single agent: repo, version, homepage, license, tags, rootfs size, and default environment variables.
+
+```bash
+flint agents info hermes
+```
+
+## <a name="build"></a>`flint agents build`
+
+Pre-build agent template(s) so that subsequent `deploy` calls boot in milliseconds.
+
+```bash
+# Build a single agent
+flint agents build hermes
+
+# Build every agent in the catalog
+flint agents build --all
+
+# Force a rebuild even if cached
+flint agents build hermes --force
+
+# Override the rootfs size
+flint agents build hermes --rootfs-size 4096
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Build every agent in the catalog |
+| `--force` | Rebuild even if a cached template exists |
+| `--rootfs-size N` | Override rootfs size in MB |
+
+## <a name="deploy"></a>`flint agents deploy <name>`
+
+Build (if needed) and deploy an agent into a fresh microVM.
+
+```bash
+# Deploy Hermes
+flint agents deploy hermes
+
+# Pass environment variables
+flint agents deploy openclaw -e MODEL_API_KEY=sk-... -e OPENCLAW_PORT=5000
+
+# Deploy without internet access
+flint agents deploy hermes --no-internet
+
+# Force a template rebuild before deploy
+flint agents deploy hermes --force-build
+```
+
+On success, the command prints the agent's sandbox ID and template ID. Use `flint list` to see it in the running-sandbox list, and `flint stop <vm_id>` to tear it down.
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-e KEY=VALUE`, `--env` | Environment variable (repeatable) |
+| `--rootfs-size N` | Override rootfs size in MB |
+| `--no-internet` | Disable outbound network access |
+| `--force-build` | Rebuild the template even if cached |
+
+## Prerequisites
+
+All `flint agents` commands (except `list` and `info`) require the daemon to be running. Start it with `flint start` in another terminal first.
+
+## Custom agents
+
+You can register your own agent at runtime by calling `register_agent(...)` from Python. See [SDK → Agents → Custom agents](/sdk/agents#custom-agents) for the full example.

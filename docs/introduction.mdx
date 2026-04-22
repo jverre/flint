@@ -1,11 +1,11 @@
 ---
 title: "Introduction"
-description: "Firecracker microVMs that start in milliseconds."
+description: "A cross-platform microVM runtime for Linux and macOS."
 ---
 
-Flint is a microVM manager built on top of [Firecracker](https://firecracker-microvm.github.io/). It spins up isolated VMs in under 100ms by loading a pre-booted golden snapshot rather than booting from scratch every time.
+Flint is a microVM runtime that spins up isolated VMs in milliseconds and gives you the same Python SDK, CLI, REST API, and interactive TUI on every platform it supports. The hypervisor underneath is a pluggable backend — pick the one that fits your host, and the rest of your stack stays unchanged.
 
-The core idea is simple: boot a VM once, snapshot it, and clone that snapshot for every new sandbox. You get real VM-level isolation without paying the boot cost each time.
+Everything you build against Flint — sandbox lifecycle, exec, file ops, PTY, pause/resume, templates, agent deploys — works identically whether the VM is running on a Linux CI box or on a MacBook on the couch. The fastest path to a sandbox is a pre-warmed one: boot a VM once, snapshot it, and clone that snapshot for every new sandbox. You get real VM-level isolation without paying the boot cost each time.
 
 <CardGroup cols={2}>
   <Card title="Quickstart" icon="rocket" href="/quickstart">
@@ -14,28 +14,34 @@ The core idea is simple: boot a VM once, snapshot it, and clone that snapshot fo
   <Card title="Python SDK" icon="python" href="/sdk/sandbox">
     The `Sandbox` class and everything it can do.
   </Card>
+  <Card title="Agents" icon="robot" href="/sdk/agents">
+    Pre-packaged AI agents you can deploy with one line.
+  </Card>
   <Card title="CLI" icon="terminal" href="/cli/overview">
-    Manage sandboxes from the command line or the interactive TUI.
+    Manage sandboxes, backends, and agents from the command line.
   </Card>
   <Card title="Architecture" icon="sitemap" href="/architecture/overview">
-    How golden snapshots, networking, and the guest agent fit together.
+    How backends, snapshots, networking, and the guest agent fit together.
   </Card>
 </CardGroup>
 
 ## What you can do with Flint
 
 - Run sandboxes and execute arbitrary code or shell commands
+- Deploy pre-packaged AI agents (Hermes, OpenClaw, or your own) in one call
 - Create custom sandbox environments from Docker images using the `Template` builder
-- Pause a running sandbox to disk and resume it later - state is fully preserved
+- Pause a running sandbox to disk and resume it later — state is fully preserved
+- Run the same workloads on Linux and macOS with no code changes
+- Swap the hypervisor without changing your app — three backends ship in the box, and third parties can publish more
 - Manage sandboxes via Python SDK, REST API, CLI, or the interactive TUI
 - Set auto-cleanup timeouts so sandboxes don't run forever
 
 ## How it works
 
-Flint runs a daemon (`flint start`) that manages the full VM lifecycle. When you create a sandbox, the daemon copies a rootfs from a pre-warmed pool, sets up a network namespace, and loads the golden snapshot into a new Firecracker process. The whole thing takes under 100ms.
+Flint runs a daemon (`flint start`) that manages the full VM lifecycle. When you create a sandbox, the daemon routes the call through a **backend plugin** — the component that knows how to drive a specific hypervisor — which sets up per-VM networking and boots the guest. Boot strategies vary (snapshot load, fresh boot, or framework-native) but the daemon's API above the backend layer is identical everywhere.
 
 Inside each VM, a small Go HTTP server called `flintd` handles command execution, file operations, and PTY sessions. The daemon proxies your SDK calls through to `flintd` over the VM's private network.
 
 <Info>
-Flint requires Linux with KVM support. It won't run on macOS or Windows.
+Flint runs on Linux (with KVM) and macOS Apple Silicon (with the Virtualization entitlement). Use `flint backends list` to see which backends are installed and ready on your host.
 </Info>
