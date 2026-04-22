@@ -143,6 +143,14 @@ class StateStore:
         )
         self._conn.commit()
 
+        # Broadcast to event bus if available. Lazy import to avoid a core→daemon
+        # dependency cycle; a no-op during tests that don't run the daemon.
+        try:
+            from flint.daemon.events import publish
+            publish("vm.state_changed", vm_id=vm_id, **{"from": from_state.value, "to": new_state.value})
+        except Exception:
+            pass
+
     def update_health(self, vm_id: str, timestamp: float | None = None) -> None:
         now = timestamp or time.time()
         self._conn.execute(

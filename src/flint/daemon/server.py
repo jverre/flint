@@ -23,8 +23,22 @@ from flint.core.manager import SandboxManager
 from flint.core._template_registry import (
     list_templates, get_template, delete_template as _delete_template,
 )
+from flint.core._volumes import VolumeStore
+from flint.core._metrics import MetricsSampler
+from flint.core import _logs
+from flint.daemon import events as _events
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def _startup_event_bus():
+    loop = asyncio.get_running_loop()
+    _events.init_bus(loop)
+    _logs.init_bus(loop)
+    daemon = getattr(app.state, "daemon", None)
+    if daemon is not None and daemon.metrics is not None:
+        daemon.metrics.start(loop)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -176,6 +190,10 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         result["storage_backend"] = daemon.storage.kind
         result["workspace_dir"] = WORKSPACE_DIR
     _write_state(daemon)
+    _events.publish("vm.created", vm=result)
+    _logs.append(vm_id, f"VM created from template '{template_id}' in {result.get('ready_time_ms', 0):.0f} ms")
+    for step, ms in (result.get("timings") or {}).items():
+        _logs.append(vm_id, f"  timing.{step} = {ms:.1f} ms")
     print(f"POST /vms — created {vm_id[:8]}")
     return {"vm": result}
 
@@ -218,6 +236,8 @@ def delete_vm(vm_id: str):
         daemon.storage.teardown_sandbox(vm_id, veth_ip)
     mgr.kill(vm_id)
     _write_state(daemon)
+    _events.publish("vm.deleted", vm_id=vm_id)
+    _logs.append(vm_id, "VM killed")
     print(f"DELETE /vms/{vm_id[:8]} — killed")
     return {"ok": True}
 
@@ -234,6 +254,8 @@ def pause_vm(vm_id: str):
         print(f"POST /vms/{vm_id[:8]}/pause — failed: {e}")
         raise HTTPException(status_code=500, detail=f"Pause failed: {e}")
     _write_state(daemon)
+    _events.publish("vm.paused", vm_id=vm_id)
+    _logs.append(vm_id, "VM paused")
     print(f"POST /vms/{vm_id[:8]}/pause — paused")
     return {"ok": True}
 
@@ -251,6 +273,8 @@ def resume_vm(vm_id: str):
         raise HTTPException(status_code=500, detail=f"Resume failed: {e}")
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)
+    _events.publish("vm.resumed", vm=result)
+    _logs.append(vm_id, "VM resumed")
     print(f"POST /vms/{vm_id[:8]}/resume — resumed")
     return {"vm": result}
 
@@ -265,6 +289,16 @@ def patch_vm(vm_id: str, body: dict):
     if timeout is not None:
         mgr.set_timeout(vm_id, float(timeout), policy)
     return {"ok": True}
+
+
+@app.get("/vms/{vm_id}/metrics")
+def get_vm_metrics(vm_id: str, window: int = 60):
+    daemon = _get_daemon()
+    if daemon.metrics is None:
+        raise HTTPException(status_code=503, detail="Metrics sampler not initialized")
+    _require_entry(vm_id)
+    samples = daemon.metrics.get(vm_id, window=window)
+    return {"samples": samples}
 
 
 # ── Network policy endpoints ──────────────────────────────────────────────
@@ -407,6 +441,54 @@ async def terminal_ws(websocket: WebSocket, vm_id: str):
         log.exception("WS /vms/%s/terminal — error", vm_id[:8])
 
 
+# ── Events broadcast WebSocket ────────────────────────────────────────────
+
+@app.websocket("/events")
+async def events_ws(websocket: WebSocket):
+    """Stream daemon-wide lifecycle events to a subscriber."""
+    bus = _events.get_bus()
+    if bus is None:
+        await websocket.close(code=1011, reason="Event bus not initialized")
+        return
+    await websocket.accept()
+    q = bus.subscribe()
+    try:
+        while True:
+            event = await q.get()
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("WS /events — error")
+    finally:
+        bus.unsubscribe(q)
+
+
+# ── Per-VM log stream ──────────────────────────────────────────────────────
+
+@app.websocket("/vms/{vm_id}/logs")
+async def logs_ws(websocket: WebSocket, vm_id: str):
+    bus = _logs.get_bus()
+    if bus is None:
+        await websocket.close(code=1011, reason="Log bus not initialized")
+        return
+    await websocket.accept()
+    # Send history first so late subscribers see recent context.
+    for line in bus.history(vm_id):
+        await websocket.send_text(line)
+    q = bus.subscribe(vm_id)
+    try:
+        while True:
+            line = await q.get()
+            await websocket.send_text(line)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("WS /vms/%s/logs — error", vm_id[:8])
+    finally:
+        bus.unsubscribe(vm_id, q)
+
+
 # ── Template endpoints ──────────────────────────────────────────────────────
 
 _build_threads: dict[str, threading.Thread] = {}
@@ -476,6 +558,100 @@ def delete_template_endpoint(template_id: str):
     return {"ok": True}
 
 
+# ── Volume endpoints ──────────────────────────────────────────────────────
+
+def _require_volumes() -> VolumeStore:
+    daemon = _get_daemon()
+    if daemon.volumes is None:
+        raise HTTPException(status_code=503, detail="Volume store not initialized")
+    return daemon.volumes
+
+
+@app.get("/volumes")
+def list_volumes():
+    vols = _require_volumes().list()
+    print(f"GET /volumes — {len(vols)} volumes")
+    return {"volumes": [v.to_dict() for v in vols]}
+
+
+@app.post("/volumes")
+def create_volume(body: dict):
+    name = body.get("name")
+    size_gib = body.get("size_gib")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400, detail="'name' is required")
+    if not isinstance(size_gib, int):
+        raise HTTPException(status_code=400, detail="'size_gib' must be an integer")
+    try:
+        vol = _require_volumes().create(name, size_gib)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _events.publish("volume.created", volume=vol.to_dict())
+    print(f"POST /volumes — created {vol.id} ({name}, {size_gib} GiB)")
+    return {"volume": vol.to_dict()}
+
+
+@app.delete("/volumes/{volume_id}")
+def delete_volume(volume_id: str):
+    ok = _require_volumes().delete(volume_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Volume not found")
+    _events.publish("volume.deleted", volume_id=volume_id)
+    print(f"DELETE /volumes/{volume_id} — deleted")
+    return {"ok": True}
+
+
+# ── Config / limits endpoints ─────────────────────────────────────────────
+
+def _current_config_view() -> dict:
+    from flint.core import config as c
+    return {
+        "pool_target_size": c.POOL_TARGET_SIZE,
+        "default_sandbox_timeout": c.DEFAULT_SANDBOX_TIMEOUT,
+        "health_check_interval": c.HEALTH_CHECK_INTERVAL,
+        "error_cleanup_delay": c.ERROR_CLEANUP_DELAY,
+    }
+
+
+def _load_config_overrides() -> dict:
+    from flint.core.config import CONFIG_OVERRIDES_PATH
+    try:
+        with open(CONFIG_OVERRIDES_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@app.get("/config")
+def get_config():
+    return {"config": _current_config_view(), "overrides": _load_config_overrides()}
+
+
+@app.patch("/config")
+def patch_config(body: dict):
+    from flint.core.config import CONFIG_FIELDS, CONFIG_OVERRIDES_PATH
+    overrides = _load_config_overrides()
+    for k, v in body.items():
+        meta = CONFIG_FIELDS.get(k)
+        if not meta:
+            raise HTTPException(status_code=400, detail=f"Unknown field: {k}")
+        _const_name, typ = meta
+        try:
+            overrides[k] = typ(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Invalid type for {k}")
+    os.makedirs(os.path.dirname(CONFIG_OVERRIDES_PATH), exist_ok=True)
+    tmp_path = CONFIG_OVERRIDES_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(overrides, f)
+    os.rename(tmp_path, CONFIG_OVERRIDES_PATH)
+    return {
+        "ok": True,
+        "overrides": overrides,
+        "requires_restart": list(body.keys()),
+    }
+
+
 # ── FlintDaemon ──────────────────────────────────────────────────────────
 
 class FlintDaemon:
@@ -488,6 +664,8 @@ class FlintDaemon:
         self._health_monitor = None
         self._lifecycle_manager = None
         self.storage = None
+        self.volumes: VolumeStore | None = None
+        self.metrics: MetricsSampler | None = None
 
     def run(self) -> None:
         self.started_at = time.time()
@@ -535,10 +713,12 @@ class FlintDaemon:
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
+        self.volumes = VolumeStore(self._state_store._conn)
         print("State store initialized.")
 
     def _init_manager(self) -> None:
         self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
+        self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [])
         _write_state(self)
 
     def _recover_sandboxes(self) -> None:
