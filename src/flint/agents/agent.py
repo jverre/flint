@@ -117,7 +117,10 @@ class Agent:
 
     def exec(self, cmd: str, timeout: float = 60) -> CommandResult:
         """Run a command inside the agent's sandbox."""
-        return self._sandbox.run_command(cmd, timeout=timeout)
+        return self._sandbox.run_command(
+            f". /etc/profile.d/agent-env.sh 2>/dev/null; {cmd}",
+            timeout=timeout,
+        )
 
     def status(self) -> AgentStatus:
         """Get the current status of this agent deployment."""
@@ -271,7 +274,11 @@ class Agent:
             network_policy=network_policy,
         )
 
-        # Inject environment variables
+        # Persist environment variables to /etc/profile.d/agent-env.sh so any
+        # shell invocation that chooses to source it (agent.exec wraps with
+        # `. /etc/profile.d/agent-env.sh` for this reason) picks them up.
+        # flintd's /exec runs under `sh -c`, which does NOT source profile
+        # scripts on its own.
         merged_env = {**definition.default_env, **(env or {})}
         if merged_env:
             env_script = "\n".join(
@@ -280,12 +287,12 @@ class Agent:
             sandbox.run_command(
                 f'cat >> /etc/profile.d/agent-env.sh << \'ENVEOF\'\n{env_script}\nENVEOF'
             )
-            # Also export in current shell
-            sandbox.run_command(env_script)
 
-        # Run post-start command if defined
+        # Run post-start command — source the env file first so the agent
+        # process itself sees MODEL_API_KEY, *_HOST, *_PORT, etc.
         if definition.post_start_cmd:
             sandbox.run_command(
+                f". /etc/profile.d/agent-env.sh 2>/dev/null; "
                 f"({definition.post_start_cmd}) > /var/log/agent.log 2>&1"
             )
 
