@@ -40,7 +40,39 @@ from .base import BackendBootResult, HostBackend
 
 
 class LinuxFirecrackerBackend(HostBackend):
+    name = "firecracker"
     kind = "linux-firecracker"
+    display_name = "Firecracker (Linux)"
+    supported_platforms = ("linux",)
+
+    def preflight(self) -> list[str]:
+        problems = super().preflight()
+        from flint.core.config import FIRECRACKER_BINARY, JAILER_BINARY, KERNEL_PATH
+
+        if not os.path.exists(FIRECRACKER_BINARY):
+            problems.append(f"firecracker binary not found at {FIRECRACKER_BINARY}")
+        if not shutil.which(JAILER_BINARY) and not os.path.exists(JAILER_BINARY):
+            problems.append(f"jailer binary not found (searched PATH and {JAILER_BINARY})")
+        if not os.path.exists(KERNEL_PATH):
+            problems.append(f"kernel image not found at {KERNEL_PATH}")
+        return problems
+
+    def template_artifact_valid(self, template_dir: str) -> bool:
+        return all(
+            os.path.exists(f"{template_dir}/{f}")
+            for f in ("rootfs.ext4", "vmstate", "mem")
+        )
+
+    def install_dependencies(self, **kwargs) -> None:
+        from flint.core._install import install_deps as _install_deps
+
+        _install_deps(
+            fc_version=kwargs.get("fc_version", "latest"),
+            install_dir=kwargs.get("install_dir", "/usr/local/bin"),
+            kernel_dir=kwargs.get("kernel_dir", "/root/firecracker-vm"),
+            kernel_version=kwargs.get("kernel_version", "6.1"),
+            skip_kernel=kwargs.get("skip_kernel", False),
+        )
 
     def ensure_runtime_ready(self) -> None:
         _ensure_bridge()
@@ -234,8 +266,8 @@ class LinuxFirecrackerBackend(HostBackend):
             chroot_base=chroot_base,
             backend_vm_ref=sandbox_id,
             runtime_dir=vm_dir,
-            guest_arch=row.get("guest_arch") or platform.machine().lower(),
-            transport_ref=row.get("transport_ref") or f"netns:{ns_name}",
+            guest_arch=platform.machine().lower(),
+            transport_ref=f"netns:{ns_name}",
             backend_metadata={
                 "socket_path": socket_path,
                 "ns_name": ns_name,
@@ -401,17 +433,17 @@ class LinuxFirecrackerBackend(HostBackend):
             vm_dir=vm_dir,
             socket_path=row["socket_path"],
             ns_name=ns_name,
-            guest_ip=row.get("guest_ip") or GUEST_IP,
+            guest_ip=GUEST_IP,
             agent_url=agent_url,
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
             chroot_base=row.get("chroot_base") or "",
             backend_kind=row.get("backend_kind") or self.kind,
-            backend_vm_ref=row.get("backend_vm_ref") or vm_id,
-            runtime_dir=row.get("runtime_dir") or vm_dir,
-            guest_arch=row.get("guest_arch") or "linux",
-            transport_ref=row.get("transport_ref") or f"netns:{ns_name}",
+            backend_vm_ref=vm_id,
+            runtime_dir=vm_dir,
+            guest_arch=platform.machine().lower(),
+            transport_ref=f"netns:{ns_name}",
         )
         return "alive", entry
 
@@ -445,3 +477,8 @@ class LinuxFirecrackerBackend(HostBackend):
             from flint.core._jailer import cleanup_jailer
 
             cleanup_jailer(chroot_base, vm_id)
+
+
+from .registry import register as _register
+
+_register(LinuxFirecrackerBackend)

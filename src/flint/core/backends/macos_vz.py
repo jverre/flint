@@ -110,7 +110,44 @@ class _BackendThread:
 
 
 class MacOSVirtualizationBackend(HostBackend):
+    name = "macos-vz"
     kind = "macos-vz-arm64"
+    display_name = "Virtualization.framework (macOS arm64)"
+    supported_platforms = ("darwin-arm64",)
+
+    def preflight(self) -> list[str]:
+        problems = super().preflight()
+        try:
+            __import__("objc")
+            __import__("Virtualization")
+            __import__("Foundation")
+        except Exception as exc:
+            problems.append(
+                "PyObjC Virtualization bindings are not installed "
+                f"(install `flint[macos-vz]`): {exc}"
+            )
+        if not os.path.exists(VZ_KERNEL_PATH):
+            problems.append(f"VZ kernel not found at {VZ_KERNEL_PATH}")
+        if not os.path.exists(VZ_ROOTFS_PATH):
+            problems.append(f"VZ rootfs not found at {VZ_ROOTFS_PATH}")
+        return problems
+
+    def template_artifact_valid(self, template_dir: str) -> bool:
+        # VZ stores a small JSON descriptor; the real kernel/rootfs live at
+        # VZ_KERNEL_PATH / VZ_ROOTFS_PATH which are checked by preflight.
+        return os.path.exists(os.path.join(template_dir, "artifact.json"))
+
+    def install_dependencies(self, **kwargs) -> None:
+        from flint.core._install import setup_macos_vz
+
+        setup_macos_vz(
+            vz_dir=kwargs.get("vz_dir"),
+            alpine_version=kwargs.get("alpine_version", "3.21.3"),
+            kernel_version=kwargs.get("kernel_version", "1.12"),
+            kernel_patch=kwargs.get("kernel_patch", "6.1.128"),
+            rootfs_size_mb=kwargs.get("rootfs_size_mb", 1024),
+            force=kwargs.get("force", False),
+        )
 
     def __init__(self) -> None:
         self._runtime = _BackendThread()
@@ -713,3 +750,8 @@ class MacOSVirtualizationBackend(HostBackend):
     @staticmethod
     def _default_assets_ready() -> bool:
         return os.path.exists(VZ_KERNEL_PATH) and os.path.exists(VZ_ROOTFS_PATH)
+
+
+from .registry import register as _register
+
+_register(MacOSVirtualizationBackend)

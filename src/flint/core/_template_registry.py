@@ -185,7 +185,15 @@ def template_snapshot_exists(template_id: str, backend_kind: str = "linux-firecr
         tdir = get_template_dir(template_id, backend_kind=backend_kind)
     except KeyError:
         return False
-    return all(os.path.exists(f"{tdir}/{f}") for f in ("rootfs.ext4", "vmstate", "mem"))
+    if not os.path.isdir(tdir):
+        return False
+    try:
+        from .backends import get_backend
+
+        backend = get_backend(backend_kind)
+    except Exception:
+        return all(os.path.exists(f"{tdir}/{f}") for f in ("rootfs.ext4", "vmstate", "mem"))
+    return backend.template_artifact_valid(tdir)
 
 
 def registered_template_ids() -> list[str]:

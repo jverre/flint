@@ -22,6 +22,17 @@ dependencies = [
     "pyobjc-framework-Virtualization>=11.1; platform_system == 'Darwin'",
 ]
 
+[project.optional-dependencies]
+firecracker = []
+cloud-hypervisor = []
+macos-vz = []
+all = []
+
+[project.entry-points."flint.backends"]
+firecracker = "flint.core.backends.linux_firecracker:LinuxFirecrackerBackend"
+cloud-hypervisor = "flint.core.backends.linux_cloud_hypervisor:LinuxCloudHypervisorBackend"
+macos-vz = "flint.core.backends.macos_vz:MacOSVirtualizationBackend"
+
 [project.scripts]
 flint = "flint.cli:cli"
 

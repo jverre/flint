@@ -38,9 +38,33 @@ jobs:
         working-directory: guest/flintd
         run: go build -o flintd .
 
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: uv sync --dev
+      - name: Run unit tests
+        run: uv run python -m pytest tests/unit/ -v
+
   e2e:
     runs-on: ubuntu-latest
     needs: [go-r2nfs, go-flintd]
+    permissions:
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [firecracker, cloud-hypervisor]
+    env:
+      FLINT_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -59,21 +83,130 @@ jobs:
         run: go get ./... && go mod tidy && go build -o r2nfs .
       - name: Enable KVM access
         run: |
+          echo "enable-kvm:start" >> /tmp/step-markers
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          echo "enable-kvm:end" >> /tmp/step-markers
       - name: Install Firecracker + kernel
-        run: sudo bash scripts/install-deps.sh
+        if: matrix.backend == 'firecracker'
+        run: |
+          echo "install-fc:start" >> /tmp/step-markers
+          sudo bash scripts/install-deps.sh
+          echo "install-fc:end" >> /tmp/step-markers
+      - name: Install cloud-hypervisor
+        if: matrix.backend == 'cloud-hypervisor'
+        run: |
+          echo "install-ch:start" >> /tmp/step-markers
+          set -euxo pipefail
+          CH_VERSION="v46.0"
+          URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          curl -fsSL -o /tmp/cloud-hypervisor "$URL"
+          ls -la /tmp/cloud-hypervisor
+          file /tmp/cloud-hypervisor
+          sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          /usr/local/bin/cloud-hypervisor --version
+          echo "install-ch:end" >> /tmp/step-markers
+      - name: Install kernel (for cloud-hypervisor)
+        if: matrix.backend == 'cloud-hypervisor'
+        run: |
+          echo "install-ch-kernel:start" >> /tmp/step-markers
+          set -euxo pipefail
+          sudo mkdir -p /root/firecracker-vm
+          ARCH="$(uname -m)"
+          sudo curl -fsSL \
+            -o /root/firecracker-vm/vmlinux \
+            "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin"
+          sudo ls -la /root/firecracker-vm/vmlinux
+          echo "install-ch-kernel:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs
         run: |
+          echo "alpine:start" >> /tmp/step-markers
+          set -x
           sudo mkdir -p /root/firecracker-vm
           curl -fsSL -o /tmp/alpine.tar.gz \
-            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz
+            https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee /tmp/alpine-download.log
+          sudo mv /tmp/alpine.tar.gz /root/firecracker-vm/alpine-minirootfs-3.21.3-x86_64.tar.gz 2>&1 | tee -a /tmp/alpine-download.log
+          sudo ls -la /root/firecracker-vm | tee -a /tmp/alpine-download.log
+          echo "alpine:end" >> /tmp/step-markers
       - name: Build rootfs
-        run: sudo -E env "PATH=$PATH" bash setup-rootfs.sh
+        run: |
+          echo "build-rootfs:start" >> /tmp/step-markers
+          sudo -E env "PATH=$PATH" bash -x setup-rootfs.sh 2>&1 | tee /tmp/build-rootfs.log
+          rc=${PIPESTATUS[0]}
+          echo "build-rootfs:end:$rc" >> /tmp/step-markers
+          exit $rc
       - name: Prepare runtime directories
         run: sudo mkdir -p /srv/jailer
+      - name: Probe backend plugin
+        id: probe
+        continue-on-error: true
+        run: |
+          set -x
+          uv run flint backends list 2>&1 | tee /tmp/probe.log
+          FLINT_BACKEND=${FLINT_BACKEND} uv run python -c "
+          import os
+          from flint.core.backends import resolve_backend
+          b = resolve_backend()
+          print('resolved:', b.name, b.kind)
+          print('preflight:', b.preflight())
+          " 2>&1 | tee -a /tmp/probe.log
       - name: Run tests
-        run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/ -v -m "not slow"
+        id: tests
+        run: |
+          sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/ -v -m "not slow" 2>&1 | tee /tmp/pytest.log
+          exit ${PIPESTATUS[0]}
         timeout-minutes: 10
+      - name: Post diagnostics comment on failure
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "### CI failure: \`e2e (${FLINT_BACKEND})\`"
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "#### Step markers"
+            echo '```'
+            cat /tmp/step-markers 2>/dev/null || echo '(no step markers)'
+            echo '```'
+            echo
+            echo "#### Filesystem state"
+            echo '```'
+            echo '--- /usr/local/bin ---'
+            ls -la /usr/local/bin 2>/dev/null | grep -E 'firecracker|jailer|cloud-hypervisor' || echo '(no relevant binaries)'
+            echo
+            echo '--- /root/firecracker-vm ---'
+            sudo ls -la /root/firecracker-vm 2>/dev/null || echo '(missing)'
+            echo
+            echo '--- /tmp (relevant) ---'
+            ls -la /tmp 2>/dev/null | grep -E 'alpine|build-rootfs|probe|pytest|step-markers|flint' || echo '(no relevant tmp files)'
+            echo '```'
+            echo
+            echo "#### Alpine download log"
+            echo '```'
+            tail -c 2000 /tmp/alpine-download.log 2>/dev/null || echo '(no alpine log)'
+            echo '```'
+            echo
+            echo "#### setup-rootfs.sh log (last 4000 chars)"
+            echo '```'
+            tail -c 4000 /tmp/build-rootfs.log 2>/dev/null || echo '(no build-rootfs log)'
+            echo '```'
+            echo
+            echo "#### Probe log"
+            echo '```'
+            tail -c 4000 /tmp/probe.log 2>/dev/null || echo '(no probe log)'
+            echo '```'
+            echo
+            echo "#### Pytest tail (last 8000 chars)"
+            echo '```'
+            tail -c 8000 /tmp/pytest.log 2>/dev/null || echo '(no pytest log)'
+            echo '```'
+            echo
+            echo "#### Daemon log tail (last 6000 chars)"
+            echo '```'
+            sudo tail -c 6000 /tmp/flint-test-daemon.log 2>/dev/null || echo '(no daemon log)'
+            echo '```'
+          } > /tmp/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md --repo "${GITHUB_REPOSITORY}"
