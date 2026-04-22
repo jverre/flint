@@ -84,8 +84,8 @@ class FlintApp(App):
         self.state.volumes = volumes
         self.state.templates = templates
         self.state.config = config_info
-        self._broadcast(SandboxesChanged(reason="snapshot"))
-        self._broadcast(VolumesChanged(reason="snapshot"))
+        self._broadcast(lambda: SandboxesChanged(reason="snapshot"))
+        self._broadcast(lambda: VolumesChanged(reason="snapshot"))
 
     def _start_event_stream(self) -> None:
         if self._event_stream is not None:
@@ -100,7 +100,7 @@ class FlintApp(App):
 
     def _set_ws_connected(self, connected: bool) -> None:
         self.state.ws_connected = connected
-        self._broadcast(WsStateChanged(connected=connected))
+        self._broadcast(lambda: WsStateChanged(connected=connected))
 
     def _resync(self) -> None:
         self.run_worker(self._startup_fetch, thread=True, exclusive=True)
@@ -113,7 +113,7 @@ class FlintApp(App):
             vm = event.get("vm") or {}
             if vm.get("vm_id"):
                 self.state.sandboxes[vm["vm_id"]] = vm
-                self._broadcast(SandboxesChanged(reason=etype))
+                self._broadcast(lambda: SandboxesChanged(reason=etype))
         elif etype == "vm.deleted":
             vm_id = event.get("vm_id")
             if vm_id:
@@ -121,38 +121,52 @@ class FlintApp(App):
                 self.state.selected_ids.discard(vm_id)
                 if self.state.selected_vm_id == vm_id:
                     self.state.selected_vm_id = None
-                self._broadcast(SandboxesChanged(reason=etype))
+                self._broadcast(lambda: SandboxesChanged(reason=etype))
         elif etype == "vm.state_changed":
             vm_id = event.get("vm_id")
             to_state = event.get("to")
             if vm_id and vm_id in self.state.sandboxes:
                 self.state.sandboxes[vm_id]["state"] = to_state or self.state.sandboxes[vm_id].get("state")
-                self._broadcast(SandboxesChanged(reason=etype))
+                self._broadcast(lambda: SandboxesChanged(reason=etype))
         elif etype == "vm.paused":
             vm_id = event.get("vm_id")
             if vm_id and vm_id in self.state.sandboxes:
                 self.state.sandboxes[vm_id]["state"] = "Paused"
-                self._broadcast(SandboxesChanged(reason=etype))
+                self._broadcast(lambda: SandboxesChanged(reason=etype))
         elif etype == "vm.resumed":
             vm = event.get("vm") or {}
             if vm.get("vm_id"):
                 self.state.sandboxes[vm["vm_id"]] = vm
-                self._broadcast(SandboxesChanged(reason=etype))
+                self._broadcast(lambda: SandboxesChanged(reason=etype))
         elif etype == "volume.created":
             vol = event.get("volume") or {}
             if vol.get("id"):
                 self.state.volumes = [v for v in self.state.volumes if v.get("id") != vol["id"]] + [vol]
-                self._broadcast(VolumesChanged(reason=etype))
+                self._broadcast(lambda: VolumesChanged(reason=etype))
         elif etype == "volume.deleted":
             vid = event.get("volume_id")
             if vid:
                 self.state.volumes = [v for v in self.state.volumes if v.get("id") != vid]
-                self._broadcast(VolumesChanged(reason=etype))
+                self._broadcast(lambda: VolumesChanged(reason=etype))
 
-    def _broadcast(self, message) -> None:
-        """Post a message to every mounted screen so widgets can react."""
+    def _broadcast(self, factory) -> None:
+        """Post a fresh message to every widget in every mounted screen.
+
+        Textual messages don't bubble down from screen to descendants, so to
+        reach child widgets' ``on_<name>`` handlers we post a dedicated
+        instance to each. ``factory`` is a callable returning a fresh Message.
+        """
         for screen in list(self.screen_stack):
             try:
-                screen.post_message(message)
+                screen.post_message(factory())
             except Exception:
                 pass
+            try:
+                widgets = list(screen.query("*"))
+            except Exception:
+                widgets = []
+            for widget in widgets:
+                try:
+                    widget.post_message(factory())
+                except Exception:
+                    pass
