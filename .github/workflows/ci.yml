@@ -280,7 +280,9 @@ jobs:
           echo "=== Python package location ==="
           sudo -E env "PATH=$PATH" uv run python -c "import flint.core._template_build as tb; print('__file__:', tb.__file__); print('project_root:', tb._find_project_root())"
       - name: Run agent e2e tests
-        run: sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v -s --tb=long 2>&1 | tee /tmp/pytest-agent-output.log
+        run: |
+          sudo -E env "PATH=$PATH" uv run python -m pytest tests/test_agents.py -v -s --tb=long 2>&1 | tee /tmp/pytest-agent-output.log
+          exit ${PIPESTATUS[0]}
         timeout-minutes: 30
       - name: Print daemon log
         if: always()
