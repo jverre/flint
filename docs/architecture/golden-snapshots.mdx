@@ -20,7 +20,7 @@ When you run `setup-rootfs.sh` or start the daemon for the first time, Flint:
 3. Pauses the VM and saves the full memory state to disk - this is the golden snapshot
 4. All future sandboxes load from this snapshot instead of booting fresh
 
-The snapshot lives at `/microvms/.golden/`. It includes:
+The snapshot lives at `$FLINT_DATA_DIR/.golden/`. It includes:
 
 - `vmstate` - Firecracker VM state (registers, device state)
 - `mem` - full VM memory image
@@ -29,7 +29,7 @@ The snapshot lives at `/microvms/.golden/`. It includes:
 
 Even with snapshot loading, there's still a step that takes time: copying the rootfs image for each new sandbox. The rootfs is an ext4 disk image, and copying a few hundred MB takes time.
 
-To fix this, Flint maintains a pool of pre-copied rootfs images at `/microvms/.pool/`. The pool refills in the background whenever you're not using it. When you create a sandbox, it just claims a pre-copied rootfs from the pool rather than copying it on demand.
+To fix this, Flint maintains a pool of pre-copied rootfs images at `$FLINT_DATA_DIR/.pool/`. The pool refills in the background whenever you're not using it. When you create a sandbox, it just claims a pre-copied rootfs from the pool rather than copying it on demand.
 
 By default the pool keeps 8 images ready (`POOL_TARGET_SIZE = 8`) with 4 background workers copying them in parallel.
 
@@ -45,7 +45,7 @@ Custom templates work the same way. When you call `Template.build()`, Flint:
 
 After that, `Sandbox(template_id=...)` is just as fast as the default template.
 
-Templates are stored in `/microvms/.templates/{template_id}/`.
+Templates are stored in `$FLINT_DATA_DIR/.templates/{template_id}/`.
 
 ## Pause and resume
 

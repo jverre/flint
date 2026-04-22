@@ -45,8 +45,8 @@ The daemon reads configuration from environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLINT_PORT` | `9100` | Port the daemon listens on |
-| `FLINT_DATA_DIR` | `/microvms` (Linux), `~/Library/Application Support/flint/data` (macOS) | Where VM rootfs images and snapshots are stored |
-| `FLINT_STATE_DIR` | `/tmp/flint` (Linux), `~/Library/Application Support/flint/state` (macOS) | Where the daemon keeps its state (SQLite db, pid file, logs) |
+| `FLINT_DATA_DIR` | `/var/lib/flint/data` (Linux), `~/Library/Application Support/flint/data` (macOS) | Where VM rootfs images and snapshots are stored |
+| `FLINT_STATE_DIR` | `/var/lib/flint/state` (Linux), `~/Library/Application Support/flint/state` (macOS) | Where the daemon keeps its state (SQLite db, pid file, logs) |
 | `FLINT_BACKEND` | host default | Backend plugin to use (`firecracker`, `cloud-hypervisor`, `macos-vz`) |
 
 ```bash

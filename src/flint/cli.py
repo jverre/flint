@@ -25,15 +25,43 @@ def start(port, data_dir, state_dir, backend):
         os.environ["FLINT_STATE_DIR"] = state_dir
     if backend is not None:
         os.environ["FLINT_BACKEND"] = backend
-        from flint.core.backends import get_backend, names, BackendNotFound
+    from flint.core.backends import resolve_backend, names, BackendNotFound
+    try:
+        plugin = resolve_backend()
+    except BackendNotFound:
+        click.echo(
+            f"Error: unknown backend {backend!r}. Available: {', '.join(names()) or '(none installed)'}",
+            err=True,
+        )
+        raise SystemExit(2)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(2)
+    problems = plugin.preflight()
+    if problems:
+        click.echo(f"Backend {plugin.name!r} preflight failed:", err=True)
+        for p in problems:
+            click.echo(f"  - {p}", err=True)
+        click.echo(f"Attempting to install missing dependencies for {plugin.name!r}...", err=True)
         try:
-            get_backend(backend)
-        except BackendNotFound:
+            plugin.install_dependencies()
+        except NotImplementedError:
             click.echo(
-                f"Error: unknown backend {backend!r}. Available: {', '.join(names()) or '(none installed)'}",
+                f"Error: backend {plugin.name!r} has no install_dependencies hook. "
+                f"Fix the problems above and re-run.",
                 err=True,
             )
             raise SystemExit(2)
+        except Exception as exc:
+            click.echo(f"Error: install_dependencies failed: {exc}", err=True)
+            raise SystemExit(2)
+        problems = plugin.preflight()
+        if problems:
+            click.echo("Still not ready after install:", err=True)
+            for p in problems:
+                click.echo(f"  - {p}", err=True)
+            raise SystemExit(2)
+        click.echo(f"Backend {plugin.name!r} ready.", err=True)
     # On macOS, ensure the Python binary has the virtualization entitlement.
     # This may os.execv() — the call never returns in that case.
     import platform

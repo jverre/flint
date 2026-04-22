@@ -477,8 +477,8 @@ Flint is configured via environment variables.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLINT_PORT` | `9100` | Daemon listen port |
-| `FLINT_DATA_DIR` | `/microvms` (Linux), `~/Library/Application Support/flint/data` (macOS) | Data directory for VMs |
-| `FLINT_STATE_DIR` | `/tmp/flint` (Linux), `~/Library/Application Support/flint/state` (macOS) | State directory for daemon files |
+| `FLINT_DATA_DIR` | `/var/lib/flint/data` (Linux), `~/Library/Application Support/flint/data` (macOS) | Data directory for VMs |
+| `FLINT_STATE_DIR` | `/var/lib/flint/state` (Linux), `~/Library/Application Support/flint/state` (macOS) | State directory for daemon files |
 
 ### Storage
 

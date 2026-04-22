@@ -10,7 +10,7 @@ def _default_dirs() -> tuple[str, str]:
     if system == "Darwin":
         base = os.path.expanduser("~/Library/Application Support/flint")
         return f"{base}/data", f"{base}/state"
-    return "/microvms", "/tmp/flint"
+    return "/var/lib/flint/data", "/var/lib/flint/state"
 
 # ── Env-var-driven directories ────────────────────────────────────────────
 _DEFAULT_DATA_DIR, _DEFAULT_STATE_DIR = _default_dirs()
