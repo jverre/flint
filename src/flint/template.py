@@ -114,7 +114,7 @@ class Template:
         from flint.core._template_build import _generate_dockerfile
         return _generate_dockerfile(self._base_image, self._steps)
 
-    def build(self, poll_interval: float = 2.0) -> TemplateInfo:
+    def build(self, poll_interval: float = 2.0, timeout: float = 600.0) -> TemplateInfo:
         """Build the template via the daemon. Blocks until complete."""
         dockerfile = self._to_dockerfile()
         client = _get_client()
@@ -126,20 +126,28 @@ class Template:
             )
             template_id = result["template_id"]
 
-            # Poll until build completes
+            # Poll until build completes.  The build runs in a background
+            # thread on the daemon — the template may not appear in the
+            # registry for a short window after the POST returns, so treat
+            # None as "not yet registered" rather than an error.
+            start = time.monotonic()
             while True:
-                info = client.get_template(template_id)
-                if info is None:
-                    raise RuntimeError(f"Template {template_id} disappeared during build")
-                status = info.get("status", "unknown")
-                if status == "ready":
-                    return TemplateInfo(
-                        template_id=template_id,
-                        name=self._name,
-                        status="ready",
+                elapsed = time.monotonic() - start
+                if elapsed > timeout:
+                    raise RuntimeError(
+                        f"Template {template_id} build timed out after {timeout}s"
                     )
-                if status == "failed":
-                    raise RuntimeError(f"Template build failed: {template_id}")
+                info = client.get_template(template_id)
+                if info is not None:
+                    status = info.get("status", "unknown")
+                    if status == "ready":
+                        return TemplateInfo(
+                            template_id=template_id,
+                            name=self._name,
+                            status="ready",
+                        )
+                    if status == "failed":
+                        raise RuntimeError(f"Template build failed: {template_id}")
                 time.sleep(poll_interval)
         finally:
             client.close()

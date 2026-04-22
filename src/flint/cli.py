@@ -149,3 +149,141 @@ def list_vms():
         age = time.time() - sb.created_at
         age_str = f"{int(age)}s" if age < 60 else f"{int(age / 60)}m"
         click.echo(f"  {sb.id[:8]}  pid={sb.pid}  state={sb.state}  age={age_str}")
+
+
+# ── Agent commands ─────────────────────────────────────────────────────────
+
+@cli.group()
+def agents():
+    """Manage pre-packaged AI agents."""
+    pass
+
+
+@agents.command(name="list")
+def agents_list():
+    """List all available agents in the catalog."""
+    from flint.agents.catalog import list_agents
+    catalog = list_agents()
+    if not catalog:
+        click.echo("No agents available.")
+        return
+    click.echo("Available agents:\n")
+    for defn in catalog:
+        click.echo(f"  {defn.name:<12} {defn.description}")
+        click.echo(f"  {'':12} repo: {defn.repo}")
+        click.echo(f"  {'':12} license: {defn.license}  tags: {', '.join(defn.tags)}")
+        click.echo()
+
+
+@agents.command()
+@click.argument("name")
+def info(name):
+    """Show detailed information about an agent."""
+    from flint.agents.catalog import get_agent
+    defn = get_agent(name)
+    if defn is None:
+        click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
+        raise SystemExit(1)
+    click.echo(f"Name:         {defn.name}")
+    click.echo(f"Description:  {defn.description}")
+    click.echo(f"Repository:   {defn.repo}")
+    click.echo(f"Version:      {defn.version}")
+    click.echo(f"Homepage:     {defn.homepage}")
+    click.echo(f"License:      {defn.license}")
+    click.echo(f"Tags:         {', '.join(defn.tags)}")
+    click.echo(f"Rootfs size:  {defn.rootfs_size_mb} MB")
+    if defn.default_env:
+        click.echo(f"Default env:")
+        for k, v in defn.default_env.items():
+            click.echo(f"  {k}={v}")
+
+
+@agents.command()
+@click.argument("name", required=False, default=None)
+@click.option("--all", "build_all", is_flag=True, default=False, help="Build all agents in the catalog")
+@click.option("--force", is_flag=True, default=False, help="Rebuild even if already cached")
+@click.option("--rootfs-size", type=int, default=None, help="Override rootfs size in MB")
+def build(name, build_all, force, rootfs_size):
+    """Pre-build agent template(s) for instant deploys.
+
+    Build a single agent by name, or use --all to build every agent in the
+    catalog. Subsequent deploys will boot from the cached snapshot in
+    milliseconds instead of rebuilding the image from scratch.
+    """
+    from flint.sandbox import Sandbox
+    if not Sandbox.is_daemon_running():
+        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
+        raise SystemExit(1)
+
+    if not build_all and name is None:
+        click.echo("Error: Provide an agent name or use --all.", err=True)
+        raise SystemExit(1)
+
+    from flint.agents.agent import Agent
+
+    if build_all:
+        from flint.agents.catalog import list_agents
+        targets = [defn.name for defn in list_agents()]
+        click.echo(f"Building {len(targets)} agent template(s)...")
+    else:
+        from flint.agents.catalog import get_agent
+        if get_agent(name) is None:
+            click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
+            raise SystemExit(1)
+        targets = [name]
+
+    for agent_name in targets:
+        status = "force-rebuilding" if force else "building"
+        click.echo(f"  [{status}] {agent_name}...")
+        info = Agent.build(agent_name, rootfs_size_mb=rootfs_size, force=force)
+        click.echo(f"  [ready]    {agent_name} -> {info.template_id}")
+
+    click.echo(f"\nDone! {len(targets)} agent template(s) ready for instant deploy.")
+
+
+@agents.command()
+@click.argument("name")
+@click.option("--env", "-e", multiple=True, help="Environment variables (KEY=VALUE)")
+@click.option("--rootfs-size", type=int, default=None, help="Override rootfs size in MB")
+@click.option("--no-internet", is_flag=True, default=False, help="Disable internet access")
+@click.option("--force-build", is_flag=True, default=False, help="Force template rebuild even if cached")
+def deploy(name, env, rootfs_size, no_internet, force_build):
+    """Build (if needed) and deploy an agent in a Flint microVM."""
+    from flint.sandbox import Sandbox
+    if not Sandbox.is_daemon_running():
+        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
+        raise SystemExit(1)
+
+    from flint.agents.catalog import get_agent
+    defn = get_agent(name)
+    if defn is None:
+        click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
+        raise SystemExit(1)
+
+    # Parse environment variables
+    env_dict: dict[str, str] = {}
+    for entry in env:
+        if "=" not in entry:
+            click.echo(f"Error: Invalid env format '{entry}'. Use KEY=VALUE.", err=True)
+            raise SystemExit(1)
+        k, v = entry.split("=", 1)
+        env_dict[k] = v
+
+    click.echo(f"Deploying {defn.name}...")
+    click.echo(f"  Building template (this may take a few minutes on first run)...")
+
+    from flint.agents.agent import Agent
+    agent = Agent.deploy(
+        name,
+        env=env_dict or None,
+        rootfs_size_mb=rootfs_size,
+        allow_internet_access=not no_internet,
+        force_build=force_build,
+    )
+
+    click.echo(f"  Agent '{agent.name}' deployed successfully!")
+    click.echo(f"  Sandbox ID: {agent.sandbox.id}")
+    click.echo(f"  Template:   {agent.template_info.template_id}")
+    click.echo()
+    click.echo(f"  Run commands:  flint agents exec {agent.sandbox.id[:8]} '<command>'")
+    click.echo(f"  Stop agent:    flint stop {agent.sandbox.id[:8]}")
