@@ -17,7 +17,8 @@ wheels/
 .idea/
 
 # Claude Code
-.claude/
+.claude/*
+!.claude/rules/
 
 # Codex
 .codex/
