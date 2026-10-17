@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from flint._client.client import DaemonClient, _TerminalConnection
 from flint.core.config import DAEMON_URL, TERM_COLS, TERM_ROWS
+
+if TYPE_CHECKING:
+    from flint.volume import Volume
 
 _client: DaemonClient | None = None
 
@@ -246,6 +249,22 @@ class Sandbox:
     def list_files(self, path: str = "/") -> list[dict]:
         """List files in a directory."""
         return _get_client().list_files(self._id, path)
+
+    # ── Volumes ─────────────────────────────────────────────────────────────
+
+    def mount(self, volume: Volume | str, path: str, *, subpath: str = "", readonly: bool = False) -> dict:
+        """Mount a volume (or one subpath of it) at ``path``, now, while running."""
+        ref = volume if isinstance(volume, str) else volume.id
+        return _get_client().mount(self._id, ref, path, subpath=subpath, readonly=readonly)
+
+    def unmount(self, path: str) -> None:
+        """Unmount the volume at ``path``."""
+        _get_client().unmount(self._id, path)
+
+    @property
+    def mounts(self) -> list[dict]:
+        """Volumes currently mounted in this sandbox."""
+        return _get_client().list_mounts(self._id)
 
     def _fetch(self) -> dict | None:
         return _get_client().get(self._id)

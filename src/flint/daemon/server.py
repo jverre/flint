@@ -23,7 +23,8 @@ from flint.core.manager import SandboxManager
 from flint.core._template_registry import (
     list_templates, get_template, delete_template as _delete_template,
 )
-from flint.core._volumes import VolumeStore
+from flint.core._volumes import Volumes, VolumeError
+from flint.core import _nfs_server
 from flint.core._metrics import MetricsSampler
 from flint.core import _logs
 from flint.daemon import events as _events
@@ -443,6 +444,29 @@ async def terminal_ws(websocket: WebSocket, vm_id: str):
 
 # ── Events broadcast WebSocket ────────────────────────────────────────────
 
+async def _forward(websocket: WebSocket, q: asyncio.Queue, send) -> None:
+    """Send queue items to the client until it disconnects.
+
+    Also waits on the socket, so the handler ends when the client goes away
+    or the server closes it on shutdown, instead of blocking on the queue.
+    """
+    receive = asyncio.ensure_future(websocket.receive())
+    get = asyncio.ensure_future(q.get())
+    try:
+        while True:
+            done, _ = await asyncio.wait({receive, get}, return_when=asyncio.FIRST_COMPLETED)
+            if get in done:
+                await send(get.result())
+                get = asyncio.ensure_future(q.get())
+            if receive in done:
+                if receive.result()["type"] == "websocket.disconnect":
+                    return
+                receive = asyncio.ensure_future(websocket.receive())  # clients send nothing we use
+    finally:
+        receive.cancel()
+        get.cancel()
+
+
 @app.websocket("/events")
 async def events_ws(websocket: WebSocket):
     """Stream daemon-wide lifecycle events to a subscriber."""
@@ -453,9 +477,7 @@ async def events_ws(websocket: WebSocket):
     await websocket.accept()
     q = bus.subscribe()
     try:
-        while True:
-            event = await q.get()
-            await websocket.send_json(event)
+        await _forward(websocket, q, websocket.send_json)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -478,9 +500,7 @@ async def logs_ws(websocket: WebSocket, vm_id: str):
         await websocket.send_text(line)
     q = bus.subscribe(vm_id)
     try:
-        while True:
-            line = await q.get()
-            await websocket.send_text(line)
+        await _forward(websocket, q, websocket.send_text)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -560,44 +580,65 @@ def delete_template_endpoint(template_id: str):
 
 # ── Volume endpoints ──────────────────────────────────────────────────────
 
-def _require_volumes() -> VolumeStore:
+def _require_volumes() -> Volumes:
     daemon = _get_daemon()
     if daemon.volumes is None:
-        raise HTTPException(status_code=503, detail="Volume store not initialized")
+        raise HTTPException(status_code=503, detail="Volumes not initialized")
     return daemon.volumes
+
+
+def _volume_call(fn, *args):
+    try:
+        return fn(*args)
+    except VolumeError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
 
 
 @app.get("/volumes")
 def list_volumes():
-    vols = _require_volumes().list()
-    print(f"GET /volumes — {len(vols)} volumes")
-    return {"volumes": [v.to_dict() for v in vols]}
+    return {"volumes": [v.to_dict() for v in _require_volumes().list()]}
 
 
 @app.post("/volumes")
 def create_volume(body: dict):
-    name = body.get("name")
-    size_gib = body.get("size_gib")
-    if not isinstance(name, str) or not name:
-        raise HTTPException(status_code=400, detail="'name' is required")
-    if not isinstance(size_gib, int):
-        raise HTTPException(status_code=400, detail="'size_gib' must be an integer")
-    try:
-        vol = _require_volumes().create(name, size_gib)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    vol = _volume_call(_require_volumes().create, body.get("name"))
     _events.publish("volume.created", volume=vol.to_dict())
-    print(f"POST /volumes — created {vol.id} ({name}, {size_gib} GiB)")
+    print(f"POST /volumes — created {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 
-@app.delete("/volumes/{volume_id}")
-def delete_volume(volume_id: str):
-    ok = _require_volumes().delete(volume_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Volume not found")
-    _events.publish("volume.deleted", volume_id=volume_id)
-    print(f"DELETE /volumes/{volume_id} — deleted")
+@app.delete("/volumes/{volume}")
+def delete_volume(volume: str):
+    vol = _volume_call(_require_volumes().delete, volume)
+    _events.publish("volume.deleted", volume_id=vol.id)
+    print(f"DELETE /volumes/{vol.id} — deleted")
+    return {"ok": True}
+
+
+@app.get("/vms/{vm_id}/mounts")
+def list_mounts(vm_id: str):
+    return {"mounts": [m.to_dict() for m in _require_volumes().list_mounts(vm_id)]}
+
+
+@app.post("/vms/{vm_id}/mounts")
+def mount_volume(vm_id: str, body: dict):
+    """Mount a volume (or a subpath of it) into a running sandbox."""
+    m = _volume_call(
+        _require_volumes().mount, vm_id, body.get("volume"), body.get("path"),
+        body.get("subpath", ""), body.get("readonly", False),
+    )
+    _events.publish("volume.attached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
+    _logs.append(vm_id, f"Mounted volume {m.volume_id}:/{m.subpath} at {m.path} ({'ro' if m.readonly else 'rw'})")
+    print(f"POST /vms/{vm_id[:8]}/mounts — {m.volume_id} at {m.path}")
+    return {"mount": m.to_dict()}
+
+
+@app.delete("/vms/{vm_id}/mounts")
+def unmount_volume(vm_id: str, path: str):
+    m = _volume_call(_require_volumes().unmount, vm_id, path)
+    _events.publish("volume.detached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
+    _logs.append(vm_id, f"Unmounted {m.path}")
+    print(f"DELETE /vms/{vm_id[:8]}/mounts — {m.path}")
     return {"ok": True}
 
 
@@ -664,7 +705,7 @@ class FlintDaemon:
         self._health_monitor = None
         self._lifecycle_manager = None
         self.storage = None
-        self.volumes: VolumeStore | None = None
+        self.volumes: Volumes | None = None
         self.metrics: MetricsSampler | None = None
 
     def run(self) -> None:
@@ -674,11 +715,13 @@ class FlintDaemon:
         self._init_dirs()
         self._write_pid()
         self._prepare_backend()
+        self._init_nfs_server()
         self._init_storage()
         self._start_pool()
         self._init_state_store()
         self._init_manager()
         self._recover_sandboxes()
+        self.volumes.replay()
         self._start_health_monitor()
         self._start_lifecycle()
         self._install_signal_handlers()
@@ -700,6 +743,15 @@ class FlintDaemon:
         self.golden_ready = artifact.get("status") == "ready"
         print(f"Backend ready: {self.backend.kind}")
 
+    def _init_nfs_server(self) -> None:
+        if self.backend.kind.startswith("macos"):
+            return  # No bridge network to serve volumes on.
+        try:
+            _nfs_server.ensure_running()
+            print("NFS server ready.")
+        except _nfs_server.NfsServerError as e:
+            print(f"NFS server unavailable, volumes can't be mounted: {e}")
+
     def _init_storage(self) -> None:
         from flint.core.storage import get_storage_backend
         self.storage = get_storage_backend()
@@ -713,13 +765,18 @@ class FlintDaemon:
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
-        self.volumes = VolumeStore(self._state_store._conn)
         print("State store initialized.")
 
     def _init_manager(self) -> None:
         self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
+        self.volumes = Volumes(self._state_store._conn, self.manager, self._state_store)
+        self.manager.kill_hooks.append(self._release_mounts)
         self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [])
         _write_state(self)
+
+    def _release_mounts(self, vm_id: str) -> None:
+        for m in self.volumes.release_vm(vm_id):
+            _events.publish("volume.detached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
 
     def _recover_sandboxes(self) -> None:
         if not self._state_store or not self.manager:
@@ -789,6 +846,7 @@ class FlintDaemon:
                 uvicorn_thread = threading.Thread(
                     target=lambda: uvicorn.run(
                         app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning",
+                        timeout_graceful_shutdown=5,
                     ),
                     daemon=True,
                 )
@@ -796,4 +854,5 @@ class FlintDaemon:
                 self.backend._runtime.run_loop()  # blocks forever
                 return
 
-        uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning")
+        # The timeout is a backstop: a stuck handler mustn't keep the daemon alive.
+        uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning", timeout_graceful_shutdown=5)

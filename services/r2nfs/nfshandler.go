@@ -3,33 +3,49 @@ package main
 import (
 	"context"
 	"net"
+	"strings"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/memfs"
 	nfs "github.com/willscott/go-nfs"
 )
 
-// nfsHandler wraps ExportManager to provide per-client overlay filesystems.
+// nfsHandler serves two kinds of export: the client's R2 workspace overlay,
+// and volume mounts ("/<mount id>").
 type nfsHandler struct {
 	exports *ExportManager
+	volumes *VolumeManager
 }
 
-func newNFSHandler(exports *ExportManager) nfs.Handler {
-	return &nfsHandler{exports: exports}
+func newNFSHandler(exports *ExportManager, volumes *VolumeManager) nfs.Handler {
+	return &nfsHandler{exports: exports, volumes: volumes}
 }
 
 // Mount returns the billy.Filesystem for the requesting client.
-// Each client gets its own overlay (sandbox layer + template layer).
+// A path naming a volume mount registered for this client gets that volume;
+// anything else gets the client's workspace overlay (sandbox + template layer).
 func (h *nfsHandler) Mount(ctx context.Context, conn net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
 	clientIP := extractIP(conn.RemoteAddr())
 
+	if mount := h.volumes.Lookup(strings.Trim(string(req.Dirpath), "/"), clientIP); mount != nil {
+		return nfs.MountStatusOk, newVolumeFS(mount), []nfs.AuthFlavor{nfs.AuthFlavorNull}
+	}
+
+	if h.exports.r2 == nil {
+		return nfs.MountStatusErrNoEnt, refusedFS, nil
+	}
 	export := h.exports.Lookup(clientIP)
 	if export == nil {
-		return nfs.MountStatusErrNoEnt, nil, nil
+		return nfs.MountStatusErrNoEnt, refusedFS, nil
 	}
 
 	fs := newOverlayFS(h.exports.r2, h.exports.cache, export.VMID, export.TemplateID)
 	return nfs.MountStatusOk, fs, []nfs.AuthFlavor{nfs.AuthFlavorNull}
 }
+
+// refusedFS is returned with refused mounts: go-nfs makes a handle for the
+// filesystem even then (and crashes on nil), but never sends it.
+var refusedFS = memfs.New()
 
 // Change returns a billy.Change for tracking filesystem mutations.
 func (h *nfsHandler) Change(fs billy.Filesystem) billy.Change {

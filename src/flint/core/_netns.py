@@ -19,8 +19,8 @@ from .config import (
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 _CLONE_NEWNET = 0x40000000
 
-# Every live Flint netns with a bridge veth -> its veth IP. r2nfs authorizes
-# workspace exports by this IP, so two live namespaces must never share one.
+# Every live Flint netns with a bridge veth -> its veth IP. The NFS server
+# authorizes workspace exports and volume mounts by this IP, so two live namespaces must never share one.
 _veth_ips: dict[str, str] = {}
 _veth_next = 2
 _veth_ip_lock = threading.Lock()
@@ -239,16 +239,19 @@ BLOCKED_EGRESS = (
 
 @functools.cache
 def storage_endpoints() -> tuple[tuple[str, str, int], ...]:
-    """``(ip, proto, port)`` the guest must reach for workspace storage, despite BLOCKED_EGRESS."""
+    """``(ip, proto, port)`` the guest must reach for storage, despite BLOCKED_EGRESS.
+
+    Always Flint's own NFS server on the bridge (volumes, and R2 workspaces);
+    plus the S3 Files endpoint when that backend is configured.
+    """
     from . import config
 
-    if config.STORAGE_BACKEND == "r2":
-        return tuple((BRIDGE_IP, proto, config.R2NFS_PORT) for proto in ("tcp", "udp"))
+    endpoints = [(BRIDGE_IP, "tcp", config.R2NFS_PORT)]
     if config.STORAGE_BACKEND == "s3_files" and config.S3_FILES_NFS_ENDPOINT:
         host = config.S3_FILES_NFS_ENDPOINT.split(":", 1)[0]
         ips = {info[4][0] for info in socket.getaddrinfo(host, 2049, socket.AF_INET, socket.SOCK_STREAM)}
-        return tuple((ip, "tcp", 2049) for ip in sorted(ips))
-    return ()
+        endpoints += [(ip, "tcp", 2049) for ip in sorted(ips)]
+    return tuple(endpoints)
 
 
 def _egress_rules(chain: str) -> list[str]:

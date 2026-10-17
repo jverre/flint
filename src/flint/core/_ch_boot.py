@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 
 from . import _cloud_hypervisor as _ch
 from ._boot import _RecoveredProcess as _RecoveredChProcess, _timed  # noqa: F401 (re-exported)
-from ._artifacts import dig_holes, link_into, sparse_copy
+from ._artifacts import dig_holes, golden_inputs_current, link_into, record_golden_inputs, sparse_copy
 from ._ch_jail import JAIL_KERNEL, JAIL_ROOTFS, ChJail
 from ._jailfs import copy_out
 from ._firecracker import _wait_for_agent
@@ -416,16 +416,13 @@ def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_
         raise RuntimeError(f"source rootfs not found: {source_rootfs}") from exc
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "rootfs.ext4")
-    try:
-        installed = os.path.getsize(dest) == source_size
-    except FileNotFoundError:
-        installed = False
-    if not installed:
-        sparse_copy(source_rootfs, dest)
+    if not os.path.exists(dest) or not golden_inputs_current(dest_dir):
         shutil.rmtree(_snapshot_dir(dest_dir), ignore_errors=True)
+        sparse_copy(source_rootfs, dest)
         log.info("CH golden rootfs installed: %s (%d bytes)", dest, source_size)
     if not ch_snapshot_ready(dest_dir):
         ch_create_golden_snapshot(dest_dir)
+    record_golden_inputs(dest_dir)
 
 
 def ch_golden_ready(dest_dir: str = CH_GOLDEN_DIR) -> bool:

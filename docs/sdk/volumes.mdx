@@ -1,0 +1,48 @@
+---
+title: "Volumes"
+description: "Share files between sandboxes by mounting volumes while they run."
+---
+
+A volume is a directory on the host. You can mount it, or one subdirectory of it, into any running sandbox at any time, read-write or read-only. There's no limit on how many you mount or when.
+
+```python
+from flint import Sandbox, Volume
+
+results = Volume.create("results")
+
+parent = Sandbox()
+parent.mount(results, "/results", readonly=True)
+
+for task in tasks:
+    child = Sandbox()
+    child.mount(results, "/out", subpath=child.id)
+    child.commands.run(f"run-task {task} > /out/report.md")
+    # The parent reads it as soon as it's written:
+    # /results/<child id>/report.md
+```
+
+## One writer per subtree
+
+A read-write mount owns its subtree. Mounting the same volume read-write over an overlapping subpath (the same directory, or one inside the other) fails with `409` and names the sandbox that holds it. Read-only mounts are unlimited and always allowed. Give each writer its own `subpath` and mount the volume read-only wherever you want to read everything.
+
+The lock is released when the writer unmounts, or when its sandbox is killed.
+
+## Methods
+
+| Method | Description |
+|--------|-------------|
+| `Volume.create(name)` | Create an empty volume |
+| `Volume.get(name)` | Find a volume by name or ID, or `None` |
+| `Volume.list()` | All volumes |
+| `volume.delete()` | Delete the volume and its files (fails while mounted) |
+| `sandbox.mount(volume, path, subpath="", readonly=False)` | Mount into the running sandbox; `volume` may also be a name or ID |
+| `sandbox.unmount(path)` | Unmount |
+| `sandbox.mounts` | Volumes mounted in this sandbox |
+
+## Behaviour
+
+- **Visibility:** read-only mounts revalidate every second, so readers see new files and changes within about a second of a writer closing them.
+- **Pause and resume:** mounts survive pause/resume and daemon restarts.
+- **Isolation:** each mount is authorized for one sandbox only. Another sandbox can't use it, and unmounting revokes access on the host even if the guest kept file handles.
+- **Performance:** every file operation goes to the host over NFS. Use volumes to share files between sandboxes. Keep package installs, builds and databases on the sandbox's own disk, which is much faster for metadata-heavy work.
+- **Requirements:** sandboxes created with `allow_internet_access=False` can't mount volumes (they have no network path to the host). The guest kernel needs an NFSv3 client. Flint's guest kernel, which `flint install-deps` installs, has one.

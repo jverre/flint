@@ -9,7 +9,6 @@ import platform
 import shutil
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import httpx
 import pytest
@@ -27,6 +26,15 @@ def test_create_and_kill(sandbox):
     # Give daemon a moment to update state
     time.sleep(0.3)
     assert not sandbox.is_running()
+
+
+def test_kill_paused_sandbox(sandbox):
+    """Killing a paused sandbox deletes it; it can't be resumed afterwards."""
+    sandbox.pause()
+    sandbox.kill()
+    assert sandbox.state == "Dead"
+    with pytest.raises(RuntimeError):
+        sandbox.resume()
 
 
 def test_sandbox_properties(sandbox):
@@ -393,54 +401,26 @@ def test_network_policy_round_trip(sandbox):
     assert rules[0]["transform"][0]["headers"]["Authorization"] == "Bearer test-token"
 
 
-def test_network_policy_injects_headers(require_sandbox):
-    """Verify the credential proxy actually injects headers into guest HTTP requests."""
+def test_network_policy_injects_credentials_over_https(require_sandbox):
+    """The proxy injects the policy's header into the guest's HTTPS requests, replacing any the guest sent.
+
+    Uses a public echo service: injection is TLS-only and keyed on the SNI, so
+    it has to be a real domain with a real certificate.
+    """
     if platform.system() != "Linux":
         pytest.skip("Network policy injection requires Linux (iptables)")
-
-    # Start a tiny HTTP echo server on the host that returns request headers as JSON.
-    class EchoHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            headers = {k: v for k, v in self.headers.items()}
-            body = json.dumps(headers).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format, *args):
-            pass  # suppress request logging
-
-    server = HTTPServer(("0.0.0.0", 18199), EchoHandler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-
+    sb = Sandbox(network_policy={
+        "allow": {"postman-echo.com": [{"transform": [{"headers": {"X-Flint-Auth": "secret-12345"}}]}]}
+    })
     try:
-        sb = Sandbox(
-            network_policy={
-                "allow": {
-                    "echo-test.local": [
-                        {"transform": [{"headers": {"X-Flint-Auth": "secret-12345"}}]}
-                    ]
-                }
-            }
+        result = sb.commands.run(
+            'wget -q -O - --header="X-Flint-Auth: guest-value" https://postman-echo.com/headers', timeout=30
         )
-        try:
-            # Guest wget to host IP; Host header triggers domain matching in the proxy.
-            # The proxy intercepts port 80 via iptables REDIRECT.
-            result = sb.commands.run(
-                'wget -q -O - --header="Host: echo-test.local" http://172.16.0.1:18199/'
-            )
-            if result.exit_code != 0:
-                pytest.skip(f"Could not reach echo server from guest: {result.stderr}")
-            body = result.stdout
-            assert "X-Flint-Auth" in body or "x-flint-auth" in body.lower()
-            assert "secret-12345" in body
-        finally:
-            sb.kill()
+        assert result.exit_code == 0, f"HTTPS through the proxy failed: {result.stdout}{result.stderr}"
+        headers = {k.lower(): v for k, v in json.loads(result.stdout)["headers"].items()}
+        assert headers.get("x-flint-auth") == "secret-12345", headers
     finally:
-        server.shutdown()
+        sb.kill()
 
 
 # ── Timeout ────────────────────────────────────────────────────────────────

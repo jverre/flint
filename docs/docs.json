@@ -50,7 +50,8 @@
               "sdk/agents",
               "sdk/commands",
               "sdk/pty",
-              "sdk/templates"
+              "sdk/templates",
+              "sdk/volumes"
             ]
           }
         ]
@@ -85,6 +86,7 @@
               "api-reference/processes",
               "api-reference/files",
               "api-reference/templates",
+              "api-reference/volumes",
               "api-reference/terminal"
             ]
           }

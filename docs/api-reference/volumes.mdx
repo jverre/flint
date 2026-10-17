@@ -1,0 +1,69 @@
+---
+title: "Volumes"
+description: "Create volumes and mount them into running sandboxes."
+---
+
+See the [Volumes SDK guide](/sdk/volumes) for the model: one writer per subtree, unlimited readers.
+
+## Create a volume
+
+`POST /volumes`
+
+```json
+{"name": "results"}
+```
+
+**Response** `200`
+
+```json
+{"volume": {"id": "vol-3f2a9c1b7e44", "name": "results", "created_at": 1792241938.57}}
+```
+
+`400` for an invalid name (1-63 letters, digits, `.`, `_`, `-`), `409` if the name exists.
+
+## List volumes
+
+`GET /volumes` → `{"volumes": [...]}`
+
+## Delete a volume
+
+`DELETE /volumes/{id or name}` → `{"ok": true}`. `409` while it is mounted anywhere.
+
+---
+
+## Mount a volume
+
+`POST /vms/{vm_id}/mounts`
+
+```json
+{"volume": "results", "path": "/results", "subpath": "", "readonly": true}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `volume` | string | required | Volume ID or name |
+| `path` | string | required | Absolute mount point in the sandbox (created if missing) |
+| `subpath` | string | `""` | Mount only this directory of the volume (created if missing) |
+| `readonly` | bool | `false` | Read-only mount |
+
+**Response** `200`
+
+```json
+{"mount": {"id": "mnt-…", "volume_id": "vol-3f2a9c1b7e44", "vm_id": "…", "path": "/results",
+           "subpath": "", "readonly": true, "created_at": 1792241990.1}}
+```
+
+| Status | Meaning |
+|--------|---------|
+| `404` | Volume not found |
+| `409` | Sandbox not running, `path` already in use, or another sandbox holds an overlapping read-write mount |
+
+Publishes `volume.attached` on the [events stream](/api-reference/overview).
+
+## List mounts
+
+`GET /vms/{vm_id}/mounts` → `{"mounts": [...]}`
+
+## Unmount
+
+`DELETE /vms/{vm_id}/mounts?path=/results` → `{"ok": true}`. Works on paused sandboxes too (access is revoked on the host). Publishes `volume.detached`. Killing a sandbox releases all its mounts.

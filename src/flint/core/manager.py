@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .backends.base import HostBackend
 from .config import log, DEFAULT_TEMPLATE_ID
@@ -49,6 +49,8 @@ class SandboxManager:
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
         self._state_store = state_store
+        # Called with the sandbox ID just before a sandbox is killed.
+        self.kill_hooks: list[Callable[[str], None]] = []
 
     def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> str:
         """Start an interactive VM from a template snapshot. Returns the vm_id."""
@@ -123,7 +125,11 @@ class SandboxManager:
 
         # Start credential proxy if network policy has transforms
         if network_policy:
-            self._apply_network_policy(entry, network_policy)
+            try:
+                self._apply_network_policy(entry, network_policy)
+            except Exception:
+                self.kill(vm_id)
+                raise
 
         total_ms = (time.monotonic() - boot.t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
@@ -134,7 +140,16 @@ class SandboxManager:
     def kill(self, sandbox_id: str) -> None:
         with self._lock:
             entry = self._sandboxes.pop(sandbox_id, None)
+        for hook in self.kill_hooks:
+            try:
+                hook(sandbox_id)
+            except Exception:
+                log.exception("[%s] kill hook failed", sandbox_id[:8])
         if not entry:
+            row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
+            if row and row["state"] == SandboxState.PAUSED.value:
+                self._backend.discard_paused(row)
+                self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
             return
 
         # Stop credential proxy before tearing down the VM
@@ -332,11 +347,32 @@ class SandboxManager:
                 proxy.start(rules)
                 entry.proxy = proxy
                 _setup_proxy_redirect(entry.ns_name)
+                self._trust_proxy_ca(entry, proxy)
         else:
             if entry.proxy:
                 entry.proxy.stop()
                 entry.proxy = None
                 _remove_proxy_redirect(entry.ns_name)
+
+    def _trust_proxy_ca(self, entry: _SandboxEntry, proxy) -> None:
+        """Add the proxy's CA to the guest's system trust bundle.
+
+        Credentials are only injected over TLS, which the proxy terminates
+        with certificates from its CA; without this, TLS clients in the guest
+        reject the connection. Idempotent, and the guest disk keeps it across
+        pause/resume. Only the public certificate leaves the host.
+        """
+        with open(proxy.ca_cert_path) as f:
+            cert = f.read().strip()
+        script = (
+            'mkdir -p /etc/ssl/certs && cd /etc/ssl/certs || exit 1\n'
+            '[ "$(cat flint-proxy-ca.pem 2>/dev/null)" = "$1" ] && exit 0\n'
+            'printf "%s\\n" "$1" > flint-proxy-ca.pem && printf "%s\\n" "$1" >> ca-certificates.crt\n'
+        )
+        body = json.dumps({"cmd": ["/bin/sh", "-c", script, "sh", cert], "timeout": 10}).encode()
+        status, resp = self._backend.proxy_guest_request(entry, "POST", "/exec", body, timeout=15)
+        if status != 200 or json.loads(resp).get("exit_code") != 0:
+            raise RuntimeError(f"Installing the proxy CA in the guest failed: {resp[:300]!r}")
 
     @property
     def backend_kind(self) -> str:

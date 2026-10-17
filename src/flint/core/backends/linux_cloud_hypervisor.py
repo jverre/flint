@@ -499,6 +499,10 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
         _delete_template_artifact(template_id, self.kind)
 
+    def discard_paused(self, row: dict) -> None:
+        # Its VMM exited at pause; the recorded pid may belong to something else now.
+        self._cleanup_dead_row({**row, "pid": 0})
+
     @staticmethod
     def _cleanup_dead_row(row: dict) -> None:
         vm_id = row["vm_id"]
