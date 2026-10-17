@@ -122,12 +122,15 @@ func Attach(conn FileConn, devPath, export string, timeout time.Duration) (*Devi
 		d.done <- err
 	}()
 
-	// The pid attribute appears once the kernel is serving the device.
-	pidFile := filepath.Join("/sys/block", filepath.Base(devPath), "pid")
+	// Ready once the kernel serves the device (its pid attribute appears)
+	// and has published its size, which some kernels do a moment later.
+	sys := filepath.Join("/sys/block", filepath.Base(devPath))
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat(pidFile); err == nil {
-			return d, nil
+		if _, err := os.Stat(filepath.Join(sys, "pid")); err == nil {
+			if sz, err := os.ReadFile(filepath.Join(sys, "size")); err == nil && len(sz) > 0 && sz[0] != '0' {
+				return d, nil
+			}
 		}
 		select {
 		case err := <-d.done:
