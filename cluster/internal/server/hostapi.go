@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net"
@@ -81,20 +82,29 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	var hash, zone, labels string
-	var expires int64
-	err = s.db.QueryRow(ctx, `SELECT secret_hash, zone, labels, expires_at FROM join_tokens WHERE id = ? AND used_at IS NULL`, tok.ID).
-		Scan(&hash, &zone, &labels, &expires)
-	if err != nil || hash != pki.HashSecret(tok.Secret) || nowMs() > expires {
-		writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
-		return
-	}
+	var zone, labels string
 	hostID := "h-" + uuid.NewString()[:13]
-	// Single use: only one joiner can flip used_at.
-	res, err := s.db.Exec(ctx, `UPDATE join_tokens SET used_at = ?, host_id = ? WHERE id = ? AND used_at IS NULL`, nowMs(), hostID, tok.ID)
-	if n, _ := res.RowsAffected(); err != nil || n != 1 {
-		writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
-		return
+	if tok.ID == "static" {
+		if s.cfg.JoinSecret == "" || subtle.ConstantTimeCompare([]byte(tok.Secret), []byte(s.cfg.JoinSecret)) != 1 {
+			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
+			return
+		}
+		labels = "{}"
+	} else {
+		var hash string
+		var expires int64
+		err = s.db.QueryRow(ctx, `SELECT secret_hash, zone, labels, expires_at FROM join_tokens WHERE id = ? AND used_at IS NULL`, tok.ID).
+			Scan(&hash, &zone, &labels, &expires)
+		if err != nil || hash != pki.HashSecret(tok.Secret) || nowMs() > expires {
+			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
+			return
+		}
+		// Single use: only one joiner can flip used_at.
+		res, err := s.db.Exec(ctx, `UPDATE join_tokens SET used_at = ?, host_id = ? WHERE id = ? AND used_at IS NULL`, nowMs(), hostID, tok.ID)
+		if n, _ := res.RowsAffected(); err != nil || n != 1 {
+			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
+			return
+		}
 	}
 	names := []string{hostnameOf(req.AgentURL), hostnameOf(req.SnapdURL)}
 	cert, err := s.hostsCA.IssueFromCSR([]byte(req.CSR), hostID, names, hostCertTTL)

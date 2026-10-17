@@ -244,7 +244,10 @@ type JoinToken struct {
 	Server      string `json:"s"`
 	ID          string `json:"i"`
 	Secret      string `json:"k"`
-	Fingerprint string `json:"f"`
+	Fingerprint string `json:"f,omitempty"`
+	// CA is the control-plane CA certificate (PEM), as an alternative to its
+	// fingerprint, for tokens assembled by Terraform from a CA it generated.
+	CA string `json:"ca,omitempty"`
 }
 
 // Encode renders the token as a single string.
@@ -260,12 +263,26 @@ func DecodeJoinToken(s string) (JoinToken, error) {
 	if !strings.HasPrefix(s, joinPrefix) {
 		return t, errors.New("not a flint join token")
 	}
-	b, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(s, joinPrefix))
+	body := strings.TrimPrefix(s, joinPrefix)
+	var b []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.StdEncoding, base64.RawStdEncoding} {
+		if b, err = enc.DecodeString(body); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return t, fmt.Errorf("join token: %w", err)
 	}
 	if err := json.Unmarshal(b, &t); err != nil {
 		return t, fmt.Errorf("join token: %w", err)
+	}
+	if t.CA != "" && t.Fingerprint == "" {
+		ca, err := ParseCertPEM([]byte(t.CA))
+		if err != nil {
+			return t, fmt.Errorf("join token CA: %w", err)
+		}
+		t.Fingerprint = Fingerprint(ca.Raw)
 	}
 	if t.Server == "" || t.ID == "" || t.Secret == "" || len(t.Fingerprint) != 64 {
 		return t, errors.New("join token: incomplete")

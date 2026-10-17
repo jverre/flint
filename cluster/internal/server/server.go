@@ -40,6 +40,14 @@ type Config struct {
 	// AdminToken bootstraps an admin credential (stored hashed). Optional
 	// after the first start.
 	AdminToken string
+	// CA files (PEM). Optional: without them the first replica generates the
+	// CAs and stores them in the database. Terraform passes its own so it can
+	// build join tokens before the control plane exists.
+	CPCACert, CPCAKey, HostsCACert, HostsCAKey string
+	// JoinSecret, if set, is a reusable host join credential (token ID
+	// "static"), for autoscaling groups whose hosts can't be given a fresh
+	// single-use token each. Rotate it by restarting with a new value.
+	JoinSecret string
 
 	LeaseTTL           time.Duration // host lease; a silent host is fenced after this
 	FenceMargin        time.Duration // extra wait after lease expiry before recovering its VMs
@@ -100,10 +108,10 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{cfg: cfg, db: d, remote: remote}
-	if s.hostsCA, err = s.loadCA(ctx, "hosts_ca", "flint hosts CA"); err != nil {
+	if s.hostsCA, err = s.loadCA(ctx, "hosts_ca", "flint hosts CA", cfg.HostsCACert, cfg.HostsCAKey); err != nil {
 		return nil, err
 	}
-	if s.cpCA, err = s.loadCA(ctx, "cp_ca", "flint control-plane CA"); err != nil {
+	if s.cpCA, err = s.loadCA(ctx, "cp_ca", "flint control-plane CA", cfg.CPCACert, cfg.CPCAKey); err != nil {
 		return nil, err
 	}
 	if s.cpClient, err = s.cpCA.Keypair("flint-server", nil, 30*24*time.Hour); err != nil {
@@ -147,9 +155,19 @@ func waitDB(ctx context.Context, d *db.DB) error {
 
 // loadCA returns the cluster-wide CA stored in the database, creating it the
 // first time. Replicas racing here all end up with the same one.
-func (s *Server) loadCA(ctx context.Context, key, cn string) (*pki.CA, error) {
-	fresh, err := pki.NewCA(cn)
-	if err != nil {
+func (s *Server) loadCA(ctx context.Context, key, cn, certFile, keyFile string) (*pki.CA, error) {
+	var fresh *pki.CA
+	var err error
+	if certFile != "" {
+		certPEM, err1 := os.ReadFile(certFile)
+		keyPEM, err2 := os.ReadFile(keyFile)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("%s files: %v %v", key, err1, err2)
+		}
+		if fresh, err = pki.LoadCA(certPEM, keyPEM); err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+	} else if fresh, err = pki.NewCA(cn); err != nil {
 		return nil, err
 	}
 	certPEM, err := s.db.SetMetaIfAbsent(ctx, key+"_cert", string(fresh.CertPEM))
@@ -172,6 +190,9 @@ func (s *Server) loadCA(ctx context.Context, key, cn string) (*pki.CA, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%s key: %w", key, err)
+	}
+	if certFile != "" && certPEM != string(fresh.CertPEM) {
+		return nil, fmt.Errorf("%s: the database already has a different CA than %s", key, certFile)
 	}
 	return pki.LoadCA([]byte(certPEM), []byte(keyPEM))
 }

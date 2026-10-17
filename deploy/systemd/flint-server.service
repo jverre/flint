@@ -1,0 +1,21 @@
+[Unit]
+Description=Flint control plane (flint-cluster server)
+Documentation=https://github.com/jverre/flint/blob/main/plans/03-cluster.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/flint/flint.env
+ExecStart=/usr/local/bin/flint-cluster server
+Restart=always
+RestartSec=2
+User=flint
+Group=flint
+StateDirectory=flint/server
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

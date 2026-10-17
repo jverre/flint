@@ -94,7 +94,7 @@ def _cluster_binary() -> str:
 
 @cli.command()
 @click.option("--join", "token", default=None, envvar="FLINT_JOIN_TOKEN", help="Join token from the control plane (first start only)")
-@click.option("--advertise", required=True, envvar="FLINT_ADVERTISE_ADDR", help="Address the control plane and other hosts reach this host on")
+@click.option("--advertise", required=True, envvar="FLINT_ADVERTISE_ADDR", help="Address the control plane and other hosts reach this host on ('auto': the default route's source address)")
 @click.option("--listen", default="0.0.0.0", envvar="FLINT_HOST", help="Address the agent API binds to")
 @click.option("--port", default=9400, type=int, envvar="FLINT_PORT", help="Agent API port (mTLS)")
 @click.option("--snapd-port", default=9501, type=int, envvar="FLINT_SNAPD_PORT", help="Port of this host's snapd peer server")
@@ -113,6 +113,11 @@ def agent(token, advertise, listen, port, snapd_port, name, zone, labels, data_d
     """
     import socket
     import subprocess
+    if advertise == "auto":
+        # The source address of the default route: the host's primary address.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            advertise = s.getsockname()[0]
     _set_daemon_env(port, data_dir, state_dir, backend)
     os.environ["FLINT_HOST"] = listen
     os.environ["FLINT_CLUSTER"] = "1"

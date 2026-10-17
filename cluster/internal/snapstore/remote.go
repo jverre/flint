@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -166,7 +167,12 @@ func newS3Remote(u *url.URL) (*s3Remote, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
-	cfg := aws.Config{Region: region}
+	// Static keys from the environment, else the default chain (instance
+	// role, web identity, shared config).
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("aws config: %w", err)
+	}
 	if id, secret := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"); id != "" {
 		cfg.Credentials = credentials.NewStaticCredentialsProvider(id, secret, os.Getenv("AWS_SESSION_TOKEN"))
 	}

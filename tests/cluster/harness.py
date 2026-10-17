@@ -212,16 +212,28 @@ class Host:
         return self.c.api.get(f"/v1/hosts/{self.host_id}").json()["host"]
 
     def vmm_pids(self) -> list[int]:
-        """VMMs of this host: processes chrooted into its jail directory."""
-        jail = os.path.join(self.root, "jailer") + "/"
+        """VMM processes of this host's VMs: pids from its state store, confirmed
+        by the VM ID in their command line (Firecracker's --id) or cgroup (Cloud
+        Hypervisor), so a reused pid is never killed."""
+        import sqlite3
+
+        try:
+            db = sqlite3.connect(f"file:{self.root}/state/flint.db?mode=ro", uri=True)
+            rows = db.execute("SELECT vm_id, pid FROM sandboxes WHERE state != 'Dead'").fetchall()
+            db.close()
+        except sqlite3.Error:
+            return []
         pids = []
-        for d in os.listdir("/proc"):
-            if d.isdigit():
-                try:
-                    if os.readlink(f"/proc/{d}/root").startswith(jail):
-                        pids.append(int(d))
-                except OSError:
-                    pass
+        for vm_id, pid in rows:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().decode(errors="replace")
+                with open(f"/proc/{pid}/cgroup") as f:
+                    cg = f.read()
+            except OSError:
+                continue
+            if vm_id in cmd or vm_id in cg:
+                pids.append(pid)
         return pids
 
     def crash(self) -> None:
@@ -234,6 +246,7 @@ class Host:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        wait_for(lambda: not self.vmm_pids(), 10, f"host {self.name}'s VMs to die")
 
     def freeze(self) -> None:
         self.agent.signal(signal.SIGSTOP)
