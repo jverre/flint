@@ -12,7 +12,7 @@ import urllib.request
 
 import websockets.sync.client as ws_sync
 
-from flint.core._artifacts import prune_shared
+from flint.core._artifacts import prune_shared, golden_inputs_current, record_golden_inputs
 from flint.core._jailfs import copy_within
 from flint.core._boot import PAUSE_MEM, PAUSE_VMSTATE, _RecoveredProcess, _boot_from_snapshot, _teardown_vm
 from flint.core._firecracker import _fc_patch, _fc_put, _fc_request, _fc_status_ok, _wait_for_agent, _wait_for_api_socket
@@ -78,7 +78,6 @@ class LinuxFirecrackerBackend(HostBackend):
             fc_version=kwargs.get("fc_version", "latest"),
             install_dir=kwargs.get("install_dir", "/usr/local/bin"),
             kernel_dir=kwargs.get("kernel_dir", "/root/firecracker-vm"),
-            kernel_version=kwargs.get("kernel_version", "6.1"),
             skip_kernel=kwargs.get("skip_kernel", False),
         )
 
@@ -89,9 +88,10 @@ class LinuxFirecrackerBackend(HostBackend):
         prune_shared(JAILER_SHARED_DIR)
 
     def ensure_default_template(self) -> None:
-        if not golden_snapshot_exists():
+        if not golden_snapshot_exists() or not golden_inputs_current(GOLDEN_DIR):
             shutil.rmtree(GOLDEN_DIR, ignore_errors=True)
             create_golden_snapshot()
+            record_golden_inputs(GOLDEN_DIR)
         register_template_artifact(
             DEFAULT_TEMPLATE_ID,
             "Default (Alpine)",
@@ -498,6 +498,7 @@ class LinuxFirecrackerBackend(HostBackend):
             runtime_dir=vm_dir,
             guest_arch=platform.machine().lower(),
             transport_ref=f"netns:{ns_name}",
+            backend_metadata=dict(row_backend_metadata(row)),
         )
         return "alive", entry
 
@@ -510,6 +511,10 @@ class LinuxFirecrackerBackend(HostBackend):
             return
         _delete_template_artifact(template_id, self.kind)
 
+    def discard_paused(self, row: dict) -> None:
+        # Its VMM exited at pause; the recorded pid may belong to something else now.
+        self._cleanup_dead_row({**row, "pid": 0})
+
     @staticmethod
     def _cleanup_dead_row(row: dict) -> None:
         vm_id = row["vm_id"]
@@ -517,10 +522,11 @@ class LinuxFirecrackerBackend(HostBackend):
         ns_name = row["ns_name"]
         chroot_base = row.get("chroot_base") or ""
 
-        try:
-            os.kill(pid, 9)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if pid:
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
 
         try:
             _delete_netns(ns_name)

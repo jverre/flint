@@ -120,12 +120,12 @@ def stop(vm_id):
 @click.option("--version", "fc_version", default="latest", help="Firecracker version to install (default: latest)")
 @click.option("--install-dir", default="/usr/local/bin", help="Directory to install binaries (default: /usr/local/bin)")
 @click.option("--kernel-dir", default="/root/firecracker-vm", help="Directory to store vmlinux (default: /root/firecracker-vm)")
-@click.option("--kernel-version", default="6.1", help="Kernel major version for S3 URL (default: 6.1)")
+@click.option("--kernel-release", default=None, help="Flint guest kernel release tag (default: the one this version of Flint was tested with)")
 @click.option("--skip-kernel", is_flag=True, default=False, help="Skip vmlinux download")
 @click.option("--check", is_flag=True, default=False, help="Print installed versions and exit")
-def install_deps(fc_version, install_dir, kernel_dir, kernel_version, skip_kernel, check):
+def install_deps(fc_version, install_dir, kernel_dir, kernel_release, skip_kernel, check):
     """Install firecracker, jailer, and vmlinux kernel."""
-    from flint.core._install import check_deps, install_deps as _install_deps
+    from flint.core._install import KERNEL_RELEASE, check_deps, install_deps as _install_deps
     if check:
         all_present = check_deps(install_dir=install_dir, kernel_dir=kernel_dir)
         raise SystemExit(0 if all_present else 1)
@@ -133,7 +133,7 @@ def install_deps(fc_version, install_dir, kernel_dir, kernel_version, skip_kerne
         fc_version=fc_version,
         install_dir=install_dir,
         kernel_dir=kernel_dir,
-        kernel_version=kernel_version,
+        kernel_release=kernel_release or KERNEL_RELEASE,
         skip_kernel=skip_kernel,
     )
 
@@ -177,6 +177,77 @@ def list_vms():
         age = time.time() - sb.created_at
         age_str = f"{int(age)}s" if age < 60 else f"{int(age / 60)}m"
         click.echo(f"  {sb.id[:8]}  pid={sb.pid}  state={sb.state}  age={age_str}")
+
+
+# ── Volume commands ────────────────────────────────────────────────────────
+
+def _daemon_client():
+    from flint._client.client import DaemonClient
+    if not DaemonClient.is_daemon_running():
+        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
+        raise SystemExit(1)
+    return DaemonClient()
+
+
+def _volume_call(fn, *args, **kwargs):
+    import httpx
+    try:
+        return fn(*args, **kwargs)
+    except httpx.HTTPStatusError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+
+@cli.group()
+def volumes():
+    """Shared volumes you mount into running sandboxes."""
+
+
+@volumes.command("list")
+def volumes_list():
+    """List volumes."""
+    vols = _volume_call(_daemon_client().list_volumes)
+    if not vols:
+        click.echo("No volumes.")
+    for v in vols:
+        click.echo(f"  {v['id']}  {v['name']}")
+
+
+@volumes.command("create")
+@click.argument("name")
+def volumes_create(name):
+    """Create a volume."""
+    v = _volume_call(_daemon_client().create_volume, name)
+    click.echo(f"Created volume {v['name']} ({v['id']})")
+
+
+@volumes.command("delete")
+@click.argument("volume")
+def volumes_delete(volume):
+    """Delete a volume (by name or ID) and its files."""
+    _volume_call(_daemon_client().delete_volume, volume)
+    click.echo(f"Deleted volume {volume}")
+
+
+@volumes.command("mount")
+@click.argument("vm_id")
+@click.argument("volume")
+@click.argument("path")
+@click.option("--subpath", default="", help="Mount only this directory of the volume")
+@click.option("--readonly", "--ro", is_flag=True, default=False, help="Mount read-only")
+def volumes_mount(vm_id, volume, path, subpath, readonly):
+    """Mount VOLUME at PATH inside running sandbox VM_ID."""
+    _volume_call(_daemon_client().mount, vm_id, volume, path, subpath=subpath, readonly=readonly)
+    click.echo(f"Mounted {volume}:/{subpath} at {path} ({'ro' if readonly else 'rw'})")
+
+
+@volumes.command("unmount")
+@click.argument("vm_id")
+@click.argument("path")
+def volumes_unmount(vm_id, path):
+    """Unmount the volume at PATH in sandbox VM_ID."""
+    _volume_call(_daemon_client().unmount, vm_id, path)
+    click.echo(f"Unmounted {path}")
 
 
 # ── Agent commands ─────────────────────────────────────────────────────────

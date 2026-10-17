@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOTFS_DIR="/root/firecracker-vm"
-ROOTFS_IMG="${ROOTFS_DIR}/rootfs.ext4"
+ROOTFS_IMG="${ROOTFS_IMG:-${ROOTFS_DIR}/rootfs.ext4}"
 ALPINE_TAR="${ROOTFS_DIR}/alpine-minirootfs-3.21.3-x86_64.tar.gz"
 MOUNT_POINT="/tmp/firecracker-rootfs"
 
@@ -34,6 +34,8 @@ sudo chmod +x "$MOUNT_POINT/usr/local/bin/flintd"
 # Write network init script (TAP + TCP replaces vsock)
 sudo tee "$MOUNT_POINT/etc/init-net.sh" > /dev/null << 'INITSCRIPT'
 #!/bin/sh
+# The kernel starts init with no PATH; flintd and everything it runs inherit this.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
@@ -57,7 +59,8 @@ mkdir -p /workspace
 # Wait for flintd to be listening before signaling READY
 i=0
 while [ "$i" -lt 200 ]; do
-    if grep -q ":1388" /proc/net/tcp 2>/dev/null; then
+    # :1388 is port 5000; a dual-stack listener only shows in tcp6.
+    if grep -qs ":1388" /proc/net/tcp /proc/net/tcp6; then
         break
     fi
     i=$((i + 1))

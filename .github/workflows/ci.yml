@@ -93,8 +93,8 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           echo "enable-kvm:end" >> /tmp/step-markers
-      - name: Install Firecracker + kernel
-        if: matrix.backend == 'firecracker'
+      - name: Install Firecracker + guest kernel
+        # Both backends boot Flint's guest kernel, which install-deps downloads.
         run: |
           echo "install-fc:start" >> /tmp/step-markers
           sudo bash scripts/install-deps.sh
@@ -112,20 +112,6 @@ jobs:
           sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
           /usr/local/bin/cloud-hypervisor --version
           echo "install-ch:end" >> /tmp/step-markers
-      - name: Install kernel (for cloud-hypervisor)
-        if: matrix.backend == 'cloud-hypervisor'
-        run: |
-          echo "install-ch-kernel:start" >> /tmp/step-markers
-          set -euxo pipefail
-          sudo mkdir -p /root/firecracker-vm
-          # CH needs a PVH-bootable kernel with virtio-pci; the Firecracker
-          # quickstart kernel has neither, so use CH's own build.
-          KERNEL_TAG="ch-release-v7.2.8-20261009"
-          sudo curl -fsSL \
-            -o /root/firecracker-vm/vmlinux \
-            "https://github.com/cloud-hypervisor/linux/releases/download/${KERNEL_TAG}/vmlinux-x86_64"
-          sudo ls -la /root/firecracker-vm/vmlinux
-          echo "install-ch-kernel:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs
         run: |
           echo "alpine:start" >> /tmp/step-markers

@@ -1,4 +1,4 @@
-"""Volumes screen — create/list/delete raw image volumes."""
+"""Volumes screen — create/list/delete shared volumes."""
 
 from __future__ import annotations
 
@@ -11,15 +11,7 @@ from textual.widgets import Button, DataTable, Footer, Input, Label, Static
 from flint.tui.events import VolumesChanged
 
 
-def _fmt_bytes(n: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
-        n /= 1024
-    return f"{n:.1f} PiB"
-
-
-class NewVolumeModal(ModalScreen[tuple[str, int] | None]):
+class NewVolumeModal(ModalScreen[str | None]):
     CSS = """
     NewVolumeModal { align: center middle; }
     NewVolumeModal > Vertical {
@@ -38,8 +30,6 @@ class NewVolumeModal(ModalScreen[tuple[str, int] | None]):
             yield Static("[b]New volume[/]")
             yield Label("Name")
             yield Input(placeholder="e.g. data-scratch", id="vol-name")
-            yield Label("Size (GiB)")
-            yield Input(value="8", id="vol-size")
             with Horizontal():
                 yield Static("", id="vol-error")
                 yield Button("Create", variant="primary", id="create")
@@ -59,19 +49,10 @@ class NewVolumeModal(ModalScreen[tuple[str, int] | None]):
 
     def _submit(self) -> None:
         name = self.query_one("#vol-name", Input).value.strip()
-        size_s = self.query_one("#vol-size", Input).value.strip()
-        err = self.query_one("#vol-error", Static)
         if not name:
-            err.update("[red]name is required[/]")
+            self.query_one("#vol-error", Static).update("[red]name is required[/]")
             return
-        try:
-            size = int(size_s)
-            if size <= 0 or size > 1024:
-                raise ValueError
-        except ValueError:
-            err.update("[red]size must be 1-1024[/]")
-            return
-        self.dismiss((name, size))
+        self.dismiss(name)
 
 
 class VolumesScreen(Screen):
@@ -101,7 +82,7 @@ class VolumesScreen(Screen):
 
     def on_mount(self) -> None:
         tbl = self.query_one("#volumes-table", DataTable)
-        tbl.add_columns("name", "size", "on-disk", "id", "created")
+        tbl.add_columns("name", "id", "created")
         self._rebuild()
         self.run_worker(self._fetch, thread=True, exclusive=True)
 
@@ -121,14 +102,10 @@ class VolumesScreen(Screen):
         tbl = self.query_one("#volumes-table", DataTable)
         tbl.clear()
         for v in self.app.state.volumes:
-            size = f"{v.get('size_gib', 0)} GiB"
-            on_disk = _fmt_bytes(v.get("size_bytes") or 0)
             created = time.strftime("%Y-%m-%d %H:%M", time.localtime(v.get("created_at", 0)))
             tbl.add_row(
                 v.get("name", "-"),
-                size,
-                on_disk,
-                v.get("id", "-")[:10],
+                v.get("id", "-"),
                 created,
                 key=v.get("id"),
             )
@@ -139,12 +116,11 @@ class VolumesScreen(Screen):
     def _on_new_result(self, result) -> None:
         if not result:
             return
-        name, size = result
-        self.run_worker(lambda: self._do_create(name, size), thread=True, exclusive=False)
+        self.run_worker(lambda: self._do_create(result), thread=True, exclusive=False)
 
-    def _do_create(self, name: str, size: int) -> None:
+    def _do_create(self, name: str) -> None:
         try:
-            vol = self.app.client.create_volume(name, size)
+            vol = self.app.client.create_volume(name)
             # Optimistic update; event bus will also deliver volume.created.
             self.app.state.volumes = [
                 v for v in self.app.state.volumes if v.get("id") != vol["id"]
@@ -171,7 +147,7 @@ class VolumesScreen(Screen):
             self.app.client.delete_volume(volume_id)
             self.app.state.volumes = [v for v in self.app.state.volumes if v.get("id") != volume_id]
             self.app.call_from_thread(self._rebuild)
-            self.app.call_from_thread(self.app.notify, f"Deleted volume {volume_id[:10]}")
+            self.app.call_from_thread(self.app.notify, f"Deleted volume {volume_id}")
         except Exception as e:
             self.app.call_from_thread(
                 self.app.notify, f"Delete failed: {e}", severity="error"

@@ -149,6 +149,9 @@ class BackendPlugin(ABC):
     def resume(self, row: dict) -> BackendBootResult:
         pass
 
+    def discard_paused(self, row: dict) -> None:
+        """Delete what a paused sandbox left behind: its snapshot, jail and network."""
+
     @abstractmethod
     def proxy_guest_request(
         self,

@@ -1,8 +1,11 @@
-// r2nfs serves Cloudflare R2 objects as an NFS filesystem.
+// r2nfs is Flint's NFS server for sandboxes.
 //
-// It provides per-sandbox NFS exports with overlay semantics:
-// a read-only template layer and a read-write sandbox layer,
-// giving the same isolation as copy-on-write local filesystems.
+// It serves two kinds of export, either of which can be enabled:
+//   - Workspaces on Cloudflare R2, with overlay semantics: a read-only
+//     template layer and a read-write sandbox layer, giving the same
+//     isolation as copy-on-write local filesystems.
+//   - Volumes: host directories that the daemon mounts into running
+//     sandboxes, read-write or read-only, one export per mount.
 package main
 
 import (
@@ -30,28 +33,32 @@ func main() {
 	secretKey := flag.String("secret-key", os.Getenv("R2_SECRET_ACCESS_KEY"), "R2 secret access key")
 	cacheDir := flag.String("cache-dir", envOr("R2_CACHE_DIR", "/tmp/r2nfs-cache"), "Local cache directory")
 	cacheSizeMB := flag.Int("cache-size-mb", 1024, "Maximum cache size in MB")
+	volumesDir := flag.String("volumes-dir", "", "Host directory holding volumes (enables volume mounts)")
 	flag.Parse()
 
-	if *accountID == "" || *accessKey == "" || *secretKey == "" {
-		log.Fatal("R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY are required")
+	r2Enabled := *accountID != "" && *accessKey != "" && *secretKey != ""
+	if !r2Enabled && *volumesDir == "" {
+		log.Fatal("nothing to serve: set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY, or --volumes-dir")
 	}
 
-	endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", *accountID)
-
-	r2, err := newR2Client(endpoint, *accessKey, *secretKey, *bucket)
-	if err != nil {
-		log.Fatalf("Failed to create R2 client: %v", err)
+	exports := newExportManager(nil, nil)
+	if r2Enabled {
+		endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", *accountID)
+		r2, err := newR2Client(endpoint, *accessKey, *secretKey, *bucket)
+		if err != nil {
+			log.Fatalf("Failed to create R2 client: %v", err)
+		}
+		cache, err := newDiskCache(*cacheDir, int64(*cacheSizeMB)*1024*1024)
+		if err != nil {
+			log.Fatalf("Failed to create cache: %v", err)
+		}
+		defer cache.Close()
+		exports = newExportManager(r2, cache)
 	}
-
-	cache, err := newDiskCache(*cacheDir, int64(*cacheSizeMB)*1024*1024)
-	if err != nil {
-		log.Fatalf("Failed to create cache: %v", err)
-	}
-
-	exports := newExportManager(r2, cache)
+	volumes := newVolumeManager(*volumesDir)
 
 	// Start management API.
-	go serveMgmtAPI(*mgmtAddr, exports)
+	go serveMgmtAPI(*mgmtAddr, exports, volumes)
 
 	// Start NFS server.
 	listener, err := net.Listen("tcp", *listenAddr)
@@ -60,8 +67,8 @@ func main() {
 	}
 	log.Printf("r2nfs listening on %s (mgmt on %s)", *listenAddr, *mgmtAddr)
 
-	handler := newNFSHandler(exports)
-	cachedHandler := nfshelper.NewCachingHandler(handler, 1024)
+	handler := newNFSHandler(exports, volumes)
+	cachedHandler := nfshelper.NewCachingHandler(handler, handleCacheSize)
 	go func() {
 		if err := nfs.Serve(listener, cachedHandler); err != nil {
 			log.Fatalf("NFS server error: %v", err)
@@ -74,8 +81,12 @@ func main() {
 	<-sig
 	log.Println("Shutting down r2nfs")
 	listener.Close()
-	cache.Close()
 }
+
+// handleCacheSize bounds the NFS file handles the server remembers. A guest
+// whose handle was evicted gets ESTALE, so this must cover every file
+// clients are working with across all mounts.
+const handleCacheSize = 1 << 17
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -100,16 +111,16 @@ func isValidID(s string) bool {
 
 // newMgmtHandler builds the HTTP handler for the management API.
 // Extracted so tests can call it without starting a real listener.
-func newMgmtHandler(exports *ExportManager) http.Handler {
+func newMgmtHandler(exports *ExportManager, volumes *VolumeManager) http.Handler {
 	mux := http.NewServeMux()
-	registerMgmtRoutes(mux, exports)
+	registerMgmtRoutes(mux, exports, volumes)
 	return mux
 }
 
 // serveMgmtAPI runs a small HTTP server for managing NFS exports.
-func serveMgmtAPI(addr string, exports *ExportManager) {
+func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager) {
 	mux := http.NewServeMux()
-	registerMgmtRoutes(mux, exports)
+	registerMgmtRoutes(mux, exports, volumes)
 	log.Printf("Management API on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Management API error: %v", err)
@@ -117,7 +128,7 @@ func serveMgmtAPI(addr string, exports *ExportManager) {
 }
 
 // registerMgmtRoutes adds the management API routes to a ServeMux.
-func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager) {
+func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *VolumeManager) {
 	mux.HandleFunc("POST /exports", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ClientIP   string `json:"client_ip"`
@@ -159,8 +170,43 @@ func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager) {
 		w.Write([]byte(`{"ok":true}`))
 	})
 
+	mux.HandleFunc("POST /mounts", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID       string `json:"id"`
+			ClientIP string `json:"client_ip"`
+			Volume   string `json:"volume"`
+			Subpath  string `json:"subpath"`
+			ReadOnly bool   `json:"readonly"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			return
+		}
+		if !isValidID(req.ID) || net.ParseIP(req.ClientIP) == nil || req.Volume == "" {
+			http.Error(w, `{"error":"id, client_ip and volume are required"}`, http.StatusBadRequest)
+			return
+		}
+		if err := volumes.Register(req.ID, req.ClientIP, req.Volume, req.Subpath, req.ReadOnly); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+
+	mux.HandleFunc("DELETE /mounts/{id}", func(w http.ResponseWriter, r *http.Request) {
+		volumes.Deregister(r.PathValue("id"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","exports":%d}`, exports.Count())
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok", "exports": exports.Count(), "mounts": volumes.Count(),
+			"r2": exports.r2 != nil, "volumes_dir": volumes.root,
+		})
 	})
 }

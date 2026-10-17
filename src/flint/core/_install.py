@@ -406,14 +406,36 @@ def _extract_and_install(tarball: Path, tmpdir: Path, fc_version: str, arch: str
         dst.chmod(0o755)
 
 
-def _install_kernel(kernel_version: str, kernel_patch: str, arch: str, kernel_dir: str) -> None:
-    url = f"https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v{kernel_version}/{arch}/vmlinux-{kernel_patch}"
+# Flint's guest kernel (scripts/build-kernel.sh): boots on Firecracker and
+# Cloud Hypervisor and has the NFS client volumes need.
+KERNEL_RELEASE = "guest-kernel-6.1.141-flint1"
+
+
+def _install_kernel(kernel_release: str, arch: str, kernel_dir: str) -> None:
     dest = Path(kernel_dir) / "vmlinux"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _info(f"Downloading vmlinux kernel ({kernel_version}) to {kernel_dir}...")
-    _download(url, dest)
-    size_mb = dest.stat().st_size // (1024 * 1024)
-    _info(f"vmlinux installed at {dest} ({size_mb}M)")
+    if arch != "x86_64":
+        _skip(f"No Flint guest kernel for {arch} yet: installing Firecracker's quickstart kernel (volumes won't work)")
+        if not dest.exists():
+            _download(f"https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/{arch}/kernels/vmlinux.bin", dest)
+        return
+    base = f"https://github.com/jverre/flint/releases/download/{kernel_release}"
+    _info(f"Downloading Flint guest kernel ({kernel_release})...")
+    with tempfile.TemporaryDirectory() as tmpdir_str:
+        tmp = Path(tmpdir_str) / f"vmlinux-{arch}"
+        checksum = Path(tmpdir_str) / f"vmlinux-{arch}.sha256"
+        _download(f"{base}/{tmp.name}", tmp)
+        _download(f"{base}/{checksum.name}", checksum)
+        _verify_checksum(tmp, checksum)
+        if dest.exists() and dest.read_bytes() == tmp.read_bytes():
+            _skip(f"vmlinux at {dest} is already {kernel_release}")
+            return
+        if dest.exists():
+            dest.replace(dest.with_name("vmlinux.old"))
+            _info(f"Previous kernel kept at {dest.with_name('vmlinux.old')}")
+        shutil.copyfile(tmp, dest)
+        dest.chmod(0o644)
+    _info(f"vmlinux installed at {dest} ({kernel_release}); the daemon rebuilds its golden snapshot on next start")
 
 
 def _current_fc_version() -> str | None:
@@ -464,8 +486,7 @@ def install_deps(
     fc_version: str = "latest",
     install_dir: str = "/usr/local/bin",
     kernel_dir: str = "/root/firecracker-vm",
-    kernel_version: str = "6.1",
-    kernel_patch: str = "5.10.217",
+    kernel_release: str = KERNEL_RELEASE,
     skip_kernel: bool = False,
 ) -> None:
     """Install firecracker, jailer, and optionally the vmlinux kernel."""
@@ -512,10 +533,6 @@ def install_deps(
     if skip_kernel:
         _skip("Skipping vmlinux download (--skip-kernel)")
     else:
-        vmlinux = Path(kernel_dir) / "vmlinux"
-        if vmlinux.exists():
-            _skip(f"vmlinux already exists at {vmlinux} - skipping")
-        else:
-            _install_kernel(kernel_version, kernel_patch, arch, kernel_dir)
+        _install_kernel(kernel_release, arch, kernel_dir)
 
     print("\n  Done.")

@@ -12,7 +12,7 @@ Event types (payload keys other than `type` and `ts`):
   volume.created       volume: dict
   volume.deleted       volume_id: str
   volume.attached      vm_id: str, volume_id: str, mount_path: str
-  volume.detached      vm_id: str, volume_id: str
+  volume.detached      vm_id: str, volume_id: str, mount_path: str
 """
 
 from __future__ import annotations

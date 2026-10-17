@@ -48,6 +48,17 @@ class _TerminalConnection:
             pass
 
 
+def _raise_for_status(resp: httpx.Response) -> None:
+    """Like raise_for_status, with the daemon's error detail in the message."""
+    if resp.is_success:
+        return
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except ValueError:
+        detail = resp.text
+    raise httpx.HTTPStatusError(f"{resp.status_code}: {detail}", request=resp.request, response=resp)
+
+
 class DaemonClient:
     def __init__(self, base_url: str = DEFAULT_URL) -> None:
         self._base_url = base_url
@@ -222,17 +233,35 @@ class DaemonClient:
 
     def list_volumes(self) -> list[dict]:
         resp = self._http.get("/volumes")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["volumes"]
 
-    def create_volume(self, name: str, size_gib: int) -> dict:
-        resp = self._http.post("/volumes", json={"name": name, "size_gib": size_gib})
-        resp.raise_for_status()
+    def create_volume(self, name: str) -> dict:
+        resp = self._http.post("/volumes", json={"name": name})
+        _raise_for_status(resp)
         return resp.json()["volume"]
 
-    def delete_volume(self, volume_id: str) -> None:
-        resp = self._http.delete(f"/volumes/{volume_id}")
-        resp.raise_for_status()
+    def delete_volume(self, volume: str) -> None:
+        """Delete a volume by ID or name."""
+        resp = self._http.delete(f"/volumes/{volume}")
+        _raise_for_status(resp)
+
+    def list_mounts(self, vm_id: str) -> list[dict]:
+        resp = self._http.get(f"/vms/{vm_id}/mounts")
+        _raise_for_status(resp)
+        return resp.json()["mounts"]
+
+    def mount(self, vm_id: str, volume: str, path: str, *, subpath: str = "", readonly: bool = False) -> dict:
+        resp = self._http.post(
+            f"/vms/{vm_id}/mounts",
+            json={"volume": volume, "path": path, "subpath": subpath, "readonly": readonly},
+        )
+        _raise_for_status(resp)
+        return resp.json()["mount"]
+
+    def unmount(self, vm_id: str, path: str) -> None:
+        resp = self._http.delete(f"/vms/{vm_id}/mounts", params={"path": path})
+        _raise_for_status(resp)
 
     # ── Config / limits ────────────────────────────────────────────────────
 

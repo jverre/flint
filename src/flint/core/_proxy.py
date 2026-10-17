@@ -12,12 +12,21 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
+import time
 
 from .config import log, HOST_IP, PROXY_PORT, PROXY_CA_DIR
 from ._netns import _popen_in_ns
+
+
+def _mitmdump() -> str:
+    """mitmdump from the daemon's own environment, which needn't be on PATH."""
+    beside = os.path.join(os.path.dirname(sys.executable), "mitmdump")
+    return beside if os.path.exists(beside) else (shutil.which("mitmdump") or "mitmdump")
 
 
 def _ensure_confdir() -> str:
@@ -32,6 +41,9 @@ def _ensure_confdir() -> str:
 
 class CredentialProxy:
     """Manages a credential injection proxy for a single sandbox."""
+
+    # The CA's public certificate (mitmproxy-ca.pem next to it holds the key).
+    ca_cert_path = os.path.join(PROXY_CA_DIR, "mitmproxy-ca-cert.pem")
 
     def __init__(self, ns_name: str) -> None:
         self.ns_name = ns_name
@@ -51,7 +63,7 @@ class CredentialProxy:
         # Launch mitmdump in transparent mode inside the netns
         addon_script = os.path.join(os.path.dirname(__file__), "_proxy_server.py")
         cmd = [
-            "mitmdump",
+            _mitmdump(),
             "--mode", "transparent",
             # Only the guest-facing TAP address: the bridge side must never reach it.
             "--listen-host", HOST_IP,
@@ -71,7 +83,30 @@ class CredentialProxy:
             start_new_session=True,
             env=env,
         )
+        try:
+            self._wait_listening()
+        except Exception:
+            self.stop()
+            raise
         log.info("[%s] Credential proxy started (mitmdump pid=%d)", self.ns_name, self._process.pid)
+
+    def _wait_listening(self, timeout: float = 15.0) -> None:
+        """Block until mitmdump listens, so the guest's first request isn't refused."""
+        # The process's own /proc net view is its namespace's; 0A is LISTEN.
+        port = f":{PROXY_PORT:04X} "
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._process.poll() is not None:
+                raise RuntimeError(f"Credential proxy exited with code {self._process.returncode}")
+            try:
+                with open(f"/proc/{self._process.pid}/net/tcp") as f:
+                    if any(port in line and line.split()[3] == "0A" for line in f):
+                        return
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Credential proxy not listening after {timeout:.0f}s")
+            time.sleep(0.05)
 
     def stop(self) -> None:
         """Stop the proxy subprocess."""
