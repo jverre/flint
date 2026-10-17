@@ -136,6 +136,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 	go d.storageHeartbeat(ctx)
 	go d.renewLoop(ctx)
+	d.fence.path = filepath.Join(cfg.IdentityDir, "fence.json")
+	d.fence.load()
 	go d.fence.loop(ctx)
 	if cfg.WatchdogDevice != "" {
 		go d.watchdog(ctx)
@@ -384,6 +386,44 @@ type fence struct {
 	vms      []fencedVM
 	fenced   []string
 	firedAt  time.Time
+	// path persists the armed fence, so a restarted snapd still enforces a
+	// deadline it accepted before (and fires at once if it passed meanwhile).
+	path string
+}
+
+type fenceFile struct {
+	Deadline int64      `json:"deadline_unix_ms"`
+	VMs      []fencedVM `json:"vms"`
+}
+
+func (f *fence) save() {
+	if f.path == "" {
+		return
+	}
+	if f.deadline.IsZero() {
+		os.Remove(f.path)
+		return
+	}
+	b, _ := json.Marshal(fenceFile{Deadline: f.deadline.UnixMilli(), VMs: f.vms})
+	tmp := f.path + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		os.Rename(tmp, f.path)
+	}
+}
+
+func (f *fence) load() {
+	b, err := os.ReadFile(f.path)
+	if err != nil {
+		return
+	}
+	var ff fenceFile
+	if json.Unmarshal(b, &ff) != nil || ff.Deadline == 0 {
+		return
+	}
+	f.mu.Lock()
+	f.deadline, f.vms = time.UnixMilli(ff.Deadline), ff.VMs
+	f.mu.Unlock()
+	log.Printf("fence: restored %d leased VMs, deadline in %s", len(ff.VMs), time.Until(f.deadline).Round(time.Millisecond))
 }
 
 func (f *fence) arm(req fenceReq) {
@@ -396,11 +436,13 @@ func (f *fence) arm(req fenceReq) {
 	}
 	f.vms = req.VMs
 	f.deadline = time.Now().Add(time.Duration(req.TTLMs) * time.Millisecond)
+	f.save()
 }
 
 func (f *fence) disarm() {
 	f.mu.Lock()
 	f.vms, f.deadline = nil, time.Time{}
+	f.save()
 	f.mu.Unlock()
 }
 
@@ -433,6 +475,7 @@ func (f *fence) loop(ctx context.Context) {
 		}
 		vms := f.vms
 		f.vms, f.deadline, f.firedAt = nil, time.Time{}, time.Now()
+		f.save()
 		f.mu.Unlock()
 		for _, v := range vms {
 			if v.PID <= 1 || (v.StartTime != "" && procStart(v.PID) != v.StartTime) {

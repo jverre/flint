@@ -56,6 +56,7 @@ func (s *Server) apiHandler() http.Handler {
 	// Cluster administration.
 	mux.HandleFunc("GET /v1/hosts", admin(s.handleListHosts))
 	mux.HandleFunc("GET /v1/hosts/{id}", admin(s.handleGetHost))
+	mux.HandleFunc("PATCH /v1/hosts/{id}", admin(s.handlePatchHost))
 	mux.HandleFunc("POST /v1/hosts/{id}/cordon", admin(s.handleCordon(true)))
 	mux.HandleFunc("POST /v1/hosts/{id}/uncordon", admin(s.handleCordon(false)))
 	mux.HandleFunc("POST /v1/hosts/{id}/drain", admin(s.handleDrain))
@@ -628,6 +629,25 @@ func (s *Server) handleGetHost(w http.ResponseWriter, r *http.Request) {
 	}
 	d["vms"] = ids
 	writeJSON(w, 200, map[string]any{"host": d})
+}
+
+// handlePatchHost: {"max_vms": n} caps the VMs placed on a host (0 = what it reports).
+func (s *Server) handlePatchHost(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MaxVMs *int `json:"max_vms"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || body.MaxVMs == nil || *body.MaxVMs < 0 {
+		writeErr(w, 400, "body must be {\"max_vms\": <n >= 0>}")
+		return
+	}
+	res, err := s.db.Exec(r.Context(), `UPDATE hosts SET max_vms = ? WHERE id = ?`, *body.MaxVMs, r.PathValue("id"))
+	if n, _ := res.RowsAffected(); err != nil || n == 0 {
+		writeErr(w, 404, "host not found")
+		return
+	}
+	h, _ := s.getHost(r.Context(), r.PathValue("id"))
+	active, _ := s.activeCounts(r.Context())
+	writeJSON(w, 200, map[string]any{"host": hostDict(h, active[h.ID])})
 }
 
 func (s *Server) handleCordon(on bool) http.HandlerFunc {

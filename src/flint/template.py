@@ -17,7 +17,8 @@ class TemplateInfo:
 
 
 def _get_client() -> DaemonClient:
-    return DaemonClient()
+    from flint.sandbox import _get_client as _shared
+    return _shared()
 
 
 class Template:

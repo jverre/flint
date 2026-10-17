@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS hosts (
     version        TEXT NOT NULL DEFAULT '',
     last_heartbeat BIGINT NOT NULL DEFAULT 0,
     state_since    BIGINT NOT NULL DEFAULT 0,
+    max_vms        INTEGER NOT NULL DEFAULT 0,
     created_at     BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS vms (
@@ -235,6 +236,28 @@ func (d *DB) eventsTable() string {
 );`
 }
 
+// addedColumns are columns added after a table was first released; Migrate
+// adds them to existing databases.
+var addedColumns = []struct{ table, column, def string }{
+	{"hosts", "max_vms", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+func (d *DB) addColumns(ctx context.Context, exec func(context.Context, string, ...any) (sql.Result, error)) error {
+	for _, c := range addedColumns {
+		if d.Dialect == "postgres" {
+			if _, err := exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s`, c.table, c.column, c.def)); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, c.table, c.column, c.def)); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	return nil
+}
+
 // Migrate creates the schema. Safe to run from every replica at once.
 func (d *DB) Migrate(ctx context.Context) error {
 	if d.Dialect == "postgres" {
@@ -253,14 +276,14 @@ func (d *DB) Migrate(ctx context.Context) error {
 				return fmt.Errorf("migrate: %w\n%s", err, stmt)
 			}
 		}
-		return nil
+		return d.addColumns(ctx, conn.ExecContext)
 	}
 	for _, stmt := range splitStatements(schema + d.eventsTable()) {
 		if _, err := d.sql.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migrate: %w\n%s", err, stmt)
 		}
 	}
-	return nil
+	return d.addColumns(ctx, d.sql.ExecContext)
 }
 
 func splitStatements(s string) []string {

@@ -239,17 +239,27 @@ type Host struct {
 	Version       string            `json:"version"`
 	LastHeartbeat int64             `json:"last_heartbeat_ms"`
 	StateSince    int64             `json:"state_since_ms"`
-	CreatedAt     int64             `json:"created_at_ms"`
+	// MaxVMs, if set by an operator, caps VMs below what the host reports.
+	MaxVMs    int   `json:"max_vms_override"`
+	CreatedAt int64 `json:"created_at_ms"`
 }
 
-const hostCols = `id, name, agent_url, snapd_url, zone, labels, backend, host_class, state, cordoned, capacity, cached, templates, version, last_heartbeat, state_since, created_at`
+// maxVMs is the effective VM cap.
+func (h *Host) maxVMs() int {
+	if h.MaxVMs > 0 && (h.Capacity.MaxVMs == 0 || h.MaxVMs < h.Capacity.MaxVMs) {
+		return h.MaxVMs
+	}
+	return h.Capacity.MaxVMs
+}
+
+const hostCols = `id, name, agent_url, snapd_url, zone, labels, backend, host_class, state, cordoned, capacity, cached, templates, version, last_heartbeat, state_since, max_vms, created_at`
 
 func scanHost(r scanner) (*Host, error) {
 	var h Host
 	var labels, capacity, cached, templates string
 	var cordoned int
 	if err := r.Scan(&h.ID, &h.Name, &h.AgentURL, &h.SnapdURL, &h.Zone, &labels, &h.Backend, &h.HostClass, &h.State, &cordoned,
-		&capacity, &cached, &templates, &h.Version, &h.LastHeartbeat, &h.StateSince, &h.CreatedAt); err != nil {
+		&capacity, &cached, &templates, &h.Version, &h.LastHeartbeat, &h.StateSince, &h.MaxVMs, &h.CreatedAt); err != nil {
 		return nil, err
 	}
 	h.Cordoned = cordoned != 0

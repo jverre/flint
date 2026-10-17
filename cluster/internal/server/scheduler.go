@@ -49,8 +49,8 @@ func (s *Server) eligibility(h *Host, active int, req placeReq, tmplSnaps map[st
 		return "backend " + h.Backend
 	case req.HostClass != "" && h.HostClass != req.HostClass:
 		return "different host class"
-	case h.Capacity.MaxVMs > 0 && active >= h.Capacity.MaxVMs:
-		return fmt.Sprintf("full (%d/%d VMs)", active, h.Capacity.MaxVMs)
+	case h.maxVMs() > 0 && active >= h.maxVMs():
+		return fmt.Sprintf("full (%d/%d VMs)", active, h.maxVMs())
 	case h.Capacity.MemAvailableMB > 0 && h.Capacity.MemAvailableMB < minFreeMemMB:
 		return "low memory"
 	case h.Capacity.DiskFreeMB > 0 && h.Capacity.DiskFreeMB < minFreeDiskMB:
@@ -134,8 +134,8 @@ func (s *Server) candidates(ctx context.Context, req placeReq) ([]*Host, error) 
 		if req.Spread != "" {
 			score -= 50 * float64(req.SpreadCounts[spreadDomain(h, req.Spread)])
 		}
-		if h.Capacity.MaxVMs > 0 {
-			score -= 30 * float64(active[h.ID]) / float64(h.Capacity.MaxVMs)
+		if m := h.maxVMs(); m > 0 {
+			score -= 30 * float64(active[h.ID]) / float64(m)
 		}
 		ok = append(ok, scored{h, score})
 	}

@@ -111,6 +111,7 @@ class ClusterAgent:
         self._pauses = self._load_json(self._pauses_path)
         self._exporting: set[str] = set()
         self.last_lease_ok = 0.0
+        self._lease_path = os.path.join(self.dir, "lease.json")
 
     # ── setup ────────────────────────────────────────────────────────────
 
@@ -129,6 +130,7 @@ class ClusterAgent:
         os.replace(tmp, path)
 
     def start(self) -> None:
+        self._fence_lapsed_leases()
         _events.hooks.append(self._events.append)
         threading.Thread(target=self._heartbeat_loop, daemon=True, name="cluster-heartbeat").start()
         threading.Thread(target=self._events_loop, daemon=True, name="cluster-events").start()
@@ -168,6 +170,24 @@ class ClusterAgent:
             raise RuntimeError(f"control plane {path}: {e.code} {e.read()[:300]!r}") from None
 
     # ── heartbeat, lease, fence ────────────────────────────────────────
+
+    def _fence_lapsed_leases(self) -> None:
+        """At startup: leased VMs whose lease ran out while this agent was down
+        may already run elsewhere (the control plane recovered them), so they
+        must not keep running here. Covers the agent and snapd dying together."""
+        lease = self._load_json(self._lease_path)
+        renewed, ttl = lease.get("renewed_at", 0.0), lease.get("ttl_ms", self.lease_ttl_ms) / 1000
+        if time.time() - renewed <= ttl:
+            return
+        mgr = self.daemon.manager
+        with mgr._lock:
+            stale = [e.vm_id for e in mgr._sandboxes.values() if e.availability in LEASED]
+        for vm_id in stale:
+            log.warning("cluster: lease of %s lapsed %.0fs ago while the agent was down; killing it", vm_id[:8], time.time() - renewed - ttl)
+            try:
+                self.daemon.kill_vm(vm_id)
+            except Exception:
+                log.exception("fencing %s failed", vm_id[:8])
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(HEARTBEAT_INTERVAL):
@@ -213,6 +233,9 @@ class ClusterAgent:
         elif not leased:
             self.snapd.disarm()
         self.last_lease_ok = time.time()
+        # Persisted so a restarted agent knows whether its leases lapsed meanwhile;
+        # backdated to the send time like the fence deadline.
+        self._save_json(self._lease_path, {"renewed_at": self.last_lease_ok - (time.monotonic() - sent), "ttl_ms": self.lease_ttl_ms})
         for vm_id in resp.get("evict") or []:
             log.info("cluster: evicting %s (owned elsewhere or deleted)", vm_id[:8])
             try:

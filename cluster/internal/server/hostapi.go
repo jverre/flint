@@ -254,6 +254,10 @@ func (s *Server) reconcileReportedVM(ctx context.Context, h *Host, v *VM, hv hos
 			v.State = VMRecovering
 			s.recoverVM(context.Background(), v, h.ID, true)
 		}(v)
+	case v.State == VMLost && v.VMSetID == "" && (hv.State == "Running" || hv.State == "Started"):
+		// Its host was only partitioned and the VM kept running: it's not lost after all.
+		s.updateVM(ctx, v.ID, vmUpdate{State: str(VMRunning), Error: str("")})
+		s.emit(ctx, "vm.found", v.Tenant, v.ID, h.ID, map[string]any{"vm_id": v.ID})
 	case v.State == VMRunning && hv.State == "Paused":
 		// Paused on the host by its own timeout policy.
 		upd := vmUpdate{State: str(VMPaused)}

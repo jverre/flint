@@ -6,18 +6,37 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from flint._client.client import DaemonClient, _TerminalConnection, auth_headers
-from flint.core.config import DAEMON_URL, TERM_COLS, TERM_ROWS
+from flint.core.config import API_KEY, DAEMON_URL, TENANT, TERM_COLS, TERM_ROWS
 
 if TYPE_CHECKING:
     from flint.volume import Volume
 
 _client: DaemonClient | None = None
+_settings: dict = {"url": DAEMON_URL, "api_key": API_KEY, "tenant": TENANT}
+
+
+def configure(url: str | None = None, api_key: str | None = None, tenant: str | None = None) -> None:
+    """Point the SDK at a daemon or a cluster control plane.
+
+    Defaults come from FLINT_URL, FLINT_API_KEY and FLINT_TENANT. ``tenant``
+    is sent on create and required by a cluster.
+    """
+    global _client
+    if url is not None:
+        _settings["url"] = url.rstrip("/")
+    if api_key is not None:
+        _settings["api_key"] = api_key
+    if tenant is not None:
+        _settings["tenant"] = tenant
+    if _client is not None:
+        _client.close()
+    _client = None
 
 
 def _get_client() -> DaemonClient:
     global _client
     if _client is None:
-        _client = DaemonClient()
+        _client = DaemonClient(_settings["url"], _settings["api_key"], _settings["tenant"])
     return _client
 
 
@@ -67,9 +86,9 @@ class Pty:
         on_data: Callable[[bytes], None] | None = None,
     ) -> PtySession:
         callback = on_data or (lambda _data: None)
-        ws_base = DAEMON_URL.replace("http://", "ws://").replace("https://", "wss://")
+        ws_base = _settings["url"].replace("http://", "ws://").replace("https://", "wss://")
         ws_url = f"{ws_base}/vms/{self._vm_id}/terminal"
-        conn = _TerminalConnection(ws_url, callback, auth_headers())
+        conn = _TerminalConnection(ws_url, callback, auth_headers(_settings["api_key"]))
         return PtySession(self._vm_id, conn)
 
 
@@ -307,4 +326,4 @@ class Sandbox:
 
     @staticmethod
     def is_daemon_running() -> bool:
-        return DaemonClient.is_daemon_running()
+        return DaemonClient.is_daemon_running(_settings["url"])

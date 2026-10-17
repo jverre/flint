@@ -59,8 +59,12 @@ def _read_daemon_log() -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_daemon():
+def _ensure_daemon(request):
     global _daemon_process
+    cluster_dir = os.path.join(os.path.dirname(__file__), "cluster")
+    if all(str(item.fspath).startswith(cluster_dir) for item in request.session.items):
+        yield  # cluster tests run their own cluster
+        return
     if Sandbox.is_daemon_running():
         yield
         return
