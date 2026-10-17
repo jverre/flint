@@ -222,3 +222,94 @@ def test_volume_size_is_what_the_sandbox_sees(make_volume, make_sandbox):
     sb.mount(vol, "/v")
     total_kib = int(sh(sb, "df -P -k /v | tail -1").split()[1])
     assert 1.8 * 2**20 < total_kib <= 2 * 2**20, f"df reports {total_kib} KiB for a 2 GiB volume"
+
+
+# ── Exclusive mounts ─────────────────────────────────────────────────────────
+
+
+def test_exclusive_mount_is_the_sandboxs_own_disk(make_volume, make_sandbox):
+    """The guest mounts the volume's ext4 itself; nobody else can mount the volume meanwhile."""
+    vol = make_volume()
+    owner, other = make_sandbox(), make_sandbox()
+    m = owner.mount(vol, "/work", exclusive=True)
+    assert m["exclusive"]
+    fs = sh(owner, "awk '$2 == \"/work\" {print $1, $3}' /proc/mounts").split()
+    assert fs[0].startswith("/dev/nbd") and fs[1] == "ext4", fs
+    sh(owner, "mkdir -p /work/repo && echo work > /work/repo/f")
+
+    for kwargs in ({}, {"readonly": True}, {"exclusive": True}):
+        err = mount_error(other, vol, "/v", **kwargs)
+        assert err.response.status_code == 409 and owner.id in str(err), (kwargs, err)
+
+    owner.unmount("/work")
+    other.mount(vol, "/work", exclusive=True)
+    assert sh(other, "cat /work/repo/f").strip() == "work"
+
+
+def test_snapshot_of_exclusive_disk_is_readable_by_many(make_volume, make_sandbox):
+    """A snapshot taken while a sandbox writes its disk is consistent, and any number of sandboxes read it."""
+    vol = make_volume()
+    owner, r1, r2 = make_sandbox(), make_sandbox(), make_sandbox()
+    owner.mount(vol, "/work", exclusive=True)
+    sh(owner, "echo v1 > /work/state")  # not synced: the snapshot freezes the filesystem itself
+    snap = make_volume(lambda name: vol.snapshot(name))
+    sh(owner, "echo v2 > /work/state")
+
+    for reader in (r1, r2):
+        reader.mount(snap, "/snap", readonly=True)
+        assert sh(reader, "cat /snap/state").strip() == "v1"
+        denied = reader.commands.run("mount -o remount,rw /snap && touch /snap/x")
+        assert denied.exit_code != 0, f"read-only snapshot accepted a write: {denied.stdout}"
+    assert sh(owner, "cat /work/state").strip() == "v2"
+
+
+def test_exclusive_disk_survives_pause_resume(make_volume, make_sandbox):
+    vol = make_volume()
+    sb = make_sandbox()
+    sb.mount(vol, "/work", exclusive=True)
+    sh(sb, "echo before > /work/f")
+    sb.pause()
+    sb.resume()
+    sh(sb, "echo after >> /work/f && sync")
+    assert sh(sb, "cat /work/f").split() == ["before", "after"]
+
+
+def test_exclusive_disk_stays_exclusive(make_volume, make_sandbox):
+    """Once a sandbox has had the raw disk, the host won't serve its filesystem: share it via snapshots."""
+    vol = make_volume()
+    a, b = make_sandbox(), make_sandbox()
+    a.mount(vol, "/work", exclusive=True)
+    sh(a, "echo data > /work/f")
+    a.unmount("/work")
+
+    err = mount_error(b, vol, "/v")
+    assert err.response.status_code == 409 and "snapshot" in str(err)
+    fork = make_volume(lambda name: vol.fork(name))
+    assert mount_error(b, fork, "/v").response.status_code == 409, "forks inherit it"
+    b.mount(fork, "/fork", exclusive=True)
+    assert sh(b, "cat /fork/f").strip() == "data"
+
+
+def test_kill_releases_exclusive_mount(make_volume, make_sandbox):
+    vol = make_volume()
+    a, b = make_sandbox(), make_sandbox()
+    a.mount(vol, "/work", exclusive=True)
+    sh(a, "echo kept > /work/f && sync")
+    a.kill()
+    b.mount(vol, "/work", exclusive=True)
+    assert sh(b, "cat /work/f").strip() == "kept"
+
+
+def test_other_sandboxes_cant_attach_an_exclusive_disk(make_volume, make_sandbox):
+    """The disk's NBD export answers only the sandbox it was mounted in."""
+    from flint.core.config import NBD_PORT
+
+    vol = make_volume()
+    owner, outsider = make_sandbox(), make_sandbox()
+    m = owner.mount(vol, "/work", exclusive=True)
+    body = f'{{"address": "10.0.0.1:{NBD_PORT}", "export": "{m["id"]}"}}'
+    stolen = outsider.commands.run(
+        f"wget -q -O - --header='Content-Type: application/json' --post-data='{body}' http://127.0.0.1:5000/disks/attach"
+    )
+    assert stolen.exit_code != 0, f"outsider attached another sandbox's disk: {stolen.stdout}"
+    sh(owner, "touch /work/still-mine")

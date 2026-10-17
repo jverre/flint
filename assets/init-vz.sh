@@ -26,6 +26,7 @@ if [ -z "$IFACE" ]; then
     done
 fi
 
+ip link set lo up 2>/dev/null || true
 if [ -n "$IFACE" ]; then
     ip link set "$IFACE" up 2>/dev/null || true
     if command -v udhcpc >/dev/null 2>&1; then

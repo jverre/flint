@@ -252,10 +252,16 @@ class Sandbox:
 
     # ── Volumes ─────────────────────────────────────────────────────────────
 
-    def mount(self, volume: Volume | str, path: str, *, subpath: str = "", readonly: bool = False) -> dict:
-        """Mount a volume (or one subpath of it) at ``path``, now, while running."""
+    def mount(self, volume: Volume | str, path: str, *, subpath: str = "", readonly: bool = False,
+              exclusive: bool = False) -> dict:
+        """Mount a volume (or one subpath of it) at ``path``, now, while running.
+
+        ``exclusive=True`` gives this sandbox the volume as its own disk: much
+        faster for file-heavy work, but no other sandbox can mount it
+        meanwhile (they read it through snapshots).
+        """
         ref = volume if isinstance(volume, str) else volume.id
-        return _get_client().mount(self._id, ref, path, subpath=subpath, readonly=readonly)
+        return _get_client().mount(self._id, ref, path, subpath=subpath, readonly=readonly, exclusive=exclusive)
 
     def unmount(self, path: str) -> None:
         """Unmount the volume at ``path``."""

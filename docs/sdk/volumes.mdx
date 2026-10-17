@@ -34,6 +34,23 @@ reader.mount(v1, "/v1", readonly=True)  # any number of sandboxes
 
 You can snapshot or fork a volume while sandboxes are writing to it: the volume's filesystem is frozen for the instant the copy is taken. Image volumes have a size (`Volume.create(name, size_gib=50)`, default 10), which sandboxes see in `df`; it is sparse, so a volume only uses the space written to it.
 
+## Exclusive mounts: a fast disk for one sandbox
+
+A normal (shared) mount goes through the host: many sandboxes can use the volume at once, but every file operation is a round trip. An exclusive mount gives one sandbox the volume as its own disk instead, and its kernel runs the filesystem, so `git`, package installs, builds and databases run at local-disk speed (creating 2,000 files: ~0.1 s exclusive vs ~2.7 s shared).
+
+```python
+work = repo.fork(f"work-{child.id}")
+child.mount(work, "/work", exclusive=True)    # child's own fast disk
+child.commands.run("cd /work && npm install && npm test")
+
+result = work.snapshot(f"result-{child.id}")   # consistent, even while the child runs
+parent.mount(result, f"/results/{child.id}", readonly=True)
+```
+
+- While a sandbox has a volume exclusively, nobody else can mount it (`409`); others read it through snapshots, which any number of sandboxes can mount read-only.
+- Once a sandbox has had a volume as a raw disk, the host doesn't trust its filesystem anymore, so that volume (and its forks) can only be mounted exclusively from then on, and its snapshots are mounted read-only as disks in each reader's own sandbox.
+- Exclusive mounts are released by `unmount` or when the sandbox is killed, and survive pause/resume.
+
 ## One writer per subtree
 
 A read-write mount owns its subtree. Mounting the same volume read-write over an overlapping subpath (the same directory, or one inside the other) fails with `409` and names the sandbox that holds it. Read-only mounts are unlimited and always allowed. Give each writer its own `subpath` and mount the volume read-only wherever you want to read everything.
@@ -50,7 +67,7 @@ The lock is released when the writer unmounts, or when its sandbox is killed.
 | `Volume.get(name)` | Find a volume by name or ID, or `None` |
 | `Volume.list()` | All volumes |
 | `volume.delete()` | Delete the volume and its files (fails while mounted) |
-| `sandbox.mount(volume, path, subpath="", readonly=False)` | Mount into the running sandbox; `volume` may also be a name or ID |
+| `sandbox.mount(volume, path, subpath="", readonly=False, exclusive=False)` | Mount into the running sandbox; `volume` may also be a name or ID |
 | `sandbox.unmount(path)` | Unmount |
 | `sandbox.mounts` | Volumes mounted in this sandbox |
 
@@ -61,5 +78,5 @@ The lock is released when the writer unmounts, or when its sandbox is killed.
 - **Durability:** writes reach the volume's storage within about a second. A sandbox's `fsync` doesn't wait for that yet.
 - **Storage:** an image volume's blocks are content-addressed chunks on the host, and in R2 too when the R2 storage backend is configured, so a host can open a volume it has never seen and fetch only the blocks that are read. Hosts without NBD get plain-directory volumes, which can't be sized or copied.
 - **Isolation:** each mount is authorized for one sandbox only. Another sandbox can't use it, and unmounting revokes access on the host even if the guest kept file handles.
-- **Performance:** every file operation goes to the host over NFS. Use volumes to share files between sandboxes. Keep package installs, builds and databases on the sandbox's own disk, which is much faster for metadata-heavy work.
-- **Requirements:** sandboxes created with `allow_internet_access=False` can't mount volumes (they have no network path to the host). The guest kernel needs an NFSv3 client. Flint's guest kernel, which `flint install-deps` installs, has one.
+- **Performance:** with a shared mount every file operation goes to the host over NFS: use shared mounts to share files, and exclusive mounts (or the sandbox's own disk) for package installs, builds and databases.
+- **Requirements:** sandboxes created with `allow_internet_access=False` can't mount volumes (they have no network path to the host). The guest kernel needs an NFSv3 client, and an NBD client for exclusive mounts. Flint's guest kernel, which `flint install-deps` installs, has both.

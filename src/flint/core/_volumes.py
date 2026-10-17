@@ -19,9 +19,18 @@ Two kinds, served the same way from ``DAEMON_DIR/volumes/<id>``:
   copies, cheap: they share every block) and forks (writable copies).
 - ``dir``: a plain host directory.
 
-Volumes are for sharing files between sandboxes, not for hot workloads:
-every metadata operation crosses to the host, so package installs and
-databases belong on the sandbox's own disk.
+Exclusive mounts (image volumes only) give one sandbox the volume as a raw
+disk: the host serves the image over NBD and the sandbox's own kernel mounts
+the ext4, so file operations run at local-disk speed. Nobody else can mount
+the volume meanwhile; others read it through snapshots. A volume a sandbox
+has had as a raw disk is "guest-written": its filesystem is untrusted, so
+the host never mounts it again. From then on it, and its forks, can only be
+mounted exclusively, and its snapshots are mounted read-only as block
+devices in each reader's own guest.
+
+Shared mounts are for sharing files between sandboxes, not for hot
+workloads: every metadata operation crosses to the host, so package installs
+and databases belong on an exclusive volume or the sandbox's own disk.
 """
 
 from __future__ import annotations
@@ -38,7 +47,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 from . import _nfs_server
-from .config import BRIDGE_IP, R2NFS_PORT, log
+from .config import BRIDGE_IP, NBD_PORT, NBD_RO_PORT, R2NFS_PORT, log
 from ._nfs_server import VOLUMES_DIR
 from .types import SandboxState
 
@@ -51,7 +60,8 @@ CREATE TABLE IF NOT EXISTS volumes (
     kind       TEXT NOT NULL DEFAULT 'dir',
     size_gib   INTEGER,
     readonly   INTEGER NOT NULL DEFAULT 0,
-    source     TEXT
+    source     TEXT,
+    guest_written INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS volume_mounts (
     id         TEXT PRIMARY KEY,
@@ -62,6 +72,8 @@ CREATE TABLE IF NOT EXISTS volume_mounts (
     readonly   INTEGER NOT NULL,
     client_ip  TEXT NOT NULL,
     created_at REAL NOT NULL,
+    transport  TEXT NOT NULL DEFAULT 'nfs',
+    device     TEXT,
     UNIQUE (vm_id, path)
 );
 """
@@ -70,13 +82,18 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 DEFAULT_SIZE_GIB = 10  # sparse: an image only uses what is written to it
 _MAX_SIZE_GIB = 16384
-_VOLUME_COLUMNS = "id, name, created_at, kind, size_gib, readonly, source"
+_VOLUME_COLUMNS = "id, name, created_at, kind, size_gib, readonly, source, guest_written"
+_MOUNT_COLUMNS = "id, volume_id, vm_id, path, subpath, readonly, client_ip, created_at, transport, device"
 
 # Readers revalidate attributes every second so they see other sandboxes'
 # writes promptly; a writer owns its subtree, so it can cache longer.
 _NFS_OPTIONS = f"vers=3,proto=tcp,port={R2NFS_PORT},mountport={R2NFS_PORT},mountproto=tcp,nolock,soft,timeo=100,retrans=3"
 _READER_OPTIONS = "ro,actimeo=1,lookupcache=positive"
 _WRITER_OPTIONS = "rw,actimeo=30"
+
+# Where a block mount's filesystem is mounted in the guest; `path` is a bind
+# mount of it (or of its subpath).
+_GUEST_DISKS_DIR = "/run/flint/disks"
 
 
 class VolumeError(Exception):
@@ -94,13 +111,14 @@ class Volume:
     size_gib: int | None = None
     readonly: bool = False
     source: str | None = None  # volume this is a snapshot or fork of
+    guest_written: bool = False  # a sandbox has had it as a raw disk
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 def _volume(row) -> Volume:
-    return Volume(row[0], row[1], row[2], row[3], row[4], bool(row[5]), row[6])
+    return Volume(row[0], row[1], row[2], row[3], row[4], bool(row[5]), row[6], bool(row[7]))
 
 
 @dataclass
@@ -113,10 +131,21 @@ class Mount:
     readonly: bool
     client_ip: str
     created_at: float
+    transport: str = "nfs"  # "nfs" (shared) or "block" (NBD, mounted by the guest)
+    device: str | None = None  # the guest's NBD device, for block mounts
+
+    @property
+    def exclusive(self) -> bool:
+        return self.transport == "block" and not self.readonly
+
+    @property
+    def guest_dir(self) -> str:
+        return f"{_GUEST_DISKS_DIR}/{self.id}"
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        del d["client_ip"]
+        del d["client_ip"], d["device"], d["transport"]
+        d["exclusive"] = self.exclusive
         return d
 
 
@@ -160,9 +189,15 @@ class Volumes:
                 self._conn.execute("ALTER TABLE volumes RENAME TO volumes_legacy_images")
             elif cols:
                 for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'dir'"), ("size_gib", "INTEGER"),
-                                  ("readonly", "INTEGER NOT NULL DEFAULT 0"), ("source", "TEXT")):
+                                  ("readonly", "INTEGER NOT NULL DEFAULT 0"), ("source", "TEXT"),
+                                  ("guest_written", "INTEGER NOT NULL DEFAULT 0")):
                     if col not in cols:
                         self._conn.execute(f"ALTER TABLE volumes ADD COLUMN {col} {decl}")
+            mount_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(volume_mounts)")}
+            if mount_cols:
+                for col, decl in (("transport", "TEXT NOT NULL DEFAULT 'nfs'"), ("device", "TEXT")):
+                    if col not in mount_cols:
+                        self._conn.execute(f"ALTER TABLE volume_mounts ADD COLUMN {col} {decl}")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
         os.makedirs(VOLUMES_DIR, exist_ok=True)
@@ -209,29 +244,44 @@ class Volumes:
         src = self._require(ref)
         if src.kind != "image":
             raise VolumeError(400, f"Volume '{src.name}' is a plain directory; only image volumes can be copied")
-        return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src)
+        owner = next((m for m in self._mounts_where("volume_id = ?", src.id) if m.exclusive), None)
+        if owner is None:
+            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src)
+        # A sandbox owns the filesystem: have it flush and hold writes while
+        # the copy is taken, so the copy is consistent.
+        if self._manager.get_entry(owner.vm_id) is None:
+            raise VolumeError(409, f"Volume '{src.name}' is mounted exclusively by paused sandbox "
+                                   f"{owner.vm_id}; resume it to copy the volume")
+        self._agent_json(owner.vm_id, "/fs/freeze", {"path": owner.guest_dir})
+        try:
+            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src)
+        finally:
+            self._agent_json(owner.vm_id, "/fs/thaw", {"path": owner.guest_dir})
 
     def _add(self, name: object, *, kind: str, size_gib: int | None = None,
              readonly: bool = False, source: Volume | None = None) -> Volume:
         if not isinstance(name, str) or not _NAME_RE.match(name):
             raise VolumeError(400, "'name' must be 1-63 letters, digits, '.', '_' or '-'")
         vol = Volume(id="vol-" + uuid.uuid4().hex[:12], name=name, created_at=time.time(), kind=kind,
-                     size_gib=size_gib, readonly=readonly, source=source.id if source else None)
+                     size_gib=size_gib, readonly=readonly, source=source.id if source else None,
+                     guest_written=bool(source and source.guest_written))
         with self._lock:
             if self.get(name) is not None:
                 raise VolumeError(409, f"Volume '{name}' already exists")
             try:
                 if kind == "image":
                     _nfs_server.create_image(vol.id, (size_gib or 0) << 30, source.id if source else "", readonly)
-                    _nfs_server.mount_image(vol.id)
+                    if not vol.guest_written:
+                        _nfs_server.mount_image(vol.id)
                 else:
                     os.makedirs(os.path.join(VOLUMES_DIR, vol.id), mode=0o755)
             except _nfs_server.NfsServerError as e:
                 self._discard(vol)
                 raise VolumeError(500, f"Creating volume '{name}' failed: {e}") from e
             self._conn.execute(
-                f"INSERT INTO volumes ({_VOLUME_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (vol.id, vol.name, vol.created_at, vol.kind, vol.size_gib, int(vol.readonly), vol.source),
+                f"INSERT INTO volumes ({_VOLUME_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (vol.id, vol.name, vol.created_at, vol.kind, vol.size_gib, int(vol.readonly), vol.source,
+                 int(vol.guest_written)),
             )
             self._conn.commit()
         log.info("Created %s volume %s (%s)%s", kind, vol.id, name, f" from {source.id}" if source else "")
@@ -262,19 +312,21 @@ class Volumes:
 
     def _mounts_where(self, where: str, *args) -> list[Mount]:
         rows = self._conn.execute(
-            "SELECT id, volume_id, vm_id, path, subpath, readonly, client_ip, created_at "
-            f"FROM volume_mounts WHERE {where} ORDER BY created_at", args,
+            f"SELECT {_MOUNT_COLUMNS} FROM volume_mounts WHERE {where} ORDER BY created_at", args,
         ).fetchall()
-        return [Mount(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6], r[7]) for r in rows]
+        return [Mount(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6], r[7], r[8], r[9]) for r in rows]
 
     def list_mounts(self, vm_id: str) -> list[Mount]:
         return self._mounts_where("vm_id = ?", vm_id)
 
-    def mount(self, vm_id: str, volume: object, path: object, subpath: object = "", readonly: object = False) -> Mount:
+    def mount(self, vm_id: str, volume: object, path: object, subpath: object = "",
+              readonly: object = False, exclusive: object = False) -> Mount:
         if not isinstance(volume, str) or not volume:
             raise VolumeError(400, "'volume' is required")
-        if not isinstance(readonly, bool):
-            raise VolumeError(400, "'readonly' must be a boolean")
+        if not isinstance(readonly, bool) or not isinstance(exclusive, bool):
+            raise VolumeError(400, "'readonly' and 'exclusive' must be booleans")
+        if exclusive and readonly:
+            raise VolumeError(400, "Exclusive mounts are read-write; mount a snapshot for a read-only disk")
         path = _clean_path(path)
         subpath = _clean_subpath(subpath)
         entry = self._manager.get_entry(vm_id)
@@ -291,37 +343,91 @@ class Volumes:
                 raise VolumeError(400, f"Volume '{vol.name}' is a read-only snapshot; mount it with readonly=True")
             if self._mounts_where("vm_id = ? AND path = ?", vm_id, path):
                 raise VolumeError(409, f"Something is already mounted at {path}")
-            if not readonly:
-                for other in self._mounts_where("volume_id = ? AND readonly = 0", vol.id):
-                    if _overlaps(subpath, other.subpath):
-                        raise VolumeError(409, (
-                            f"'{vol.name}:/{subpath}' overlaps '{vol.name}:/{other.subpath}', which sandbox "
-                            f"{other.vm_id} has mounted read-write at {other.path}; only one writer per subtree"
-                        ))
+            others = self._mounts_where("volume_id = ?", vol.id)
+            holder = next((o for o in others if o.exclusive), None)
+            if holder:
+                raise VolumeError(409, f"Volume '{vol.name}' is mounted exclusively by sandbox {holder.vm_id} "
+                                       f"at {holder.path}; snapshot it to read it elsewhere")
+            if exclusive:
+                if vol.kind != "image":
+                    raise VolumeError(400, f"Volume '{vol.name}' is a plain directory; only image volumes "
+                                           "can be mounted exclusively")
+                if others:
+                    raise VolumeError(409, f"Volume '{vol.name}' is mounted by sandbox {others[0].vm_id} "
+                                           f"at {others[0].path}; an exclusive mount needs it to itself")
+                transport = "block"
+            elif vol.guest_written:
+                if not vol.readonly:
+                    raise VolumeError(409, f"Volume '{vol.name}' has been a sandbox's exclusive disk, so only "
+                                           "exclusive mounts can use it now; snapshot it to share it read-only")
+                transport = "block"  # read-only, in the reader's own guest
+            else:
+                transport = "nfs"
+                if not readonly:
+                    for other in others:
+                        if not other.readonly and _overlaps(subpath, other.subpath):
+                            raise VolumeError(409, (
+                                f"'{vol.name}:/{subpath}' overlaps '{vol.name}:/{other.subpath}', which sandbox "
+                                f"{other.vm_id} has mounted read-write at {other.path}; only one writer per subtree"
+                            ))
             m = Mount(
                 id="mnt-" + uuid.uuid4().hex, volume_id=vol.id, vm_id=vm_id, path=path, subpath=subpath,
-                readonly=readonly, client_ip=client_ip, created_at=time.time(),
+                readonly=readonly, client_ip=client_ip, created_at=time.time(), transport=transport,
             )
-            # Insert first so the writer check sees this mount while it's being set up.
+            # Insert first so the checks above see this mount while it's being set up.
             self._conn.execute(
-                "INSERT INTO volume_mounts (id, volume_id, vm_id, path, subpath, readonly, client_ip, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (m.id, m.volume_id, m.vm_id, m.path, m.subpath, int(m.readonly), m.client_ip, m.created_at),
+                f"INSERT INTO volume_mounts ({_MOUNT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (m.id, m.volume_id, m.vm_id, m.path, m.subpath, int(m.readonly), m.client_ip, m.created_at,
+                 m.transport, m.device),
             )
             self._conn.commit()
 
         try:
-            _nfs_server.register_mount(m.id, client_ip, vol.id, subpath, readonly)
-            options = f"{_NFS_OPTIONS},{_READER_OPTIONS if readonly else _WRITER_OPTIONS}"
-            # Through a shell rather than flintd's /mount/nfs: in templates
-            # built before init-net.sh set PATH, flintd can't find `mount`.
-            script = 'mkdir -p "$1" && mount -t nfs -o "$2" "$3" "$1"'
-            self._guest_sh(vm_id, script, path, options, f"{BRIDGE_IP}:/{m.id}")
+            if transport == "nfs":
+                self._mount_nfs(m)
+            else:
+                self._mount_block(m, vol)
         except Exception as e:
             self._forget(m)
+            if m.exclusive and not vol.guest_written:
+                self._restore_to_host(vol)
             raise VolumeError(500, f"Mount failed: {e}") from e
-        log.info("[%s] mounted %s:/%s at %s (%s)", vm_id[:8], vol.name, subpath, path, "ro" if readonly else "rw")
+        log.info("[%s] mounted %s:/%s at %s (%s%s)", vm_id[:8], vol.name, subpath, path,
+                 "ro" if readonly else "rw", ", exclusive" if exclusive else "")
         return m
+
+    def _mount_nfs(self, m: Mount) -> None:
+        _nfs_server.register_mount(m.id, m.client_ip, m.volume_id, m.subpath, m.readonly)
+        options = f"{_NFS_OPTIONS},{_READER_OPTIONS if m.readonly else _WRITER_OPTIONS}"
+        # Through a shell rather than flintd's /mount/nfs: in templates
+        # built before init-net.sh set PATH, flintd can't find `mount`.
+        script = 'mkdir -p "$1" && mount -t nfs -o "$2" "$3" "$1"'
+        self._guest_sh(m.vm_id, script, m.path, options, f"{BRIDGE_IP}:/{m.id}")
+
+    def _mount_block(self, m: Mount, vol: Volume) -> None:
+        if m.exclusive and not vol.guest_written:
+            # The sandbox's kernel owns the filesystem from now on. Marked
+            # first, so a failure part-way leaves it untrusted.
+            with self._lock:
+                self._conn.execute("UPDATE volumes SET guest_written = 1 WHERE id = ?", (vol.id,))
+                self._conn.commit()
+            _nfs_server.unmount_image(vol.id)
+        _nfs_server.export_image(m.id, vol.id, m.client_ip, m.readonly)
+        port = NBD_RO_PORT if m.readonly else NBD_PORT
+        resp = self._agent_json(m.vm_id, "/disks/attach", {"address": f"{BRIDGE_IP}:{port}", "export": m.id})
+        m.device = resp["device"]
+        with self._lock:
+            self._conn.execute("UPDATE volume_mounts SET device = ? WHERE id = ?", (m.device, m.id))
+            self._conn.commit()
+        # Snapshots are frozen when taken: no journal to replay (and a
+        # read-only device couldn't replay it).
+        opts = "ro,noload" if m.readonly else "rw,noatime"
+        script = (
+            'mkdir -p "$1" "$2" && mount -t ext4 -o "$4" "$3" "$1" && '
+            'src="$1/$5" && { [ -z "$5" ] || [ -d "$src" ] || mkdir -p "$src"; } && '
+            'mount --bind "$src" "$2"'
+        )
+        self._guest_sh(m.vm_id, script, m.guest_dir, m.path, m.device, opts, m.subpath)
 
     def unmount(self, vm_id: str, path: object) -> Mount:
         path = _clean_path(path)
@@ -330,10 +436,18 @@ class Volumes:
             raise VolumeError(404, f"No volume mounted at {path}")
         m = found[0]
         # A paused sandbox can't be reached; revoking server-side is enough,
-        # its stale mount fails with EACCES once resumed.
+        # its stale mount fails with errors once resumed.
         if self._manager.get_entry(vm_id) is not None:
             try:
-                self._guest_sh(vm_id, 'umount "$1" 2>/dev/null || umount -l "$1"', path)
+                if m.transport == "nfs":
+                    self._guest_sh(vm_id, 'umount "$1" 2>/dev/null || umount -l "$1"', path)
+                else:
+                    # A clean unmount flushes the filesystem to the volume; a
+                    # busy one is detached lazily.
+                    self._guest_sh(vm_id, 'for p in "$1" "$2"; do umount "$p" 2>/dev/null || umount -l "$p"; done; '
+                                          'rmdir "$2" 2>/dev/null; true', path, m.guest_dir)
+                    if m.device:
+                        self._agent_json(vm_id, "/disks/detach", {"device": m.device})
             except Exception as e:
                 log.warning("[%s] umount %s failed in guest: %s", vm_id[:8], path, e)
         self._forget(m)
@@ -348,10 +462,11 @@ class Volumes:
         return mounts
 
     def replay(self) -> None:
-        """At daemon start: make sure image volumes are mounted on the host, re-register
-        sandbox mounts with the NFS server, and drop mounts of sandboxes that are gone."""
+        """At daemon start: make sure host-served image volumes are mounted on the host,
+        re-register sandbox mounts with the storage server, and drop mounts of sandboxes
+        that are gone."""
         for vol in self.list():
-            if vol.kind == "image":
+            if vol.kind == "image" and not vol.guest_written:
                 try:
                     _nfs_server.mount_image(vol.id)
                 except _nfs_server.NfsServerError as e:
@@ -362,9 +477,25 @@ class Volumes:
                 self._forget(m)
                 continue
             try:
-                _nfs_server.register_mount(m.id, m.client_ip, m.volume_id, m.subpath, m.readonly)
+                if m.transport == "nfs":
+                    _nfs_server.register_mount(m.id, m.client_ip, m.volume_id, m.subpath, m.readonly)
+                else:
+                    _nfs_server.export_image(m.id, m.volume_id, m.client_ip, m.readonly)
             except _nfs_server.NfsServerError as e:
                 log.warning("[%s] could not restore mount %s: %s", m.vm_id[:8], m.path, e)
+
+    def _restore_to_host(self, vol: Volume) -> None:
+        """After a failed first exclusive mount: if the sandbox never attached the
+        disk, the host still trusts it and takes it back (the storage server
+        refuses images a sandbox has written)."""
+        try:
+            _nfs_server.mount_image(vol.id)
+        except _nfs_server.NfsServerError as e:
+            log.warning("Volume %s stays exclusive-only: %s", vol.id, e)
+            return
+        with self._lock:
+            self._conn.execute("UPDATE volumes SET guest_written = 0 WHERE id = ?", (vol.id,))
+            self._conn.commit()
 
     def _guest_sh(self, vm_id: str, script: str, *args: str) -> None:
         """Run a shell script in the guest with positional args; raise on failure."""
@@ -375,9 +506,25 @@ class Volumes:
             detail = (result.get("stderr") or result.get("stdout") or resp.decode(errors="replace")).strip()
             raise VolumeError(500, f"In sandbox: {detail}")
 
+    def _agent_json(self, vm_id: str, path: str, body: dict) -> dict:
+        """POST to the guest agent; raise with its error on failure."""
+        status, resp = self._manager.agent_request(vm_id, "POST", path, json.dumps(body).encode(), 90)
+        if status == 404 and b"error" not in resp:
+            raise VolumeError(501, "This sandbox's guest agent predates exclusive volumes; rebuild its template")
+        try:
+            data = json.loads(resp)
+        except ValueError:
+            data = {"error": resp.decode(errors="replace")}
+        if status != 200:
+            raise VolumeError(500, f"In sandbox ({path}): {data.get('error', data)}")
+        return data
+
     def _forget(self, m: Mount) -> None:
         try:
-            _nfs_server.deregister_mount(m.id)
+            if m.transport == "nfs":
+                _nfs_server.deregister_mount(m.id)
+            else:
+                _nfs_server.unexport_image(m.id)
         except _nfs_server.NfsServerError as e:
             log.warning("Failed to revoke mount %s: %s", m.id, e)
         with self._lock:

@@ -643,10 +643,11 @@ def mount_volume(vm_id: str, body: dict):
     """Mount a volume (or a subpath of it) into a running sandbox."""
     m = _volume_call(
         _require_volumes().mount, vm_id, body.get("volume"), body.get("path"),
-        body.get("subpath", ""), body.get("readonly", False),
+        body.get("subpath", ""), body.get("readonly", False), body.get("exclusive", False),
     )
     _events.publish("volume.attached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
-    _logs.append(vm_id, f"Mounted volume {m.volume_id}:/{m.subpath} at {m.path} ({'ro' if m.readonly else 'rw'})")
+    mode = "exclusive" if m.exclusive else ("ro" if m.readonly else "rw")
+    _logs.append(vm_id, f"Mounted volume {m.volume_id}:/{m.subpath} at {m.path} ({mode})")
     print(f"POST /vms/{vm_id[:8]}/mounts — {m.volume_id} at {m.path}")
     return {"mount": m.to_dict()}
 
