@@ -10,6 +10,13 @@ from flint.core._jailer import JailSpec
 pytestmark = pytest.mark.skipif(platform.system() != "Linux", reason="Linux backend only")
 
 
+@pytest.fixture(autouse=True)
+def _firecracker_only(backend_kind):
+    # Only Firecracker runs under the jailer; Cloud Hypervisor has no chroot yet.
+    if backend_kind != "linux-firecracker":
+        pytest.skip(f"jailer layout is Firecracker-only (backend: {backend_kind})")
+
+
 def test_jailer_chroot_cleanup(sandbox):
     vm_id = sandbox.id
     spec = JailSpec(vm_id=vm_id, ns_name=f"fc-{vm_id[:8]}")
