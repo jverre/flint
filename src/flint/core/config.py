@@ -39,13 +39,18 @@ AGENT_PORT = 5000
 GUEST_IP = "172.16.0.2"
 HOST_IP = "172.16.0.1"
 
-BRIDGE_NAME = "br-flint"
-BRIDGE_IP = "10.0.0.1"
+# One bridge + /24 per daemon. Override both to run several daemons (e.g. two
+# cluster host agents) on one machine without sharing addresses or firewall chains.
+BRIDGE_NAME = os.environ.get("FLINT_BRIDGE_NAME", "br-flint")
+VETH_SUBNET = os.environ.get("FLINT_BRIDGE_SUBNET", "10.0.0")  # VMs get <subnet>.{2..254}
+BRIDGE_IP = f"{VETH_SUBNET}.1"
 BRIDGE_CIDR = 24
-VETH_SUBNET = "10.0.0"  # VMs get 10.0.0.{2..254}
+# Host chains for this bridge. iptables chain names are at most 28 characters.
+_CHAIN_SUFFIX = "" if BRIDGE_NAME == "br-flint" else f"-{BRIDGE_NAME}"
+HOST_INPUT_CHAIN = f"FLINT-INPUT{_CHAIN_SUFFIX}"[:28]
+HOST_FORWARD_CHAIN = f"FLINT-FORWARD{_CHAIN_SUFFIX}"[:28]
 
 GOLDEN_TAP = "tap-golden"
-GOLDEN_NS = "fc-golden"
 GOLDEN_DIR = f"{DATA_DIR}/.golden"
 
 POOL_DIR = f"{DATA_DIR}/.pool"
@@ -62,8 +67,12 @@ TERM_COLS = 120
 TERM_ROWS = 40
 
 # ── Daemon ────────────────────────────────────────────────────────────────
-DAEMON_HOST = "127.0.0.1"
-DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
+DAEMON_HOST = os.environ.get("FLINT_HOST", "127.0.0.1")
+# Where clients (SDK, CLI, TUI) send requests: a local daemon, or a cluster's
+# control plane (FLINT_URL=https://flint.example.com, FLINT_API_KEY=...).
+DAEMON_URL = os.environ.get("FLINT_URL", f"http://127.0.0.1:{DAEMON_PORT}").rstrip("/")
+API_KEY = os.environ.get("FLINT_API_KEY", "")
+TENANT = os.environ.get("FLINT_TENANT", "")
 DAEMON_DIR = STATE_DIR
 DAEMON_STATE_PATH = f"{STATE_DIR}/state.json"
 DAEMON_PID_PATH = f"{STATE_DIR}/flintd.pid"
@@ -80,6 +89,9 @@ JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
 # live on the jailer's filesystem so they can be hard-linked into each chroot.
 # Pools are per daemon (keyed by data dir); shared artifacts are keyed by source.
 _DATA_KEY          = hashlib.sha1(DATA_DIR.encode()).hexdigest()[:8]
+GOLDEN_NS          = f"fc-golden-{_DATA_KEY}"
+# cgroup v2 parent of every jailed Firecracker VM (jailer --parent-cgroup).
+JAILER_PARENT_CGROUP = os.environ.get("FLINT_JAILER_PARENT_CGROUP", "firecracker")
 FC_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-fc-{_DATA_KEY}"
 CH_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-ch-{_DATA_KEY}"
 JAILER_SHARED_DIR  = f"{JAILER_BASE_DIR}/.snapshots"

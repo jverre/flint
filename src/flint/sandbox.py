@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from flint._client.client import DaemonClient, _TerminalConnection
+from flint._client.client import DaemonClient, _TerminalConnection, auth_headers
 from flint.core.config import DAEMON_URL, TERM_COLS, TERM_ROWS
 
 if TYPE_CHECKING:
@@ -69,7 +69,7 @@ class Pty:
         callback = on_data or (lambda _data: None)
         ws_base = DAEMON_URL.replace("http://", "ws://").replace("https://", "wss://")
         ws_url = f"{ws_base}/vms/{self._vm_id}/terminal"
-        conn = _TerminalConnection(ws_url, callback)
+        conn = _TerminalConnection(ws_url, callback, auth_headers())
         return PtySession(self._vm_id, conn)
 
 
@@ -116,10 +116,14 @@ class Sandbox:
         use_pool: bool = True,
         use_pyroute2: bool = True,
         network_policy: dict | None = None,
+        tenant: str | None = None,
+        availability: str | None = None,
     ) -> None:
+        """``tenant`` and ``availability`` (``ephemeral`` | ``restartable`` |
+        ``durable``) apply when talking to a cluster control plane."""
         client = _get_client()
         if vm_id is None:
-            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy)
+            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy, tenant=tenant, availability=availability)
             self._id = vm["vm_id"]
             self._timings: dict[str, float] = vm.get("timings", {})
             self._ready_time_ms: float | None = vm.get("ready_time_ms")
@@ -198,6 +202,11 @@ class Sandbox:
     def resume(self) -> None:
         """Resume a paused sandbox."""
         _get_client().resume(self._id)
+
+    def fork(self, count: int = 1) -> list[Sandbox]:
+        """Clone this running sandbox (memory, processes and files) into ``count``
+        new sandboxes. The original keeps running. Needs a cluster control plane."""
+        return [Sandbox.connect(vm["vm_id"]) for vm in _get_client().fork(self._id, count)]
 
     def set_timeout(self, timeout_seconds: float, policy: str = "kill") -> None:
         """Set auto-cleanup timeout for this sandbox."""

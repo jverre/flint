@@ -38,6 +38,7 @@ from flint.core.config import (
     GOLDEN_TAP,
     GUEST_IP,
     JAILER_GID,
+    JAILER_PARENT_CGROUP,
     JAILER_UID,
     TEMPLATES_DIR,
     log,
@@ -258,10 +259,10 @@ class LinuxFirecrackerBackend(HostBackend):
 
         # Clean stale cgroup entries
         for cg_base in (
-            f"/sys/fs/cgroup/firecracker/{sandbox_id}",
-            f"/sys/fs/cgroup/cpu/firecracker/{sandbox_id}",
-            f"/sys/fs/cgroup/memory/firecracker/{sandbox_id}",
-            f"/sys/fs/cgroup/pids/firecracker/{sandbox_id}",
+            f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{sandbox_id}",
+            f"/sys/fs/cgroup/cpu/{JAILER_PARENT_CGROUP}/{sandbox_id}",
+            f"/sys/fs/cgroup/memory/{JAILER_PARENT_CGROUP}/{sandbox_id}",
+            f"/sys/fs/cgroup/pids/{JAILER_PARENT_CGROUP}/{sandbox_id}",
         ):
             if os.path.isdir(cg_base):
                 shutil.rmtree(cg_base, ignore_errors=True)

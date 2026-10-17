@@ -13,7 +13,8 @@ from pyroute2 import IPRoute, NetNS
 
 from .config import (
     HOST_TAP_MAC, HOST_IP, GUEST_IP, GUEST_MAC,
-    BRIDGE_NAME, BRIDGE_IP, BRIDGE_CIDR, VETH_SUBNET, PROXY_PORT, log,
+    BRIDGE_NAME, BRIDGE_IP, BRIDGE_CIDR, VETH_SUBNET, PROXY_PORT,
+    HOST_INPUT_CHAIN, HOST_FORWARD_CHAIN, log,
 )
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -262,7 +263,7 @@ def _egress_rules(chain: str) -> list[str]:
 
 
 def ensure_host_firewall() -> None:
-    """Host-side rules for traffic from sandboxes on br-flint (idempotent, rebuilt each start).
+    """Host-side rules for traffic from sandboxes on this daemon's bridge (idempotent, rebuilt each start).
 
     - FLINT-INPUT: sandboxes can't reach services on the host itself, except
       the storage server they mount.
@@ -271,26 +272,26 @@ def ensure_host_firewall() -> None:
       whose FORWARD policy is DROP (Docker sets that) still give sandboxes internet.
     Each namespace enforces the same egress policy; this is the second layer.
     """
-    rules = ["*filter", ":FLINT-INPUT - [0:0]", ":FLINT-FORWARD - [0:0]"]
-    rules += [f"-A FLINT-INPUT -i {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
+    rules = ["*filter", f":{HOST_INPUT_CHAIN} - [0:0]", f":{HOST_FORWARD_CHAIN} - [0:0]"]
+    rules += [f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
     rules += [
-        f"-A FLINT-INPUT -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
+        f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
         for ip, proto, port in storage_endpoints() if ip == BRIDGE_IP
     ]
-    rules += [f"-A FLINT-INPUT -i {BRIDGE_NAME} -j DROP"]
+    rules += [f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -j DROP"]
     rules += [
-        f"-A FLINT-FORWARD -o {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-        f"-A FLINT-FORWARD -i {BRIDGE_NAME} -o {BRIDGE_NAME} -j DROP",
+        f"-A {HOST_FORWARD_CHAIN} -o {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+        f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -o {BRIDGE_NAME} -j DROP",
     ]
     rules += [
-        f"-A FLINT-FORWARD -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
+        f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
         for ip, proto, port in storage_endpoints() if ip != BRIDGE_IP
     ]
-    rules += [f"-A FLINT-FORWARD -i {BRIDGE_NAME} -d {cidr} -j DROP" for cidr in BLOCKED_EGRESS]
-    rules += [f"-A FLINT-FORWARD -i {BRIDGE_NAME} -j ACCEPT", "COMMIT", ""]
+    rules += [f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -d {cidr} -j DROP" for cidr in BLOCKED_EGRESS]
+    rules += [f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -j ACCEPT", "COMMIT", ""]
     # --noflush keeps the host's other rules; declaring the chains flushes ours.
     subprocess.run(["iptables-restore", "--noflush"], input="\n".join(rules), text=True, capture_output=True, check=True)
-    for parent, chain in (("INPUT", "FLINT-INPUT"), ("FORWARD", "FLINT-FORWARD")):
+    for parent, chain in (("INPUT", HOST_INPUT_CHAIN), ("FORWARD", HOST_FORWARD_CHAIN)):
         if subprocess.run(["iptables", "-C", parent, "-j", chain], capture_output=True).returncode != 0:
             subprocess.run(["iptables", "-I", parent, "1", "-j", chain], capture_output=True, check=True)
 

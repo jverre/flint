@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .config import (
     JAILER_BINARY, FIRECRACKER_BINARY, JAILER_BASE_DIR,
-    JAILER_UID, JAILER_GID, JAILER_CGROUP_VER, JAILER_SHARED_DIR,
+    JAILER_UID, JAILER_GID, JAILER_CGROUP_VER, JAILER_SHARED_DIR, JAILER_PARENT_CGROUP,
 )
 from ._artifacts import link_into, shared_readonly
 from ._jailfs import own
@@ -65,6 +65,7 @@ def build_jailer_command(spec: JailSpec) -> list[str]:
         "--gid", str(JAILER_GID),
         "--chroot-base-dir", JAILER_BASE_DIR,
         "--cgroup-version", str(JAILER_CGROUP_VER),
+        "--parent-cgroup", JAILER_PARENT_CGROUP,
         "--netns", f"/var/run/netns/{spec.ns_name}",
         "--",
         "--api-sock", "firecracker.sock",
@@ -76,11 +77,11 @@ def cleanup_jailer(chroot_base: str, vm_id: str) -> None:
     if os.path.isdir(chroot_base):
         shutil.rmtree(chroot_base, ignore_errors=True)
     if JAILER_CGROUP_VER == 2:
-        cgroup_path = f"/sys/fs/cgroup/firecracker/{vm_id}"
+        cgroup_path = f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{vm_id}"
         if os.path.isdir(cgroup_path):
             shutil.rmtree(cgroup_path, ignore_errors=True)
     else:
         for controller in ("cpu", "memory", "blkio", "devices", "pids"):
-            cgroup_path = f"/sys/fs/cgroup/{controller}/firecracker/{vm_id}"
+            cgroup_path = f"/sys/fs/cgroup/{controller}/{JAILER_PARENT_CGROUP}/{vm_id}"
             if os.path.isdir(cgroup_path):
                 shutil.rmtree(cgroup_path, ignore_errors=True)

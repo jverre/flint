@@ -14,6 +14,7 @@ import websockets.sync.client as ws_sync
 from websockets.exceptions import WebSocketException
 
 from flint.core.config import DAEMON_URL, log
+from flint._client.client import auth_headers
 
 
 class LogStream:
@@ -43,7 +44,7 @@ class LogStream:
 
     def _run_loop(self) -> None:
         try:
-            self._ws = ws_sync.connect(self._ws_url, open_timeout=5)
+            self._ws = ws_sync.connect(self._ws_url, open_timeout=5, additional_headers=auth_headers() or None)
         except Exception as e:
             log.debug("LogStream connect failed: %s", e)
             return
