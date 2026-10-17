@@ -318,6 +318,59 @@ def test_template_build_and_run(backend_kind):
 # ── Network policy ─────────────────────────────────────────────────────────
 
 
+def test_sandbox_cannot_reach_other_sandboxes_on_bridge(sandbox):
+    """No other sandbox's network namespace answers on the shared bridge.
+
+    Another sandbox and the daemon's pre-built namespaces are on the bridge
+    during the sweep. Only the sandbox's own namespace may reply, which also
+    proves the probe itself works.
+    """
+    from flint.core.config import VETH_SUBNET
+
+    other = Sandbox()
+    try:
+        sweep = sandbox.commands.run(
+            f"for i in $(seq 2 254); do (ping -c1 -W1 {VETH_SUBNET}.$i >/dev/null 2>&1 && echo {VETH_SUBNET}.$i) & done; wait",
+            timeout=30,
+        )
+        responders = sweep.stdout.split()
+        assert len(responders) == 1, f"bridge addresses answering from inside a sandbox: {responders}"
+    finally:
+        other.kill()
+
+
+def test_sandbox_reaches_internet(sandbox):
+    """A sandbox with internet access can resolve names and open TCP connections out."""
+    dns = sandbox.commands.run("nslookup example.com 8.8.8.8")
+    assert dns.exit_code == 0, dns
+    tcp = sandbox.commands.run("nc -w5 1.1.1.1 80 </dev/null")
+    assert tcp.exit_code == 0, tcp
+
+
+def test_sandbox_cannot_reach_host_services(sandbox):
+    """A service listening on every host address is unreachable from inside a sandbox."""
+    import socket
+
+    from flint.core.config import BRIDGE_IP
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.connect(("8.8.8.8", 53))
+    host_ip = probe.getsockname()[0]
+    probe.close()
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 0))
+    server.listen(16)
+    port = server.getsockname()[1]
+    try:
+        for ip in (BRIDGE_IP, host_ip):
+            result = sandbox.commands.run(f"nc -w3 {ip} {port} </dev/null")
+            assert result.exit_code != 0, f"sandbox reached host service at {ip}:{port}"
+    finally:
+        server.close()
+
+
 def test_network_policy_round_trip(sandbox):
     """Set a network policy, read it back, verify it matches."""
     policy = {
@@ -558,17 +611,24 @@ def test_create_process(sandbox):
 
 
 def test_multiple_pause_resume_cycles(sandbox):
-    """Pause and resume twice — verify state persists across both cycles."""
-    sandbox.commands.run("echo cycle1 > /tmp/c1.txt")
-    sandbox.pause()
-    sandbox.resume()
-    sandbox.commands.run("echo cycle2 > /tmp/c2.txt")
-    sandbox.pause()
-    sandbox.resume()
-    r1 = sandbox.commands.run("cat /tmp/c1.txt")
-    r2 = sandbox.commands.run("cat /tmp/c2.txt")
-    assert r1.exit_code == 0 and "cycle1" in r1.stdout
-    assert r2.exit_code == 0 and "cycle2" in r2.stdout
+    """Pause and resume twice — memory written before each pause survives both cycles."""
+    # tmpfs keeps the data in guest RAM only, spread over thousands of pages.
+    setup = sandbox.commands.run("mkdir -p /run/mem && mount -t tmpfs -o size=32m tmpfs /run/mem")
+    assert setup.exit_code == 0, setup
+
+    digests = {}
+    for cycle in (1, 2):
+        written = sandbox.commands.run(
+            f"dd if=/dev/urandom of=/run/mem/c{cycle} bs=1M count=8 2>/dev/null && md5sum /run/mem/c{cycle}"
+        )
+        assert written.exit_code == 0, written
+        digests[f"/run/mem/c{cycle}"] = written.stdout.split()[0]
+        sandbox.pause()
+        sandbox.resume()
+        check = sandbox.commands.run("md5sum /run/mem/c*")
+        assert check.exit_code == 0, check
+        seen = {path: digest for digest, path in (line.split() for line in check.stdout.splitlines())}
+        assert seen == digests, f"after cycle {cycle}: {check.stdout!r} != {digests}"
 
 
 def test_create_sandbox_with_options(require_sandbox):

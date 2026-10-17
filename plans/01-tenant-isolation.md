@@ -25,13 +25,13 @@ have no test proving it.
 
 | Boundary | Requirement | Current state |
 |----------|-------------|---------------|
-| **VM ↔ host** | VMM runs jailed: chroot, unprivileged uid, seccomp, cgroups, minimal devices | Firecracker uses the jailer. **Cloud Hypervisor has no jailer**, only `--seccomp true` + netns (`_ch_boot.py`) |
-| **VM ↔ VM (cross-tenant)** | No packets between tenants' VMs | **Gap.** Every internet-enabled VM's veth joins the shared `br-flint` bridge (`10.0.0.0/24`) with no forwarding/isolation rules. Cross-VM reachability via the bridge must be tested and blocked |
+| **VM ↔ host** | VMM runs jailed: chroot, unprivileged uid, seccomp, cgroups, minimal devices | Done for both: Firecracker uses the jailer; Cloud Hypervisor runs in Flint's equivalent jail (`_ch_jail.py`, TAP passed as an fd). Golden-snapshot boots of tenant templates are jailed on both. Covered by `test_vmm_runs_unprivileged_in_its_jail` |
+| **VM ↔ VM (cross-tenant)** | No packets between tenants' VMs | Done: bridge port isolation + per-netns ingress firewall; host drops bridge hairpin. Covered by `test_sandbox_cannot_reach_other_sandboxes_on_bridge` |
 | **VM ↔ VM (same tenant)** | Allowed only when the tenant opts in | Not modelled |
-| **VM ↔ host services** | VMs can reach only explicitly exposed host services | **Verify.** The bridge IP `10.0.0.1` is the host; anything listening on `0.0.0.0` is reachable. `r2nfs` intentionally listens on `10.0.0.1:2049`; its exports need per-VM access control |
-| **VM ↔ another VM's proxy** | A VM can never use another VM's credential proxy | **Verify.** The mitmproxy runs inside each VM's netns; confirm it isn't reachable from the bridge on the netns' veth IP |
+| **VM ↔ host services** | VMs can reach only explicitly exposed host services | Done: host `FLINT-INPUT` drops everything from `br-flint` except the r2nfs port; netns egress policy blocks private ranges. Covered by `test_sandbox_cannot_reach_host_services`. r2nfs authorizes exports by veth IP, which is now unique and unspoofable (per-netns NAT + port isolation) |
+| **VM ↔ another VM's proxy** | A VM can never use another VM's credential proxy | Done: proxy listens on `172.16.0.1` only, and the netns drops unsolicited veth ingress |
 | **VM ↔ control plane** | Guest can't reach daemon API; guest agent only reachable from its own netns | Daemon binds `127.0.0.1:9100` (good). `flintd` listens on `:5000` inside the guest; reachable only through the netns, verify |
-| **Egress** | Default deny or allowlist; always block host, link-local (`169.254.0.0/16`, cloud metadata), RFC1918 and the bridge subnet | `allow_internet_access` on/off + HTTP(S) redirect to proxy. No allowlist enforcement for non-HTTP, no explicit metadata/RFC1918 block |
+| **Egress** | Default deny or allowlist; always block host, link-local (`169.254.0.0/16`, cloud metadata), RFC1918 and the bridge subnet | Host, link-local, RFC1918, CGNAT, loopback and multicast blocked in every netns and again on the host (storage endpoint excepted). Still no per-domain allowlist for non-HTTP |
 | **Secrets** | Injected by proxy, never in the guest, encrypted at rest, never returned by the API | Injection works. **Stored as plaintext JSON** in SQLite (`network_policy_json`) and **returned verbatim** by `GET /vms/{id}/network-policy` |
 | **Storage** | No shared writable layers across tenants; rootfs, snapshots, pause state and volumes wiped on delete | Copy-on-write per VM. Delete is `rmtree`/`unlink` (no wipe, no proof). Volumes have no tenant |
 | **Resources** | Per-VM CPU, memory, disk IO, network limits; per-tenant quotas (VM count, vCPU, RAM, disk) | Per-VM cgroups (Firecracker). No IO/network limits, no tenant quotas |
@@ -80,9 +80,9 @@ have no test proving it.
 
 ### 5. Cloud Hypervisor jailing
 
-- Run CH as an unprivileged user in a chroot with the same layout the
-  Firecracker jailer creates, plus cgroups v2 limits. Reuse the jailer
-  directory conventions so recovery code stays shared.
+Done: chroot per VM in the jailer's layout, unprivileged uid with
+`no_new_privs`, own cgroup v2, seccomp, `/dev/kvm` + `/dev/urandom` only, TAP
+passed as an fd. Cgroup *limits* are part of item 6.
 
 ### 6. Resource limits and quotas
 

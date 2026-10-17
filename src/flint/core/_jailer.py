@@ -7,8 +7,10 @@ from dataclasses import dataclass
 
 from .config import (
     JAILER_BINARY, FIRECRACKER_BINARY, JAILER_BASE_DIR,
-    JAILER_UID, JAILER_GID, JAILER_CGROUP_VER, log,
+    JAILER_UID, JAILER_GID, JAILER_CGROUP_VER, JAILER_SHARED_DIR,
 )
+from ._artifacts import link_into, shared_readonly
+from ._jailfs import own
 
 
 @dataclass
@@ -29,15 +31,28 @@ class JailSpec:
         return f"{self.chroot_root}/firecracker.sock"
 
 
-def stage_file_into_chroot(src: str, dest_name: str, spec: JailSpec) -> str:
-    """Hard-link (fallback: copy) src into the chroot root. Returns dest path."""
+def stage_private_file(src: str, dest_name: str, spec: JailSpec) -> str:
+    """Move a VM-owned writable file (e.g. a pool rootfs) into the chroot. Returns dest path."""
     dest = f"{spec.chroot_root}/{dest_name}"
-    try:
-        os.link(src, dest)
-    except OSError:
-        log.warning("jailer: hard-link failed for %s, falling back to copy", os.path.basename(src))
-        shutil.copy2(src, dest)
-    os.chown(dest, JAILER_UID, JAILER_GID)
+    link_into(src, dest)
+    make_private(dest)
+    return dest
+
+
+def make_private(path: str) -> None:
+    """Hand a per-VM file to the jailed VMM. Copies of read-only golden files inherit 0444."""
+    own(path, JAILER_UID, JAILER_GID, 0o600)
+
+
+def stage_shared_file(src: str, dest_name: str, spec: JailSpec) -> str:
+    """Hard-link a read-only artifact shared by all VMs (golden mem/vmstate) into the chroot.
+
+    The link shares the inode with every other VM, so it stays root-owned and
+    read-only: a compromised VMM must not be able to rewrite another tenant's
+    snapshot. Sharing the inode also shares the page cache across VMs.
+    """
+    dest = f"{spec.chroot_root}/{dest_name}"
+    os.link(shared_readonly(src, JAILER_SHARED_DIR), dest)
     return dest
 
 

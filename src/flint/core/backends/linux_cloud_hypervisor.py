@@ -25,15 +25,21 @@ from flint.core._ch_boot import (
     _RecoveredChProcess,
     _ch_ns_name,
     _ch_tap_name,
-    ch_boot_fresh,
+    ch_boot,
     ch_create_golden,
+    ch_create_golden_snapshot,
     ch_golden_ready,
+    ch_snapshot_ready,
+    ch_tap_for_ns,
     ch_pause_vm,
     ch_resume_from_pause,
     ch_teardown,
 )
+from flint.core._ch_jail import CH_JAIL_DIR, ChJail
 from flint.core._firecracker import _wait_for_agent
-from flint.core._netns import _delete_netns, _enter_netns, _ensure_bridge, _restore_netns
+from flint.core._netns import _delete_netns, _enter_netns, _ensure_bridge, _restore_netns, ensure_host_firewall, reserve_existing_veth_ips
+from flint.core._netns_pool import start_netns_pool, stop_netns_pool
+from flint.core._pool import start_pool, stop_pool
 from flint.core.config import (
     AGENT_PORT,
     CH_GOLDEN_DIR,
@@ -43,27 +49,7 @@ from flint.core.config import (
 )
 from flint.core.types import _SandboxEntry, SandboxState
 
-from .base import BackendBootResult, HostBackend
-
-
-def _row_meta(row: dict) -> dict:
-    """Return the per-sandbox backend_metadata dict from a state-store row.
-
-    Rows can carry it as either a pre-parsed dict (``backend_metadata``) or
-    the raw ``backend_meta_json`` TEXT column. Accept either.
-    """
-    meta = row.get("backend_metadata")
-    if isinstance(meta, dict):
-        return meta
-    raw = row.get("backend_meta_json")
-    if isinstance(raw, str) and raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return {}
+from .base import BackendBootResult, HostBackend, row_backend_metadata
 
 
 class LinuxCloudHypervisorBackend(HostBackend):
@@ -87,11 +73,14 @@ class LinuxCloudHypervisorBackend(HostBackend):
             problems.append(f"kernel image not found at {_cfg.KERNEL_PATH}")
         if not os.path.exists(_cfg.SOURCE_ROOTFS):
             problems.append(f"source rootfs not found at {_cfg.SOURCE_ROOTFS}")
+        for tool in ("setpriv", "chroot"):
+            if not shutil.which(tool):
+                problems.append(f"{tool} not found on PATH (needed to jail cloud-hypervisor)")
         return problems
 
     def template_artifact_valid(self, template_dir: str) -> bool:
-        # CH uses fresh boot per sandbox, so the default template only needs a
-        # rootfs. Per-sandbox pause snapshots live under each sandbox's vm_dir.
+        # A rootfs is enough: without a golden snapshot, create() cold-boots.
+        # Per-sandbox pause snapshots live under each sandbox's vm_dir.
         return os.path.exists(os.path.join(template_dir, "rootfs.ext4"))
 
     def install_dependencies(self, **kwargs) -> None:
@@ -101,6 +90,8 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
     def ensure_runtime_ready(self) -> None:
         _ensure_bridge()
+        ensure_host_firewall()
+        reserve_existing_veth_ips()
 
     def ensure_default_template(self) -> None:
         from flint.core._template_registry import register_template_artifact
@@ -110,8 +101,12 @@ class LinuxCloudHypervisorBackend(HostBackend):
         try:
             ch_create_golden(dest_dir=CH_GOLDEN_DIR, source_rootfs=_cfg.SOURCE_ROOTFS)
         except Exception as exc:
-            log.warning("ch golden template not installed: %s", exc)
-            status = "pending"
+            if ch_golden_ready(CH_GOLDEN_DIR):
+                # Sandboxes still work, they just cold-boot instead of restoring.
+                log.warning("ch golden snapshot not created, falling back to fresh boot: %s", exc)
+            else:
+                log.warning("ch golden template not installed: %s", exc)
+                status = "pending"
 
         register_template_artifact(
             DEFAULT_TEMPLATE_ID,
@@ -127,10 +122,27 @@ class LinuxCloudHypervisorBackend(HostBackend):
         )
 
     def start_pool(self) -> None:
-        pass
+        start_pool(_cfg.CH_POOL_DIR, self._pool_sources)
+        start_netns_pool("ch-", ch_tap_for_ns)
 
     def stop_pool(self) -> None:
-        pass
+        stop_pool()
+        stop_netns_pool()
+
+    @staticmethod
+    def _pool_sources(template_id: str) -> dict[str, str] | None:
+        from flint.core._template_registry import get_template_dir
+
+        if template_id == DEFAULT_TEMPLATE_ID:
+            template_dir = CH_GOLDEN_DIR
+        else:
+            try:
+                template_dir = get_template_dir(template_id, backend_kind=LinuxCloudHypervisorBackend.kind)
+            except KeyError:
+                return None
+        if not ch_snapshot_ready(template_dir):
+            return None
+        return {"rootfs.ext4": os.path.join(template_dir, "snapshot", "rootfs.ext4")}
 
     def create(
         self,
@@ -145,9 +157,10 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 f"cloud-hypervisor golden rootfs not found in {CH_GOLDEN_DIR}"
             )
 
-        boot = ch_boot_fresh(
+        boot = ch_boot(
             template_id=template_id,
             allow_internet_access=allow_internet_access,
+            use_pool=use_pool,
             use_pyroute2=use_pyroute2,
         )
 
@@ -159,7 +172,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             ns_name=boot.ns_name,
             guest_ip=GUEST_IP,
             agent_url=boot.agent_url,
-            chroot_base="",
+            chroot_base=boot.chroot_base,
             backend_vm_ref=boot.vm_id,
             runtime_dir=boot.vm_dir,
             guest_arch=platform.machine().lower(),
@@ -177,14 +190,10 @@ class LinuxCloudHypervisorBackend(HostBackend):
     def kill(self, entry: _SandboxEntry) -> None:
         ns_name = entry.ns_name or (entry.backend_metadata or {}).get("ns_name") or _ch_ns_name(entry.vm_id)
         socket_path = entry.socket_path or (entry.backend_metadata or {}).get("api_socket") or ""
-        ch_teardown(entry.process, ns_name, entry.vm_dir, socket_path=socket_path)
+        ch_teardown(entry.process, ns_name, entry.vm_id, socket_path=socket_path)
 
     def pause(self, entry: _SandboxEntry, state_store) -> None:
-        socket_path = entry.socket_path or (entry.backend_metadata or {}).get("api_socket")
-        if not socket_path:
-            raise RuntimeError("cloud-hypervisor pause: missing api socket path")
-
-        pause_dir = ch_pause_vm(socket_path, entry.vm_dir)
+        pause_dir = ch_pause_vm(entry.vm_id)
 
         # Stop the CH process — vm.restore on resume needs a fresh cloud-hypervisor
         # instance pointed at the same api-socket path.
@@ -210,19 +219,18 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
     def resume(self, row: dict) -> BackendBootResult:
         vm_id = row["vm_id"]
-        vm_dir = row["vm_dir"]
         ns_name = row.get("ns_name") or _ch_ns_name(vm_id)
-        meta = _row_meta(row)
+        meta = row_backend_metadata(row)
         tap_name = meta.get("tap_name") or _ch_tap_name(vm_id)
-        pause_dir = row.get("pause_state_ref") or meta.get("pause_dir") or os.path.join(vm_dir, "pause")
 
         boot = ch_resume_from_pause(
-            vm_id=vm_id,
-            vm_dir=vm_dir,
-            pause_dir=pause_dir,
+            vm_id,
             ns_name=ns_name,
             tap_name=tap_name,
+            veth_ip=meta.get("veth_ip", ""),
         )
+        vm_dir = boot.vm_dir
+        pause_dir = os.path.join(vm_dir, "pause")
 
         return BackendBootResult(
             process=boot.process,
@@ -232,7 +240,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             ns_name=ns_name,
             guest_ip=GUEST_IP,
             agent_url=boot.agent_url,
-            chroot_base="",
+            chroot_base=boot.chroot_base,
             backend_vm_ref=vm_id,
             runtime_dir=vm_dir,
             guest_arch=platform.machine().lower(),
@@ -244,6 +252,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 "ns_name": ns_name,
                 "tap_name": tap_name,
                 "pause_dir": pause_dir,
+                "veth_ip": boot.veth_ip,
             },
         )
 
@@ -402,7 +411,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             self._cleanup_dead_row(row)
             return "dead", None
 
-        meta = _row_meta(row)
+        meta = row_backend_metadata(row)
 
         entry = _SandboxEntry(
             vm_id=vm_id,
@@ -416,7 +425,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             agent_healthy=True,
             state=SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
-            chroot_base="",
+            chroot_base=row.get("chroot_base") or "",
             backend_kind=row.get("backend_kind") or self.kind,
             backend_vm_ref=vm_id,
             runtime_dir=vm_dir,
@@ -427,11 +436,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         return "alive", entry
 
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        """Build a CH template: Docker build -> rootfs extraction -> register.
-
-        CH doesn't need a pre-baked snapshot (we fresh-boot per sandbox) so
-        this skips the FC ``create_golden_snapshot`` step.
-        """
+        """Build a CH template: Docker build -> rootfs extraction -> golden snapshot -> register."""
         from flint.core._template_build import (
             _build_flintd,
             _docker_build,
@@ -473,6 +478,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
             rootfs_path = f"{template_dir}/rootfs.ext4"
             _extract_rootfs(image_tag, rootfs_path, rootfs_size_mb)
+            ch_create_golden_snapshot(template_dir)
 
             update_template_artifact_status(template_id, self.kind, "ready")
 
@@ -511,7 +517,9 @@ class LinuxCloudHypervisorBackend(HostBackend):
         except Exception:
             pass
 
-        if vm_dir:
+        ChJail(vm_id).cleanup()
+        # Sandboxes created before CH was jailed kept their files in the data dir.
+        if vm_dir and not vm_dir.startswith(CH_JAIL_DIR):
             shutil.rmtree(vm_dir, ignore_errors=True)
 
 

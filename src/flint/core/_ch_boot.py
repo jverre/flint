@@ -1,15 +1,19 @@
 """Cloud-Hypervisor boot + snapshot pipeline.
 
 Mirrors the Firecracker :mod:`_boot` / :mod:`_snapshot` modules but targets the
-cloud-hypervisor REST API. CH has no jailer of its own, so we isolate by running
-the process inside a per-VM netns and (when available) a dedicated systemd slice
-with ``--seccomp true``. The guest workload and host network layout are
-identical to the FC backend, so the same ``flintd`` image, init-net.sh, guest
-IP, and ARP pre-seed work unchanged.
+cloud-hypervisor REST API. Every VMM, including the one that takes a template's
+golden snapshot, runs jailed (see :mod:`_ch_jail`). The guest workload and host
+network layout are identical to the FC backend, so the same ``flintd`` image,
+init-net.sh, guest IP, and ARP pre-seed work unchanged.
 
-Fresh-boot path (no snapshot/restore) is used for per-sandbox create() to keep
-the pipeline simple and robust. Per-sandbox pause/resume uses
+create() restores from a per-template golden snapshot (``<template>/snapshot``)
+taken right after flintd came up, so sandboxes skip kernel boot. Templates
+without a snapshot fall back to a fresh boot. Per-sandbox pause/resume uses
 ``/api/v1/vm.snapshot`` + ``/api/v1/vm.restore``.
+
+Snapshots are taken inside the jail, so they reference chroot paths
+(``/vmlinux``, ``/rootfs.ext4``) and an fd-backed NIC: every VM restores the
+same golden files unchanged, with its own disk and a fresh TAP fd.
 """
 
 from __future__ import annotations
@@ -22,23 +26,25 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import _cloud_hypervisor as _ch
-from ._boot import _RecoveredProcess as _RecoveredChProcess, _timed
+from ._boot import _RecoveredProcess as _RecoveredChProcess, _timed  # noqa: F401 (re-exported)
+from ._artifacts import dig_holes, link_into, sparse_copy
+from ._ch_jail import JAIL_KERNEL, JAIL_ROOTFS, ChJail
+from ._jailfs import copy_out
 from ._firecracker import _wait_for_agent
 from ._netns import (
     _delete_netns,
-    _popen_in_ns,
     _setup_netns_pyroute2,
     _setup_netns_subprocess,
+    open_tap_fd,
 )
+from ._netns_pool import acquire_netns
+from ._pool import _claim_pool_entry
 from .config import (
-    CH_BINARY,
     CH_CPU_COUNT,
     CH_MEMORY_BYTES,
     CH_GOLDEN_DIR,
-    DATA_DIR,
     DEFAULT_TEMPLATE_ID,
     GUEST_MAC,
-    KERNEL_PATH,
     SOURCE_ROOTFS,
     log,
 )
@@ -51,6 +57,10 @@ CH_BOOT_ARGS = (
     "nokaslr root=/dev/vda rw init=/etc/init-net.sh"
 )
 
+# Id of the guest NIC. Restores hand CH a fresh TAP fd for it.
+NET_ID = "net0"
+_SNAPSHOT_FILES = ("config.json", "state.json", "memory-ranges")
+
 
 def _ch_ns_name(vm_id: str) -> str:
     return f"ch-{vm_id[:8]}"
@@ -60,11 +70,17 @@ def _ch_tap_name(vm_id: str) -> str:
     return f"chtap-{vm_id[:8]}"
 
 
+def ch_tap_for_ns(ns_name: str) -> str:
+    """TAP name for a pooled ``ch-<id>`` namespace (≤15 chars)."""
+    return f"chtap-{ns_name[len('ch-'):]}"
+
+
 @dataclass
 class ChBootResult:
     vm_id: str
-    vm_dir: str
-    socket_path: str
+    vm_dir: str          # chroot root
+    chroot_base: str
+    socket_path: str     # host path
     ns_name: str
     process: subprocess.Popen
     agent_url: str
@@ -74,44 +90,35 @@ class ChBootResult:
     t_total: float = 0.0
 
 
-def _build_vm_config(rootfs_path: str, tap_name: str) -> dict:
-    """Build the JSON config body for ``PUT /api/v1/vm.create``."""
+def _build_vm_config() -> dict:
+    """``vm.create`` body for a fresh boot, in chroot paths. The NIC is added via ``vm.add-net``."""
     return {
         "cpus": {"boot_vcpus": CH_CPU_COUNT, "max_vcpus": CH_CPU_COUNT},
         "memory": {"size": CH_MEMORY_BYTES},
-        "payload": {
-            "kernel": KERNEL_PATH,
-            "cmdline": CH_BOOT_ARGS,
-        },
-        "disks": [{"path": rootfs_path, "readonly": False}],
-        "net": [{"tap": tap_name, "mac": GUEST_MAC}],
+        "payload": {"kernel": JAIL_KERNEL, "cmdline": CH_BOOT_ARGS},
+        "disks": [{"path": JAIL_ROOTFS, "readonly": False}],
         "serial": {"mode": "Tty"},
         "console": {"mode": "Off"},
     }
 
 
-def _popen_cloud_hypervisor(
-    ns_name: str,
-    socket_path: str,
-    log_path: str,
-) -> subprocess.Popen:
-    """Spawn cloud-hypervisor inside ``ns_name`` with its API socket bound."""
-    # cloud-hypervisor honours SIGUSR1/SIGTERM for graceful shutdown; we use
-    # --seccomp true + --log-file for hardening and observability.
-    cmd = [
-        CH_BINARY,
-        "--api-socket", f"path={socket_path}",
-        "--seccomp", "true",
-    ]
-    log_fd = open(log_path, "w")
-    return _popen_in_ns(
-        ns_name,
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+def _boot_fresh(jail: ChJail, ns_name: str, tap_name: str) -> None:
+    _ch.vm_create(jail.socket_path, _build_vm_config())
+    tap_fd = open_tap_fd(ns_name, tap_name)
+    try:
+        _ch.vm_add_net(jail.socket_path, {"id": NET_ID, "mac": GUEST_MAC}, tap_fd)
+    finally:
+        os.close(tap_fd)
+    _ch.vm_boot(jail.socket_path)
+
+
+def _restore(jail: ChJail, ns_name: str, tap_name: str, jail_snapshot_dir: str) -> None:
+    tap_fd = open_tap_fd(ns_name, tap_name)
+    try:
+        _ch.vm_restore(jail.socket_path, f"file://{jail_snapshot_dir}", {NET_ID: tap_fd})
+    finally:
+        os.close(tap_fd)
+    _ch.vm_resume(jail.socket_path)
 
 
 def _log_tail(path: str, nbytes: int = 2000) -> str:
@@ -127,84 +134,94 @@ def _log_tail(path: str, nbytes: int = 2000) -> str:
         return ""
 
 
-def ch_boot_fresh(
+def _template_dir(template_id: str) -> str:
+    from ._template_registry import get_template_dir
+
+    if template_id == DEFAULT_TEMPLATE_ID:
+        return CH_GOLDEN_DIR
+    return get_template_dir(template_id, backend_kind="linux-cloud-hypervisor")
+
+
+def ch_boot(
     *,
     template_id: str = DEFAULT_TEMPLATE_ID,
     allow_internet_access: bool = True,
+    use_pool: bool = True,
     use_pyroute2: bool = True,
 ) -> ChBootResult:
-    """Fresh-boot a cloud-hypervisor VM from a template rootfs.
+    """Start a jailed cloud-hypervisor VM for ``template_id``.
 
-    No snapshot/restore; each sandbox boots from scratch via vm.create +
-    vm.boot. That's ~1-2s (kernel init + flintd start) versus ~200ms for
-    the FC snapshot-restore path, but correct behaviour first.
+    Restores the template's golden snapshot when it has one (~100 ms), else
+    boots the kernel from scratch (~500 ms).
     """
-    from ._template_registry import get_template_dir
-
     vm_id = str(uuid.uuid4())
-    ns_name = _ch_ns_name(vm_id)
-    tap_name = _ch_tap_name(vm_id)
+    jail = ChJail(vm_id)
+    ns_name = ""  # set once the namespace is acquired
     sid = vm_id[:8]
 
-    if template_id == DEFAULT_TEMPLATE_ID:
-        template_dir = CH_GOLDEN_DIR
-    else:
-        template_dir = get_template_dir(template_id, backend_kind="linux-cloud-hypervisor")
-
-    rootfs_src = os.path.join(template_dir, "rootfs.ext4")
+    template_dir = _template_dir(template_id)
+    snapshot_dir = _snapshot_dir(template_dir)
+    restore = ch_snapshot_ready(template_dir)
+    rootfs_src = os.path.join(snapshot_dir if restore else template_dir, "rootfs.ext4")
     if not os.path.exists(rootfs_src):
         raise RuntimeError(f"cloud-hypervisor rootfs not found: {rootfs_src}")
-
-    vm_dir = f"{DATA_DIR}/ch-{vm_id}"
-    socket_path = f"{vm_dir}/ch.sock"
-    rootfs_path = f"{vm_dir}/rootfs.ext4"
-    log_path = f"{vm_dir}/cloud-hypervisor.log"
 
     timings: dict[str, float] = {}
     t_total = time.monotonic()
     process: subprocess.Popen | None = None
+    pool_entry_dir = None
 
     try:
-        os.makedirs(vm_dir, exist_ok=True)
+        jail.prepare()
 
         with _timed(timings, "copy_rootfs_ms"):
-            subprocess.run(
-                ["cp", "--reflink=auto", rootfs_src, rootfs_path], check=True
-            )
-
-        with _timed(timings, "netns_setup_ms"):
-            if use_pyroute2:
-                veth_ip = _setup_netns_pyroute2(
-                    ns_name, tap_name, internet=allow_internet_access
-                )
+            # Pool entries are copies of the snapshot's disk, so only use them
+            # when restoring; a fresh boot starts from the template rootfs.
+            if use_pool and restore:
+                pool_entry_dir = _claim_pool_entry(template_id)
+            if pool_entry_dir:
+                link_into(f"{pool_entry_dir}/rootfs.ext4", jail.host_path(JAIL_ROOTFS))
+                shutil.rmtree(pool_entry_dir, ignore_errors=True)
+                pool_entry_dir = None
             else:
-                veth_ip = _setup_netns_subprocess(
-                    ns_name, tap_name, internet=allow_internet_access
-                )
+                sparse_copy(rootfs_src, jail.host_path(JAIL_ROOTFS))
+            jail.give(JAIL_ROOTFS)
+
+        # Pre-built by the netns pool when available.
+        with _timed(timings, "netns_setup_ms"):
+            net = acquire_netns(
+                "ch-", ch_tap_for_ns, allow_internet_access,
+                use_pool=use_pool, use_pyroute2=use_pyroute2,
+            )
+            ns_name, tap_name, veth_ip = net.ns_name, net.tap_name, net.veth_ip
 
         with _timed(timings, "popen_ms"):
-            process = _popen_cloud_hypervisor(ns_name, socket_path, log_path)
+            process = jail.spawn(ns_name)
 
-        with _timed(timings, "wait_api_ready_ms"):
-            _ch.wait_for_api_socket(socket_path, process=process, log_path=log_path)
-
-        with _timed(timings, "api_vm_create_ms"):
-            _ch.vm_create(socket_path, _build_vm_config(rootfs_path, tap_name))
-
-        with _timed(timings, "api_vm_boot_ms"):
-            _ch.vm_boot(socket_path)
+        if restore:
+            with _timed(timings, "stage_snapshot_ms"):
+                os.mkdir(jail.host_path("/restore"))
+                for name in _SNAPSHOT_FILES:
+                    jail.link_shared(os.path.join(snapshot_dir, name), f"/restore/{name}")
+            with _timed(timings, "api_vm_restore_ms"):
+                _restore(jail, ns_name, tap_name, "/restore")
+            shutil.rmtree(jail.host_path("/restore"), ignore_errors=True)
+        else:
+            with _timed(timings, "api_vm_boot_ms"):
+                _boot_fresh(jail, ns_name, tap_name)
 
         with _timed(timings, "agent_connect_ms"):
             agent_url = _wait_for_agent(ns_name)
 
         total_ms = (time.monotonic() - t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in timings.items())
-        log.debug("[%s] ch boot %.0f ms: %s", sid, total_ms, parts)
+        log.debug("[%s] ch %s %.0f ms: %s", sid, "restore" if restore else "boot", total_ms, parts)
 
         return ChBootResult(
             vm_id=vm_id,
-            vm_dir=vm_dir,
-            socket_path=socket_path,
+            vm_dir=jail.root,
+            chroot_base=jail.base,
+            socket_path=jail.socket_path,
             ns_name=ns_name,
             process=process,
             agent_url=agent_url,
@@ -215,7 +232,7 @@ def ch_boot_fresh(
         )
 
     except Exception:
-        tail = _log_tail(log_path)
+        tail = _log_tail(jail.log_path)
         if tail:
             log.error("ch boot failed — cloud-hypervisor log:\n%s", tail)
         if process is not None:
@@ -224,15 +241,16 @@ def ch_boot_fresh(
                 process.wait(timeout=2)
             except Exception:
                 pass
-        _delete_netns(ns_name)
-        shutil.rmtree(vm_dir, ignore_errors=True)
+        if pool_entry_dir:
+            shutil.rmtree(pool_entry_dir, ignore_errors=True)
+        if ns_name:
+            _delete_netns(ns_name)
+        jail.cleanup()
         raise
 
 
-def ch_teardown(
-    process, ns_name: str, vm_dir: str, socket_path: str = ""
-) -> None:
-    """Best-effort VM teardown: graceful shutdown → SIGKILL → remove netns+dir."""
+def ch_teardown(process, ns_name: str, vm_id: str, socket_path: str = "") -> None:
+    """Best-effort VM teardown: graceful shutdown → SIGKILL → remove netns, jail and cgroup."""
     if socket_path and os.path.exists(socket_path):
         try:
             _ch.vmm_shutdown(socket_path)
@@ -248,96 +266,150 @@ def ch_teardown(
         except Exception:
             pass
     _delete_netns(ns_name)
-    if vm_dir:
-        shutil.rmtree(vm_dir, ignore_errors=True)
+    ChJail(vm_id).cleanup()
 
 
-def ch_pause_vm(socket_path: str, vm_dir: str) -> str:
-    """Pause + snapshot a running CH VM to ``<vm_dir>/pause/``. Returns the pause dir."""
-    pause_dir = os.path.join(vm_dir, "pause")
-    # CH refuses to overwrite snapshot files, and any left over from an earlier
-    # pause/resume cycle are stale once the VM has resumed.
-    shutil.rmtree(pause_dir, ignore_errors=True)
-    os.makedirs(pause_dir)
-    _ch.vm_pause(socket_path)
+def ch_pause_vm(vm_id: str) -> str:
+    """Pause + snapshot a running CH VM to ``/pause`` in its jail. Returns the host path."""
+    jail = ChJail(vm_id)
+    pause_dir = jail.host_path("/pause")
+    # CH refuses to overwrite an existing snapshot, and a VM that was paused
+    # before still has one here. Write a fresh one and swap it in; restore
+    # copies memory, so the running VM no longer needs the old files.
+    staging = jail.host_path("/pause.tmp")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    jail.give("/pause.tmp")
+    _ch.vm_pause(jail.socket_path)
     try:
-        _ch.vm_snapshot(socket_path, f"file://{pause_dir}")
+        _ch.vm_snapshot(jail.socket_path, "file:///pause.tmp")
     except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
         try:
-            _ch.vm_resume(socket_path)
+            _ch.vm_resume(jail.socket_path)
         except Exception:
             pass
         raise
+    shutil.rmtree(pause_dir, ignore_errors=True)
+    os.rename(staging, pause_dir)
     return pause_dir
 
 
 def ch_resume_from_pause(
     vm_id: str,
-    vm_dir: str,
-    pause_dir: str,
     *,
     ns_name: str,
     tap_name: str,
     use_pyroute2: bool = True,
     allow_internet_access: bool = True,
+    veth_ip: str = "",
 ) -> ChBootResult:
-    """Restart cloud-hypervisor and restore from a per-sandbox pause snapshot."""
-    socket_path = os.path.join(vm_dir, "ch.sock")
-    log_path = os.path.join(vm_dir, "cloud-hypervisor.log")
+    """Restart the jailed VMM and restore from the sandbox's pause snapshot."""
+    jail = ChJail(vm_id)
 
-    # Netns may still exist from the running-state teardown (we kill only the
-    # CH process on pause); ensure it's present.
+    # The netns survives pause; it's gone only after a host reboot.
     if not os.path.exists(f"/var/run/netns/{ns_name}"):
-        if use_pyroute2:
-            _setup_netns_pyroute2(ns_name, tap_name, internet=allow_internet_access)
-        else:
-            _setup_netns_subprocess(ns_name, tap_name, internet=allow_internet_access)
-
-    try:
-        os.unlink(socket_path)
-    except FileNotFoundError:
-        pass
-
-    process = _popen_cloud_hypervisor(ns_name, socket_path, log_path)
+        setup = _setup_netns_pyroute2 if use_pyroute2 else _setup_netns_subprocess
+        veth_ip = setup(ns_name, tap_name, internet=allow_internet_access)
 
     timings: dict[str, float] = {}
     t_total = time.monotonic()
+    process = None
     try:
-        with _timed(timings, "wait_api_ready_ms"):
-            _ch.wait_for_api_socket(socket_path, process=process, log_path=log_path)
+        with _timed(timings, "popen_ms"):
+            process = jail.spawn(ns_name)
         with _timed(timings, "api_vm_restore_ms"):
-            _ch.vm_restore(socket_path, f"file://{pause_dir}")
-        with _timed(timings, "api_vm_resume_ms"):
-            _ch.vm_resume(socket_path)
+            _restore(jail, ns_name, tap_name, "/pause")
         with _timed(timings, "agent_connect_ms"):
             agent_url = _wait_for_agent(ns_name)
     except Exception:
-        tail = _log_tail(log_path)
+        tail = _log_tail(jail.log_path)
         if tail:
             log.error("ch resume failed — cloud-hypervisor log:\n%s", tail)
-        try:
-            process.kill()
-            process.wait(timeout=2)
-        except Exception:
-            pass
+        if process is not None:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
         raise
 
     return ChBootResult(
         vm_id=vm_id,
-        vm_dir=vm_dir,
-        socket_path=socket_path,
+        vm_dir=jail.root,
+        chroot_base=jail.base,
+        socket_path=jail.socket_path,
         ns_name=ns_name,
         process=process,
         agent_url=agent_url,
         tap_name=tap_name,
-        veth_ip="",
+        veth_ip=veth_ip,
         timings=timings,
         t_total=t_total,
     )
 
 
+def _snapshot_dir(template_dir: str) -> str:
+    return os.path.join(template_dir, "snapshot")
+
+
+def ch_snapshot_ready(template_dir: str) -> bool:
+    snapshot_dir = _snapshot_dir(template_dir)
+    return all(os.path.exists(os.path.join(snapshot_dir, f)) for f in (*_SNAPSHOT_FILES, "rootfs.ext4"))
+
+
+def ch_create_golden_snapshot(template_dir: str) -> None:
+    """Boot the template once (jailed), wait for flintd, and snapshot it to ``<template_dir>/snapshot``.
+
+    The template's image is tenant-supplied, so this boot is as confined as a
+    sandbox. The snapshot keeps the exact disk the golden VM ran on, since
+    guest page cache in the memory image must match it.
+    """
+    snapshot_dir = _snapshot_dir(template_dir)
+    staging = f"{snapshot_dir}.tmp"
+    shutil.rmtree(staging, ignore_errors=True)
+
+    vm_id = f"golden-{uuid.uuid4()}"
+    jail = ChJail(vm_id)
+    ns_name = _ch_ns_name(vm_id[len("golden-"):])
+    tap_name = ch_tap_for_ns(ns_name)
+    process = None
+    t0 = time.monotonic()
+    try:
+        jail.prepare()
+        sparse_copy(os.path.join(template_dir, "rootfs.ext4"), jail.host_path(JAIL_ROOTFS))
+        jail.give(JAIL_ROOTFS)
+        _setup_netns_pyroute2(ns_name, tap_name, internet=False)
+        process = jail.spawn(ns_name)
+        _boot_fresh(jail, ns_name, tap_name)
+        _wait_for_agent(ns_name)
+        os.mkdir(jail.host_path("/snapshot"))
+        jail.give("/snapshot")
+        _ch.vm_pause(jail.socket_path)
+        _ch.vm_snapshot(jail.socket_path, "file:///snapshot")
+
+        # The template image ran in this VMM: copy out without following links.
+        os.makedirs(staging)
+        for name in _SNAPSHOT_FILES:
+            copy_out(jail.host_path(f"/snapshot/{name}"), os.path.join(staging, name))
+        copy_out(jail.host_path(JAIL_ROOTFS), os.path.join(staging, "rootfs.ext4"))
+    except Exception:
+        tail = _log_tail(jail.log_path)
+        if tail:
+            log.error("ch golden snapshot failed — cloud-hypervisor log:\n%s", tail)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        ch_teardown(process, ns_name, vm_id, jail.socket_path)
+
+    dig_holes(os.path.join(staging, "memory-ranges"))
+    shutil.rmtree(snapshot_dir, ignore_errors=True)
+    os.rename(staging, snapshot_dir)
+    log.info("CH golden snapshot ready in %s (%.0f ms)", snapshot_dir, (time.monotonic() - t0) * 1000)
+
+
 def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_ROOTFS) -> None:
-    """Install the default CH template (just a rootfs copy, no snapshot)."""
+    """Install the default CH template rootfs and its golden snapshot."""
     try:
         source_size = os.path.getsize(source_rootfs)
     except FileNotFoundError as exc:
@@ -345,12 +417,15 @@ def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "rootfs.ext4")
     try:
-        if os.path.getsize(dest) == source_size:
-            return
+        installed = os.path.getsize(dest) == source_size
     except FileNotFoundError:
-        pass
-    subprocess.run(["cp", "--reflink=auto", source_rootfs, dest], check=True)
-    log.info("CH golden rootfs installed: %s (%d bytes)", dest, source_size)
+        installed = False
+    if not installed:
+        sparse_copy(source_rootfs, dest)
+        shutil.rmtree(_snapshot_dir(dest_dir), ignore_errors=True)
+        log.info("CH golden rootfs installed: %s (%d bytes)", dest, source_size)
+    if not ch_snapshot_ready(dest_dir):
+        ch_create_golden_snapshot(dest_dir)
 
 
 def ch_golden_ready(dest_dir: str = CH_GOLDEN_DIR) -> bool:

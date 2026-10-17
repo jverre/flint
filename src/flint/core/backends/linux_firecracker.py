@@ -6,14 +6,18 @@ import json
 import os
 import platform
 import shutil
+import stat
 import threading
 import urllib.request
 
 import websockets.sync.client as ws_sync
 
-from flint.core._boot import _RecoveredProcess, _boot_from_snapshot, _teardown_vm
+from flint.core._artifacts import prune_shared
+from flint.core._jailfs import copy_within
+from flint.core._boot import PAUSE_MEM, PAUSE_VMSTATE, _RecoveredProcess, _boot_from_snapshot, _teardown_vm
 from flint.core._firecracker import _fc_patch, _fc_put, _fc_request, _fc_status_ok, _wait_for_agent, _wait_for_api_socket
-from flint.core._netns import _delete_netns, _ensure_bridge, _enter_netns, _restore_netns
+from flint.core._netns import _delete_netns, _ensure_bridge, _enter_netns, _restore_netns, ensure_host_firewall, reserve_existing_veth_ips
+from flint.core._netns_pool import start_netns_pool, stop_netns_pool
 from flint.core._pool import start_pool, stop_pool
 
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
@@ -28,15 +32,19 @@ from flint.core.config import (
     AGENT_PORT,
     DATA_DIR,
     DEFAULT_TEMPLATE_ID,
+    FC_POOL_DIR,
+    JAILER_SHARED_DIR,
     GOLDEN_DIR,
     GOLDEN_TAP,
     GUEST_IP,
+    JAILER_GID,
+    JAILER_UID,
     TEMPLATES_DIR,
     log,
 )
 from flint.core.types import _SandboxEntry, SandboxState
 
-from .base import BackendBootResult, HostBackend
+from .base import BackendBootResult, HostBackend, row_backend_metadata
 
 
 class LinuxFirecrackerBackend(HostBackend):
@@ -76,6 +84,9 @@ class LinuxFirecrackerBackend(HostBackend):
 
     def ensure_runtime_ready(self) -> None:
         _ensure_bridge()
+        ensure_host_firewall()
+        reserve_existing_veth_ips()
+        prune_shared(JAILER_SHARED_DIR)
 
     def ensure_default_template(self) -> None:
         if not golden_snapshot_exists():
@@ -90,10 +101,24 @@ class LinuxFirecrackerBackend(HostBackend):
         )
 
     def start_pool(self) -> None:
-        start_pool()
+        start_pool(FC_POOL_DIR, self._pool_sources)
+        start_netns_pool("fc-", lambda _ns: GOLDEN_TAP)
+
+    @staticmethod
+    def _pool_sources(template_id: str) -> dict[str, str] | None:
+        if template_id == DEFAULT_TEMPLATE_ID:
+            if not golden_snapshot_exists():
+                return None
+            snapshot_dir = GOLDEN_DIR
+        elif template_snapshot_exists(template_id, backend_kind=LinuxFirecrackerBackend.kind):
+            snapshot_dir = get_template_dir(template_id)
+        else:
+            return None
+        return {"rootfs.ext4": f"{snapshot_dir}/rootfs.ext4", PAUSE_MEM: f"{snapshot_dir}/mem"}
 
     def stop_pool(self) -> None:
         stop_pool()
+        stop_netns_pool()
 
     def create(
         self,
@@ -143,13 +168,40 @@ class LinuxFirecrackerBackend(HostBackend):
         _teardown_vm(entry.process, entry.ns_name, entry.chroot_base, entry.vm_id)
 
     def pause(self, entry: _SandboxEntry, state_store) -> None:
+        """Snapshot the VM to ``pause-mem``/``pause-vmstate`` in its chroot, then stop it.
+
+        ``pause-mem`` always holds a complete memory image: a copy of the
+        golden ``mem`` before the first pause, and the VM's own backing file
+        after a resume. A diff snapshot writes only the pages dirtied since the
+        last restore into it in place. Clean pages are still backed by that
+        file's page cache, so rewriting dirty pages under the running VM is
+        safe. A full snapshot is the fallback.
+        """
         _fc_patch(entry.socket_path, "/vm", {"state": "Paused"})
-        snapshot_body = {
-            "snapshot_type": "Full",
-            "snapshot_path": "pause-vmstate",
-            "mem_file_path": "pause-mem",
-        }
-        resp = _fc_put(entry.socket_path, "/snapshot/create", snapshot_body)
+        pause_mem = os.path.join(entry.vm_dir, PAUSE_MEM)
+        try:
+            try:
+                have_base = stat.S_ISREG(os.lstat(pause_mem).st_mode)
+            except FileNotFoundError:
+                have_base = False
+            if not have_base:
+                # Pool miss at create: build the base now (slower, same result).
+                # The VMM has run guest code, so don't trust paths in its jail.
+                copy_within(os.path.join(entry.vm_dir, "mem"), pause_mem, JAILER_UID, JAILER_GID)
+            resp = _fc_put(entry.socket_path, "/snapshot/create", {
+                "snapshot_type": "Diff",
+                "snapshot_path": PAUSE_VMSTATE,
+                "mem_file_path": PAUSE_MEM,
+            })
+            if not _fc_status_ok(resp):
+                log.warning("[%s] diff snapshot failed, taking a full one: %s", entry.vm_id[:8], resp.split("\r\n\r\n", 1)[-1][:300])
+                resp = _fc_put(entry.socket_path, "/snapshot/create", {
+                    "snapshot_type": "Full",
+                    "snapshot_path": PAUSE_VMSTATE,
+                    "mem_file_path": PAUSE_MEM,
+                })
+        except Exception as exc:
+            resp = str(exc)
         if not _fc_status_ok(resp):
             _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
             raise RuntimeError(f"Snapshot create failed: {resp}")
@@ -188,7 +240,7 @@ class LinuxFirecrackerBackend(HostBackend):
         # (firecracker binary link, /dev/kvm, /dev/net/tun, /dev/urandom,
         # cgroup dirs). These conflict if the jailer is restarted with the
         # same --id. Remove everything except the files we need to keep.
-        _keep = {"rootfs.ext4", "pause-vmstate", "pause-mem"}
+        _keep = {"rootfs.ext4", PAUSE_VMSTATE, PAUSE_MEM}
         for entry in os.listdir(spec.chroot_root):
             if entry in _keep:
                 continue
@@ -227,9 +279,9 @@ class LinuxFirecrackerBackend(HostBackend):
         try:
             _wait_for_api_socket(socket_path)
             snapshot_body = {
-                "snapshot_path": "pause-vmstate",
-                "mem_backend": {"backend_type": "File", "backend_path": "pause-mem"},
-                "enable_diff_snapshots": False,
+                "snapshot_path": PAUSE_VMSTATE,
+                "mem_backend": {"backend_type": "File", "backend_path": PAUSE_MEM},
+                "track_dirty_pages": True,
                 "resume_vm": False,
                 "network_overrides": [{"iface_id": "eth0", "host_dev_name": GOLDEN_TAP}],
             }
@@ -272,6 +324,8 @@ class LinuxFirecrackerBackend(HostBackend):
                 "socket_path": socket_path,
                 "ns_name": ns_name,
                 "chroot_base": chroot_base,
+                # The netns survives pause, and storage deregisters exports by this IP on kill.
+                "veth_ip": row_backend_metadata(row).get("veth_ip", ""),
             },
         )
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,9 @@ GOLDEN_DIR = f"{DATA_DIR}/.golden"
 POOL_DIR = f"{DATA_DIR}/.pool"
 POOL_TARGET_SIZE = 8
 POOL_WORKERS = 4
+# Pre-built network namespaces with internet access. Each holds one of the
+# bridge's 253 IPs, which also caps concurrent internet-enabled sandboxes.
+NETNS_POOL_SIZE = int(os.environ.get("FLINT_NETNS_POOL_SIZE", "8"))
 
 TEMPLATES_DIR = f"{DATA_DIR}/.templates"
 DEFAULT_TEMPLATE_ID = "default"
@@ -72,6 +76,13 @@ JAILER_BASE_DIR    = os.environ.get("FLINT_JAILER_BASE_DIR", "/srv/jailer")
 JAILER_UID         = int(os.environ.get("FLINT_JAILER_UID", "1000"))
 JAILER_GID         = int(os.environ.get("FLINT_JAILER_GID", "1000"))
 JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
+# Pool entries and shared read-only artifacts (snapshots, kernel, VMM binary)
+# live on the jailer's filesystem so they can be hard-linked into each chroot.
+# Pools are per daemon (keyed by data dir); shared artifacts are keyed by source.
+_DATA_KEY          = hashlib.sha1(DATA_DIR.encode()).hexdigest()[:8]
+FC_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-fc-{_DATA_KEY}"
+CH_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-ch-{_DATA_KEY}"
+JAILER_SHARED_DIR  = f"{JAILER_BASE_DIR}/.snapshots"
 
 # ── Credential proxy ─────────────────────────────────────────────────────
 PROXY_PORT = int(os.environ.get("FLINT_PROXY_PORT", "8080"))
@@ -87,7 +98,6 @@ CH_BINARY         = os.environ.get("FLINT_CH_BINARY", "/usr/local/bin/cloud-hype
 CH_CPU_COUNT      = int(os.environ.get("FLINT_CH_CPU_COUNT", "1"))
 CH_MEMORY_BYTES   = int(os.environ.get("FLINT_CH_MEMORY_BYTES", str(128 * 1024 * 1024)))
 CH_GOLDEN_DIR     = os.environ.get("FLINT_CH_GOLDEN_DIR", f"{DATA_DIR}/.golden-ch")
-CH_SLICE          = os.environ.get("FLINT_CH_SLICE", "flint.slice")
 CH_UID            = int(os.environ.get("FLINT_CH_UID", str(JAILER_UID)))
 
 # ── macOS Virtualization.framework backend ───────────────────────────────
