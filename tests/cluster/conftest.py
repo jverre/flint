@@ -33,14 +33,15 @@ def cluster():
 def hosts(cluster):
     """Hosts a and b, ready and schedulable; restored after the test."""
     for h in cluster.hosts.values():
-        h.ensure_up()
         cluster.api.post(f"/v1/hosts/{h.host_id}/uncordon")
         cluster.api.patch(f"/v1/hosts/{h.host_id}", json={"max_vms": 0})
+        h.ensure_up()
     yield cluster.hosts
     for h in cluster.hosts.values():
-        h.ensure_up()
+        # Uncordon first: a drained host only returns to ready once uncordoned.
         cluster.api.post(f"/v1/hosts/{h.host_id}/uncordon")
         cluster.api.patch(f"/v1/hosts/{h.host_id}", json={"max_vms": 0})
+        h.ensure_up()
 
 
 @pytest.fixture

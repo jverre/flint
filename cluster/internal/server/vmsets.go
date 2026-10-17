@@ -174,6 +174,9 @@ func (s *Server) rollVMSet(ctx context.Context, vs *VMSet, active, standby []*VM
 
 // createVMSetMember places a new member, spreading members across zones or hosts.
 func (s *Server) createVMSetMember(ctx context.Context, vs *VMSet, siblings []*VM, role string) (*VM, error) {
+	if err := s.checkQuota(ctx, vs.Tenant, 1); err != nil {
+		return nil, err
+	}
 	counts := map[string]int{}
 	hosts, _ := s.listHosts(ctx)
 	byID := map[string]*Host{}

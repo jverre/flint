@@ -163,5 +163,13 @@ def backend_health(_ensure_daemon):
 
 
 @pytest.fixture(scope="session")
+def daemon_only(backend_health):
+    """Skip a test that checks something host-local (volumes, per-daemon config,
+    jail directories) when the suite runs against a cluster control plane."""
+    if backend_health.get("role") == "control-plane":
+        pytest.skip("host-local feature: not served by the cluster control plane")
+
+
+@pytest.fixture(scope="session")
 def backend_kind(backend_health):
     return backend_health["backend_kind"]

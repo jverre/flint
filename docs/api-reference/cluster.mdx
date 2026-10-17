@@ -1,0 +1,52 @@
+---
+title: "Cluster API"
+description: "What the control plane adds to the daemon's API."
+---
+
+`flint-cluster server` serves the daemon's API (`/vms`, `/vms/{id}/...`, `/templates`, `/events`) for the whole cluster, plus the endpoints below. Every request needs `Authorization: Bearer <token>`; admin-only endpoints are marked.
+
+## VMs
+
+| Method | Path | |
+|--------|------|---|
+| `POST` | `/vms?tenant=&template_id=` | Body adds `availability` (`ephemeral` \| `restartable` \| `durable`) and `labels`. `tenant` is required. `503` with `capacity_exhausted` when no host can take it |
+| `POST` | `/vms/{id}/fork` | `{"count": n}` (1-100). Returns `{"vms": [...]}` |
+| `POST` | `/vms/{id}/checkpoint` | Snapshot a running VM now |
+| `POST` | `/vms/{id}/migrate` | Move a running VM to another host (`{"host_id": ...}` needs admin) |
+
+VM objects carry `host_id`, `tenant`, `availability`, `cluster_state` and, for durable VMs, `checkpoint_at`. `state` uses the daemon's names, plus `Migrating`, `Recovering` and `Lost`.
+
+## VM sets
+
+| Method | Path | |
+|--------|------|---|
+| `POST` | `/v1/vmsets` | `{"name", "tenant", "spec": {"replicas", "template_id", "availability", "spread": "zone"\|"host", "standby", "max_unavailable"}}` |
+| `GET` | `/v1/vmsets`, `/v1/vmsets/{id}` | Status: running, standby, by zone, members |
+| `PUT` | `/v1/vmsets/{id}` | New spec; a new `template_id` rolls the set |
+| `DELETE` | `/v1/vmsets/{id}` | Deletes its members |
+
+## Hosts (admin)
+
+| Method | Path | |
+|--------|------|---|
+| `GET` | `/v1/hosts`, `/v1/hosts/{id}` | State, zone, capacity, host class, cached snapshots |
+| `PATCH` | `/v1/hosts/{id}` | `{"max_vms": n}` |
+| `POST` | `/v1/hosts/{id}/cordon`, `/uncordon`, `/drain` | |
+| `DELETE` | `/v1/hosts/{id}` | `?force=true` if it still has VMs |
+| `POST` | `/v1/join-tokens` | `{"zone", "labels", "ttl_seconds"}` → single-use `token` |
+
+## Tokens (admin)
+
+| Method | Path | |
+|--------|------|---|
+| `POST` | `/v1/tokens` | `{"kind": "service"\|"admin", "name", "tenants": [...]}` → the token, shown once |
+| `GET` | `/v1/tokens` | |
+| `DELETE` | `/v1/tokens/{id}` | |
+
+## Other
+
+| Method | Path | |
+|--------|------|---|
+| `GET` | `/v1/events?since=&vm_id=&type=&tenant=` | Event history |
+| `GET` | `/v1/snapshots` | Admin: snapshots in the store |
+| `GET` | `/health` | No auth. `hosts_ready`, `leader`, `replica` |

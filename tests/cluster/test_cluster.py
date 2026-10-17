@@ -24,6 +24,15 @@ def state(sb: Sandbox) -> dict:
     return sb._fetch() or {}
 
 
+def running(pid: int) -> bool:
+    """A killed VMM whose parent (the agent) is frozen stays a zombie: that's dead."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
 def test_host_joins_once_and_reports_capacity(cluster, hosts):
     for h in hosts.values():
         info = h.info()
@@ -138,7 +147,7 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
     t0 = time.time()
     killed_at = recovered_at = None
     while time.time() - t0 < 40 and not (killed_at and recovered_at):
-        if killed_at is None and not os.path.exists(f"/proc/{pid}"):
+        if killed_at is None and not running(pid):
             killed_at = time.time() - t0
         st = state(durable)
         if recovered_at is None and st.get("state") == "Started" and host_of(cluster, durable) == "a":
@@ -167,11 +176,11 @@ def test_restarted_agent_kills_vms_whose_lease_lapsed(cluster, hosts, make_vm):
     old_pid = state(durable)["pid"]
     for p in (hosts["b"].agent, hosts["b"].snapd):
         p.kill()
-    assert os.path.exists(f"/proc/{old_pid}"), "the VM should outlive its agent"
+    assert running(old_pid), "the VM should outlive its agent"
     wait_for(lambda: state(durable).get("state") == "Started" and host_of(cluster, durable) == "a", 40,
              "the durable VM recovered on a")
     hosts["b"].ensure_up()
-    assert not os.path.exists(f"/proc/{old_pid}"), "the lapsed copy on b is still running"
+    assert not running(old_pid), "the lapsed copy on b is still running"
     assert durable.read_file("/root/marker") == b"durable"
 
 
@@ -252,6 +261,13 @@ def test_credentials_and_tenants_are_isolated(cluster, hosts, make_vm):
     assert pinned.get(f"/vms/{mine.id}").status_code == 404
     assert all(v["tenant"] == "other" for v in pinned.get("/vms").json()["vms"])
     assert pinned.post("/vms", params={"tenant": TENANT}).status_code == 403
+    # A tenant at its quota gets a clear refusal, not a VM.
+    assert cluster.api.put("/v1/tenants/quota-t/quota", json={"max_vms": 1}).status_code == 200
+    first = make_vm(tenant="quota-t")
+    r = cluster.api.post("/vms", params={"tenant": "quota-t"})
+    assert r.status_code == 429 and "quota" in r.json()["detail"], r.text
+    with pytest.raises(RuntimeError, match="quota"):
+        first.fork(1)
     # VMs can't reach the control plane, host agents or snapd on the host.
     bridge_ip = f"{b.subnet}.1"
     for port in (cluster.port, cluster.port + 1, b.agent_port, b.snapd_port):

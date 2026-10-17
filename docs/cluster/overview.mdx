@@ -1,0 +1,106 @@
+---
+title: "Cluster overview"
+description: "Run Flint across many hosts behind one API, highly available."
+---
+
+A Flint cluster runs sandboxes on many KVM hosts behind one API. Your code doesn't change: point the SDK at the control plane instead of a local daemon.
+
+```python
+import flint
+from flint import Sandbox
+
+flint.configure(url="https://flint.example.com", api_key="flint_...", tenant="user_123")
+
+sb = Sandbox(availability="durable")   # survives a host crash
+sb.commands.run("echo hello")
+kids = sb.fork(3)                      # three copies, on whichever hosts have room
+```
+
+Or with environment variables: `FLINT_URL`, `FLINT_API_KEY`, `FLINT_TENANT`.
+
+## Components
+
+```
+      SDK / CLI / Terraform
+               │  HTTPS, API token
+      ┌────────▼─────────┐
+      │  load balancer   │
+      └──┬────────────┬──┘
+   ┌─────▼──────┐  ┌──▼─────────┐
+   │flint-server│  │flint-server│   stateless replicas; one runs the reconcilers
+   └─────┬──────┘  └──────┬─────┘
+         ├── Postgres (catalog, events)
+         ├── object store (snapshots)
+         │ mTLS
+  ┌──────┴───────────────────────┐
+┌─▼──────────────┐      ┌────────▼───────┐
+│ host (zone a)  │      │ host (zone b)  │
+│ flint agent    │      │ flint agent    │   the daemon, in agent mode
+│ flint-cluster  │◄────►│ flint-cluster  │   snapd: snapshots, peer
+│   snapd        │      │   snapd        │   chunk serving, fencing
+└────────────────┘      └────────────────┘
+```
+
+| Component | What it does |
+|-----------|--------------|
+| `flint-cluster server` | The API (the daemon's, for the whole cluster), scheduler, gateway to hosts, host registry, certificate authority, reconcilers. Stateless: run two or more behind a load balancer. |
+| Postgres | The catalog: hosts, VMs, snapshots, templates, VM sets, tokens, events. SQLite works for a single server. |
+| Object store | Snapshots, as 4 MiB content-addressed chunks plus a manifest. S3, R2, GCS (interop), MinIO or a shared directory. |
+| `flint agent` | The Flint daemon as a host agent: runs VMs, reports to the control plane, serves it over mTLS. |
+| `flint-cluster snapd` | Next to each agent: takes and restores snapshots, serves cached chunks to other hosts, writes the storage heartbeat, and fences VMs. |
+
+## Snapshots move VMs
+
+Pause, fork, checkpoint and template are all the same thing: a snapshot of a VM's memory and disk in the object store. Any host of the same host class (backend, CPU model, kernel, VMM version) can restore it, so:
+
+- **Fork** pauses the source for the time it takes to snapshot it (a fraction of a second), then starts the copies wherever there's room. Hosts fetch chunks directly from the source host while they upload, so they don't wait for the object store.
+- **Resume** happens on the VM's own host when it can (its files are still there), anywhere else otherwise.
+- **Templates** built on one host boot on every host.
+- **Draining** a host moves its VMs, with their memory, to other hosts.
+
+Only chunks that changed are uploaded, and every chunk is verified against its hash when it's fetched.
+
+## High availability
+
+Each VM has an availability class:
+
+| `availability` | Its host crashes | Its host is drained |
+|----------------|------------------|---------------------|
+| `ephemeral` (default) | The VM is `Lost`; you recreate it | Moved |
+| `restartable` | Recreated on another host from its template | Moved |
+| `durable` | Restored on another host from its last checkpoint (every 5 minutes by default), same ID | Moved |
+
+Files written since the last checkpoint and memory are lost with the host; everything before it isn't. Planned moves (drain, migrate, resume elsewhere) lose nothing.
+
+**Fencing** makes sure a VM never runs twice. A host holds a lease for its `durable` and `restartable` VMs, renewed by every heartbeat (every 2 seconds). If the agent stops renewing (it hung, or lost the control plane), snapd kills those VMs when the lease expires. The control plane recovers them elsewhere only after the lease plus a margin. With `FLINT_WATCHDOG_DEVICE` set, a hung or dead snapd resets the host through the watchdog, so nothing can keep a fenced VM alive. A restarted agent kills leased VMs whose lease lapsed while it was down.
+
+A host that stops heartbeating but keeps writing its **storage heartbeat** (a second channel through the object store) is `isolated`, not `down`: its `ephemeral` VMs keep running there.
+
+The control plane itself is stateless replicas plus Postgres: killing a replica changes nothing for clients behind the load balancer, and another replica takes over the reconcilers within seconds. Use a highly available Postgres (any managed one) for a highly available cluster.
+
+## VM sets
+
+A VM set keeps N copies of a template running, spread across zones, with paused standbys ready to replace a failed member with a snapshot restore instead of a fresh boot:
+
+```bash
+curl -X POST $FLINT_URL/v1/vmsets -H "Authorization: Bearer $FLINT_API_KEY" -d '{
+  "name": "workers", "tenant": "acme",
+  "spec": {"replicas": 6, "template_id": "worker", "spread": "zone", "standby": 1}
+}'
+```
+
+Changing `template_id` rolls the set, `max_unavailable` members at a time.
+
+## Security
+
+- API callers use tokens: `admin` (everything) and `service` (VMs, optionally limited to some tenants). Only their hashes are stored.
+- Hosts join with a single-use token that pins the control plane's CA, and get a short-lived certificate (renewed automatically).
+- Two CAs keep roles apart: host agents only accept the control plane's certificates, so a compromised host can't drive another host's VMs, and a host certificate is not an API credential.
+- VMs can't reach the control plane, agents or snapd: every host's firewall drops sandbox traffic to the host.
+- snapd reads a VM's files beneath its jail without following symlinks, so a compromised guest can't get host files exported into a snapshot.
+
+## Not in a cluster yet
+
+- Volumes (`/volumes`, `/vms/{id}/mounts`) are host-local and answer `501` through the control plane.
+- Per-daemon `/config` is per host.
+- Restore is eager: a host fetches a snapshot before starting it (lazy restore is planned).

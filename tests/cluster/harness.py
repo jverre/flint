@@ -28,6 +28,24 @@ import httpx
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ADMIN_TOKEN = "flint_testadmin_" + "c3VwZXJzZWNyZXQ"
+PIDS_DIR = ""  # set by Cluster: processes are recorded so a later run can clean up after a crashed one
+
+
+def kill_recorded(pids_dir: str) -> None:
+    """Kill processes a previous run started (it may have died before teardown)."""
+    if not os.path.isdir(pids_dir):
+        return
+    for name in os.listdir(pids_dir):
+        try:
+            with open(os.path.join(pids_dir, name)) as f:
+                pid = int(f.read().strip())
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+            if b"flint" in cmd:
+                os.kill(pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        os.unlink(os.path.join(pids_dir, name))
 
 
 def wait_for(cond, timeout: float, what: str, interval: float = 0.25):
@@ -119,6 +137,9 @@ class Proc:
     def start(self) -> None:
         fd = open(self.log, "ab")
         self.p = subprocess.Popen(self.cmd, env=self.env, stdout=fd, stderr=subprocess.STDOUT, start_new_session=True)
+        if PIDS_DIR:
+            with open(os.path.join(PIDS_DIR, f"{self.name}.pid"), "w") as f:
+                f.write(str(self.p.pid))
 
     def alive(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -181,6 +202,9 @@ class Host:
     def start(self, token: str | None = None) -> None:
         for d in ("data", "state", "jailer", "cache"):
             os.makedirs(os.path.join(self.root, d), exist_ok=True)
+        # Two pre-copied disks per host, not eight: a test host makes few VMs at once.
+        with open(os.path.join(self.root, "state", "config.json"), "w") as f:
+            json.dump({"pool_target_size": 2}, f)
         cmd = [sys.executable, "-c", "from flint.cli import cli; cli()", "agent",
                # All interfaces, as in production: the isolation test checks VMs still can't reach it.
                "--advertise", "127.0.0.1", "--listen", "0.0.0.0", "--port", str(self.agent_port),
@@ -345,6 +369,10 @@ class Cluster:
         ], env, os.path.join(self.logs, f"server-{i}.log"))
 
     def start(self, hosts: list[tuple[str, str]]) -> None:
+        global PIDS_DIR
+        PIDS_DIR = os.path.join(self.base, "pids")
+        kill_recorded(PIDS_DIR)
+        os.makedirs(PIDS_DIR, exist_ok=True)
         # Hosts' identities belong to the previous run's control plane.
         shutil.rmtree(os.path.join(self.base, "hosts"), ignore_errors=True)
         shutil.rmtree(self.logs, ignore_errors=True)
@@ -363,8 +391,8 @@ class Cluster:
                 raise RuntimeError(f"replica {i} exited:\n{tail(p.log)}")
         for idx, (name, zone) in enumerate(hosts, start=1):
             h = Host(self, name, idx, zone)
+            self.hosts[name] = h  # before start, so teardown covers a host that failed to start
             h.start(self.join_token(zone))
-            self.hosts[name] = h
 
     def join_token(self, zone: str = "") -> str:
         r = self.api.post("/v1/join-tokens", json={"zone": zone})
@@ -462,3 +490,23 @@ def have_prereqs() -> str | None:
     if not (os.environ.get("FLINT_TEST_DATABASE_URL") and os.environ.get("FLINT_TEST_STORE_URL")) and not shutil.which("docker"):
         return "docker not available (or set FLINT_TEST_DATABASE_URL and FLINT_TEST_STORE_URL)"
     return None
+
+
+if __name__ == "__main__":
+    # Bring up a cluster to use by hand (or to run tests/ against), until Ctrl-C:
+    #   sudo -E .venv/bin/python -m tests.cluster.harness
+    reason = have_prereqs()
+    if reason:
+        sys.exit(f"can't run a cluster here: {reason}")
+    c = Cluster()
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    try:
+        c.start([("a", "zone-1"), ("b", "zone-2")])
+        print(f"export FLINT_URL={c.url} FLINT_API_KEY={ADMIN_TOKEN} FLINT_TENANT=dev", flush=True)
+        print(f"logs: {c.logs}", flush=True)
+        stop.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        c.stop()

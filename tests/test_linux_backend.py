@@ -8,7 +8,12 @@ from flint.core._ch_jail import ChJail
 from flint.core._jailer import JailSpec
 
 
-pytestmark = pytest.mark.skipif(platform.system() != "Linux", reason="Linux backend only")
+
+# Host-local: inspects one daemon's jails (skipped against a cluster control plane).
+pytestmark = [
+    pytest.mark.skipif(platform.system() != "Linux", reason="Linux backend only"),
+    pytest.mark.usefixtures("daemon_only"),
+]
 
 
 def _jail(sandbox, backend_kind) -> tuple[str, str]:

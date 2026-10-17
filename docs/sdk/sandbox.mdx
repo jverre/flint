@@ -337,3 +337,14 @@ assert result.exit_code == 0
 
 sandbox.kill()
 ```
+
+## In a cluster
+
+Point the SDK at a cluster's control plane with `flint.configure(url=..., api_key=..., tenant=...)` or `FLINT_URL`, `FLINT_API_KEY` and `FLINT_TENANT`. Two extras then work:
+
+```python
+sandbox = Sandbox(availability="durable")  # ephemeral (default) | restartable | durable
+copies = sandbox.fork(3)                   # memory, processes and files, on any host with room
+```
+
+`fork()` keeps the original running. See [Cluster overview](/cluster/overview) for what each availability class survives.

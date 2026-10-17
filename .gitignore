@@ -24,3 +24,6 @@ wheels/
 .codex/
 services/r2nfs/r2nfs
 cluster/flint-cluster
+.terraform/
+.terraform.lock.hcl
+*.tfstate*

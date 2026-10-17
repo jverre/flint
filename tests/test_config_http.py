@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from .conftest import AUTH, BASE_URL, TEST_PORT, WS_BASE, api
+
+# Host-local: inspects one daemon (skipped against a cluster control plane).
+pytestmark = pytest.mark.usefixtures("daemon_only")
 
 
 BASE = BASE_URL

@@ -206,6 +206,11 @@ CREATE TABLE IF NOT EXISTS vmsets (
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tenant_quotas (
+    tenant     TEXT PRIMARY KEY,
+    max_vms    INTEGER NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS leases (
     name       TEXT PRIMARY KEY,
     holder     TEXT NOT NULL,

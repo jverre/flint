@@ -651,6 +651,8 @@ def delete_template_endpoint(template_id: str):
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
     daemon = _get_daemon()
+    if daemon.cluster:
+        daemon.cluster.forget_template(template_id)
     daemon.backend.delete_template_artifact(template_id, tmpl)
     artifacts = tmpl.get("artifacts") or {}
     for artifact in artifacts.values():

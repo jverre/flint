@@ -107,6 +107,12 @@ func Run(ctx context.Context, cfg Config) error {
 	d.store = snapstore.NewStore(remote, cache, peerClient)
 
 	errc := make(chan error, 3)
+	// Bind the peer port first: if another snapd holds it, fail before
+	// touching its unix socket.
+	pln, err := net.Listen("tcp", cfg.PeerListen)
+	if err != nil {
+		return err
+	}
 	// Local API on a root-only unix socket.
 	os.Remove(cfg.Socket)
 	if err := os.MkdirAll(filepath.Dir(cfg.Socket), 0o700); err != nil {
@@ -126,10 +132,6 @@ func Run(ctx context.Context, cfg Config) error {
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return d.currentCert(), nil },
 		ClientCAs:      pool,
 		ClientAuth:     tls.RequireAndVerifyClientCert,
-	}
-	pln, err := net.Listen("tcp", cfg.PeerListen)
-	if err != nil {
-		return err
 	}
 	peer := &http.Server{Handler: snapstore.PeerHandler(cache), ReadHeaderTimeout: 10 * time.Second}
 	go func() { errc <- peer.Serve(tls.NewListener(pln, peerTLS)) }()

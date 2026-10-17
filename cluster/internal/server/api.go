@@ -66,6 +66,8 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /v1/tokens", admin(s.handleListTokens))
 	mux.HandleFunc("DELETE /v1/tokens/{id}", admin(s.handleDeleteToken))
 	mux.HandleFunc("GET /v1/snapshots", admin(s.handleListSnapshots))
+	mux.HandleFunc("PUT /v1/tenants/{tenant}/quota", admin(s.handlePutQuota))
+	mux.HandleFunc("GET /v1/tenants/{tenant}/quota", auth(s.handleGetQuota))
 
 	mux.HandleFunc("POST /v1/vmsets", auth(s.handleCreateVMSet))
 	mux.HandleFunc("GET /v1/vmsets", auth(s.handleListVMSets))
@@ -164,6 +166,11 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.AllowInternet != nil {
 		internet = *body.AllowInternet
+	}
+	if err := s.checkQuota(r.Context(), tenant, 1); err != nil {
+		code, detail := statusFor(err)
+		writeErr(w, code, detail)
+		return
 	}
 	v := &VM{ID: uuid.NewString(), Tenant: tenant, State: VMPending, TemplateID: tmpl, Availability: avail,
 		Spec: VMSpec{AllowInternet: internet, NetworkPolicy: body.NetworkPolicy}, Labels: body.Labels}

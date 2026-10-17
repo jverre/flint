@@ -16,6 +16,46 @@ Decisions taken (October 2026):
   control-plane replica may be a point of failure for the API, for
   templates, or for a VM's ability to be forked, resumed or recovered.
 
+## Status (October 2026)
+
+M0–M5 are built; M6 is not. Code:
+
+| Piece | Where |
+|-------|-------|
+| `flint-cluster server` (control plane) | `cluster/internal/server`, `cluster/internal/db`, `cluster/internal/pki` |
+| `flint-cluster snapd` (snapshot store, peers, fence, storage heartbeat, cert renewal) | `cluster/internal/snapd`, `cluster/internal/snapstore` |
+| `flint-cluster join` | `cluster/internal/join` |
+| Host agent mode (`flint agent`) | `src/flint/cluster/`, cluster hooks in `src/flint/core/backends/` |
+| Node package, Terraform | `deploy/`, `terraform/modules/{flint-pki,flint-cloudinit}`, `terraform/examples/{byo,aws}` |
+| Tests | `tests/cluster/` (e2e on real hosts), `cluster/**/_test.go` (chunk store, scheduler) |
+
+Shipped as one Go binary, `flint-cluster`, with `server`, `snapd` and `join`
+subcommands. Differences from the plan below:
+
+- **Drain and migrate use snapshot migration on both backends** (pause,
+  restore elsewhere, about a second of downtime). Cloud Hypervisor live
+  migration isn't wired up.
+- **Terraform bootstrap**: `flint-pki` generates both CAs and a reusable
+  join secret up front, so hosts in an autoscaling group join on boot. Join
+  tokens can carry the CA certificate instead of its fingerprint.
+- **Fencing has three layers**: snapd's fence (persisted, so a restarted
+  snapd still enforces it); the agent kills leased VMs whose lease lapsed
+  while it was down (covers agent and snapd dying together); the watchdog
+  (`FLINT_WATCHDOG_DEVICE`) covers a hung snapd. The watchdog path isn't
+  exercised in tests: it would reset the test machine.
+- **Tenant quotas**: VM count only (`PUT /v1/tenants/{t}/quota`), checked on
+  create, fork and VM-set members.
+
+Not done yet:
+
+- M6: lazy restore (`userfaultfd`, chunk-backed disk), block-level dirty
+  tracking, cloud-identity join, WireGuard overlay.
+- Volumes and per-daemon `/config` through the control plane (they answer
+  `501`); external fencing through cloud APIs; agent/server version-skew
+  enforcement (agents report their version; nothing checks it).
+- The AWS example validates against the provider schema but hasn't been
+  applied.
+
 ## What HA means for a VM
 
 A VM is a running process on one host; its memory can't survive that host

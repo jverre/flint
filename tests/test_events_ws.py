@@ -24,7 +24,7 @@ def _collect(events: list, ws) -> None:
         pass
 
 
-def test_volume_events_broadcast(_ensure_daemon):
+def test_volume_events_broadcast(_ensure_daemon, daemon_only):
     ws = ws_sync.connect(f"{WS_BASE}/events", open_timeout=5, additional_headers=AUTH or None)
     events: list = []
     t = threading.Thread(target=_collect, args=(events, ws), daemon=True)

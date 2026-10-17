@@ -43,13 +43,13 @@ provider and built-in tenant-aware observability in open source.
 
 | # | Component | Status |
 |---|-----------|--------|
-| 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (current daemon) |
+| 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (the daemon; `flint agent` runs it as a cluster host) |
 | 2 | **Guest agent** (`flintd`): exec, PTY, files, processes | Exists |
 | 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Partial, see [01](01-tenant-isolation.md) |
-| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Partial (FastAPI, single host, no auth) |
-| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial (in-memory bus) |
-| 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist |
-| 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Not started (drain/migration pulled into phase 3, see [03](03-cluster.md)) |
+| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, tokens and `tenant` exist ([03](03-cluster.md)); no checked-in OpenAPI spec; the single daemon still has no auth |
+| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: the cluster persists tenant-tagged events (`/v1/events`); no export |
+| 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist; Terraform deploys clusters (no workload provider yet) |
+| 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Cordon, drain, migration (snapshot-based) and VM-set rolling updates exist ([03](03-cluster.md)); no health gates, backups or live migration |
 
 ## Phases
 

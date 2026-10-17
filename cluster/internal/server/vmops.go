@@ -221,7 +221,8 @@ func (s *Server) resumeVM(ctx context.Context, v *VM) (*VM, error) {
 	if h, ok := s.hostIfUsable(ctx, v.HostID); ok && !h.Cordoned && h.State == HostReady {
 		info, err := s.resumeOnHost(ctx, h, v.ID)
 		if err == nil {
-			s.updateVM(ctx, v.ID, vmUpdate{State: str(VMRunning), Info: info})
+			// Its pause snapshot is no longer needed (GC reclaims it).
+			s.updateVM(ctx, v.ID, vmUpdate{State: str(VMRunning), Info: info, PauseID: str("")})
 			return s.getVM(ctx, v.ID)
 		}
 		log.Printf("resume %s on its host %s failed (%v); restoring elsewhere", short(v.ID), h.Name, err)
@@ -239,6 +240,7 @@ func (s *Server) resumeVM(ctx context.Context, v *VM) (*VM, error) {
 	if oh, ok := s.hostIfUsable(ctx, old); ok {
 		s.deleteOnHost(ctx, oh, v.ID) // drop its stale paused copy
 	}
+	s.updateVM(ctx, v.ID, vmUpdate{PauseID: str("")})
 	s.emit(ctx, "vm.moved", v.Tenant, v.ID, h.ID, map[string]any{"vm_id": v.ID, "from_host": old, "to_host": h.ID, "reason": "resume"})
 	return s.getVM(ctx, v.ID)
 }
@@ -253,6 +255,9 @@ func (s *Server) forkVM(ctx context.Context, v *VM, count int) ([]*VM, error) {
 	h, ok := s.hostIfUsable(ctx, v.HostID)
 	if !ok {
 		return nil, &apiError{http.StatusServiceUnavailable, "the VM's host is unreachable"}
+	}
+	if err := s.checkQuota(ctx, v.Tenant, count); err != nil {
+		return nil, err
 	}
 	snapID := "fork-" + uuid.NewString()
 	t0 := time.Now()
@@ -429,6 +434,10 @@ func statusFor(err error) (int, string) {
 	var ae *apiError
 	if errors.As(err, &ae) {
 		return ae.Status, ae.Detail
+	}
+	var qe *quotaError
+	if errors.As(err, &qe) {
+		return http.StatusTooManyRequests, qe.Error()
 	}
 	if errors.Is(err, errNoCapacity) {
 		return http.StatusServiceUnavailable, err.Error()

@@ -1,0 +1,45 @@
+---
+title: "Operating a cluster"
+description: "Hosts, tokens, draining, failures."
+---
+
+The `flint cluster` commands talk to the control plane (`FLINT_URL`, `FLINT_API_KEY` with an admin token).
+
+```bash
+flint cluster hosts                     # ID, zone, state, VMs/capacity
+flint cluster cordon h-3dd4f8ff-f2f4    # no new VMs here
+flint cluster drain h-3dd4f8ff-f2f4     # move its VMs away (with their memory), then "drained"
+flint cluster uncordon h-3dd4f8ff-f2f4  # back in service
+flint cluster join-token --zone zone-2  # single-use host join token
+flint cluster token --tenant acme       # a service token limited to tenant acme
+flint cluster vmsets
+```
+
+Cap a host below what it reports with `PATCH /v1/hosts/{id}` and `{"max_vms": 10}`.
+
+## Host states
+
+| State | Meaning |
+|-------|---------|
+| `joining` | Joined; its first heartbeat isn't in yet (it's building its golden snapshot) |
+| `ready` | Takes VMs |
+| `unreachable` | Missed heartbeats for one lease; no new VMs |
+| `isolated` | No heartbeats for lease + margin, but still writing storage heartbeats. Its `durable`/`restartable` VMs were fenced and recovered elsewhere; its `ephemeral` VMs keep running |
+| `down` | Silent everywhere. Its VMs are recovered (or `Lost`) |
+| `draining`, `drained` | Being emptied by `drain` |
+
+A host that comes back deletes the VMs the cluster moved away while it was gone.
+
+## Events
+
+`GET /events` (WebSocket) streams the cluster's events, the same ones as a daemon's plus cluster ones: `host.joined`, `host.unreachable`, `host.isolated`, `host.down`, `host.ready`, `vm.lost`, `vm.recovered`, `vm.crashed`, `vm.moved`, `vm.checkpointed`, `vmset.*`. `GET /v1/events?since=<seq>&vm_id=&type=` returns them as history.
+
+## Timing
+
+| Setting | Default | |
+|---------|---------|---|
+| `FLINT_LEASE_TTL` | 15s | A silent host's leased VMs are fenced after this |
+| `FLINT_FENCE_MARGIN` | 5s | Extra wait before recovering them elsewhere |
+| `FLINT_CHECKPOINT_INTERVAL` | 5m | How much a `durable` VM can lose |
+
+So a host crash is detected and its VMs restored within about 20 seconds by default.
