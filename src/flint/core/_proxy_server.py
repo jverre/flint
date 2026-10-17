@@ -66,8 +66,20 @@ class CredentialInjector:
         """Intercept requests and inject headers for matching domains."""
         self._reload()
 
-        host = flow.request.pretty_host  # works correctly in transparent mode
-        headers_to_inject = _match_domain(host, self._rules)
+        # In transparent mode the upstream is the guest's original destination
+        # IP, and the Host header is guest-controlled, so neither proves where
+        # the request is going. Only the TLS SNI is bound to the destination:
+        # mitmproxy verifies the upstream certificate against it. So only inject
+        # over TLS, keyed on SNI, and only when the Host header agrees with it
+        # (otherwise a request with SNI=attacker.com, Host=api.openai.com would
+        # carry the secret to a server holding a valid attacker.com cert).
+        sni = flow.client_conn.sni
+        if not flow.client_conn.tls_established or not sni:
+            return
+        sni = sni.lower().rstrip(".")
+        if flow.request.pretty_host.lower().rstrip(".") != sni:
+            return
+        headers_to_inject = _match_domain(sni, self._rules)
         if not headers_to_inject:
             return
 
