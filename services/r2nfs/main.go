@@ -10,6 +10,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"syscall"
 	"unicode"
 
+	"github.com/jverre/flint/services/r2nfs/blockstore"
 	nfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 )
@@ -34,6 +36,7 @@ func main() {
 	cacheDir := flag.String("cache-dir", envOr("R2_CACHE_DIR", "/tmp/r2nfs-cache"), "Local cache directory")
 	cacheSizeMB := flag.Int("cache-size-mb", 1024, "Maximum cache size in MB")
 	volumesDir := flag.String("volumes-dir", "", "Host directory holding volumes (enables volume mounts)")
+	imagesDir := flag.String("images-dir", "", "Host directory holding block images (enables image-backed volumes)")
 	flag.Parse()
 
 	r2Enabled := *accountID != "" && *accessKey != "" && *secretKey != ""
@@ -42,9 +45,11 @@ func main() {
 	}
 
 	exports := newExportManager(nil, nil)
+	var r2 *R2Client
 	if r2Enabled {
 		endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", *accountID)
-		r2, err := newR2Client(endpoint, *accessKey, *secretKey, *bucket)
+		var err error
+		r2, err = newR2Client(endpoint, *accessKey, *secretKey, *bucket)
 		if err != nil {
 			log.Fatalf("Failed to create R2 client: %v", err)
 		}
@@ -57,8 +62,21 @@ func main() {
 	}
 	volumes := newVolumeManager(*volumesDir)
 
+	var images *ImageManager
+	if *imagesDir != "" && *volumesDir != "" {
+		var remote blockstore.Remote
+		if r2 != nil {
+			remote = r2 // images are stored in R2 too, and load lazily on any host
+		}
+		var err error
+		if images, err = newImageManager(*imagesDir, *volumesDir, remote); err != nil {
+			log.Printf("Image-backed volumes disabled: %v", err)
+			images = nil
+		}
+	}
+
 	// Start management API.
-	go serveMgmtAPI(*mgmtAddr, exports, volumes)
+	go serveMgmtAPI(*mgmtAddr, exports, volumes, images)
 
 	// Start NFS server.
 	listener, err := net.Listen("tcp", *listenAddr)
@@ -70,7 +88,9 @@ func main() {
 	handler := newNFSHandler(exports, volumes)
 	cachedHandler := nfshelper.NewCachingHandler(handler, handleCacheSize)
 	go func() {
-		if err := nfs.Serve(listener, cachedHandler); err != nil {
+		// Closing the listener at shutdown ends Serve; that mustn't exit
+		// before the shutdown path has flushed the images.
+		if err := nfs.Serve(listener, cachedHandler); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Fatalf("NFS server error: %v", err)
 		}
 	}()
@@ -81,6 +101,9 @@ func main() {
 	<-sig
 	log.Println("Shutting down r2nfs")
 	listener.Close()
+	if images != nil {
+		images.Flush() // the devices go with this process; get their data into the images first
+	}
 }
 
 // handleCacheSize bounds the NFS file handles the server remembers. A guest
@@ -109,18 +132,85 @@ func isValidID(s string) bool {
 	return true
 }
 
+func writeJSONError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+func writeOK(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// registerImageRoutes adds the image API; without images every call is 503.
+func registerImageRoutes(mux *http.ServeMux, images *ImageManager) {
+	withImage := func(h func(w http.ResponseWriter, r *http.Request, id string)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if images == nil {
+				writeJSONError(w, http.StatusServiceUnavailable, fmt.Errorf("image-backed volumes are not enabled"))
+				return
+			}
+			id := r.PathValue("id")
+			if !isValidID(id) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid image id"))
+				return
+			}
+			h(w, r, id)
+		}
+	}
+	mux.HandleFunc("PUT /images/{id}", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
+		var req struct {
+			Size     int64  `json:"size"`
+			From     string `json:"from"`
+			ReadOnly bool   `json:"readonly"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid json"))
+			return
+		}
+		if req.From != "" && !isValidID(req.From) {
+			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid source image"))
+			return
+		}
+		if err := images.Create(id, req.Size, req.From, req.ReadOnly); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeOK(w)
+	}))
+	mux.HandleFunc("DELETE /images/{id}", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
+		if err := images.Delete(id); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeOK(w)
+	}))
+	mux.HandleFunc("POST /images/{id}/mount", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
+		if err := images.Mount(id); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeOK(w)
+	}))
+	mux.HandleFunc("DELETE /images/{id}/mount", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
+		images.Unmount(id)
+		writeOK(w)
+	}))
+}
+
 // newMgmtHandler builds the HTTP handler for the management API.
 // Extracted so tests can call it without starting a real listener.
-func newMgmtHandler(exports *ExportManager, volumes *VolumeManager) http.Handler {
+func newMgmtHandler(exports *ExportManager, volumes *VolumeManager, images *ImageManager) http.Handler {
 	mux := http.NewServeMux()
-	registerMgmtRoutes(mux, exports, volumes)
+	registerMgmtRoutes(mux, exports, volumes, images)
 	return mux
 }
 
 // serveMgmtAPI runs a small HTTP server for managing NFS exports.
-func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager) {
+func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager, images *ImageManager) {
 	mux := http.NewServeMux()
-	registerMgmtRoutes(mux, exports, volumes)
+	registerMgmtRoutes(mux, exports, volumes, images)
 	log.Printf("Management API on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Management API error: %v", err)
@@ -128,7 +218,9 @@ func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager) {
 }
 
 // registerMgmtRoutes adds the management API routes to a ServeMux.
-func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *VolumeManager) {
+func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *VolumeManager, images *ImageManager) {
+	registerImageRoutes(mux, images)
+
 	mux.HandleFunc("POST /exports", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ClientIP   string `json:"client_ip"`
@@ -206,7 +298,7 @@ func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *Vol
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok", "exports": exports.Count(), "mounts": volumes.Count(),
-			"r2": exports.r2 != nil, "volumes_dir": volumes.root,
+			"r2": exports.r2 != nil, "volumes_dir": volumes.root, "images": images != nil,
 		})
 	})
 }

@@ -236,8 +236,21 @@ class DaemonClient:
         _raise_for_status(resp)
         return resp.json()["volumes"]
 
-    def create_volume(self, name: str) -> dict:
-        resp = self._http.post("/volumes", json={"name": name})
+    def create_volume(self, name: str, size_gib: int | None = None) -> dict:
+        body: dict = {"name": name}
+        if size_gib is not None:
+            body["size_gib"] = size_gib
+        resp = self._http.post("/volumes", json=body)
+        _raise_for_status(resp)
+        return resp.json()["volume"]
+
+    def snapshot_volume(self, volume: str, name: str) -> dict:
+        resp = self._http.post(f"/volumes/{volume}/snapshot", json={"name": name})
+        _raise_for_status(resp)
+        return resp.json()["volume"]
+
+    def fork_volume(self, volume: str, name: str) -> dict:
+        resp = self._http.post(f"/volumes/{volume}/fork", json={"name": name})
         _raise_for_status(resp)
         return resp.json()["volume"]
 

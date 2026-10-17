@@ -601,9 +601,27 @@ def list_volumes():
 
 @app.post("/volumes")
 def create_volume(body: dict):
-    vol = _volume_call(_require_volumes().create, body.get("name"))
+    vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"))
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes — created {vol.id} ({vol.name})")
+    return {"volume": vol.to_dict()}
+
+
+@app.post("/volumes/{volume}/snapshot")
+def snapshot_volume(volume: str, body: dict):
+    """A read-only copy of the volume as it is now."""
+    vol = _volume_call(_require_volumes().snapshot, volume, body.get("name"))
+    _events.publish("volume.created", volume=vol.to_dict())
+    print(f"POST /volumes/{volume}/snapshot — {vol.id} ({vol.name})")
+    return {"volume": vol.to_dict()}
+
+
+@app.post("/volumes/{volume}/fork")
+def fork_volume(volume: str, body: dict):
+    """A writable copy of the volume as it is now."""
+    vol = _volume_call(_require_volumes().fork, volume, body.get("name"))
+    _events.publish("volume.created", volume=vol.to_dict())
+    print(f"POST /volumes/{volume}/fork — {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 

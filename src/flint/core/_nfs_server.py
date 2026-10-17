@@ -25,6 +25,7 @@ BINARY = os.environ.get(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "services", "r2nfs", "r2nfs"),
 )
 VOLUMES_DIR = os.path.join(config.DAEMON_DIR, "volumes")
+IMAGES_DIR = os.path.join(config.DAEMON_DIR, "images")
 _PID_PATH = os.path.join(config.DAEMON_DIR, "r2nfs.pid")
 _LOG_PATH = os.path.join(config.DAEMON_DIR, "r2nfs.log")
 
@@ -63,7 +64,8 @@ def ensure_running() -> None:
     """Adopt the running server if it serves what this daemon needs, else (re)start it."""
     want_r2 = config.STORAGE_BACKEND == "r2"
     current = health()
-    if current and current.get("volumes_dir") == VOLUMES_DIR and current.get("r2") == want_r2:
+    # "images" is missing from servers built before image-backed volumes.
+    if current and current.get("volumes_dir") == VOLUMES_DIR and current.get("r2") == want_r2 and "images" in current:
         return
     if current:
         log.info("Replacing NFS server (volumes_dir=%s r2=%s; want %s r2=%s)",
@@ -87,6 +89,7 @@ def ensure_running() -> None:
         f"--listen={config.BRIDGE_IP}:{config.R2NFS_PORT}",
         f"--mgmt=127.0.0.1:{config.R2NFS_MGMT_PORT}",
         f"--volumes-dir={VOLUMES_DIR}",
+        f"--images-dir={IMAGES_DIR}",
     ]
     env = os.environ.copy()
     if want_r2:
@@ -143,6 +146,26 @@ def register_mount(mount_id: str, client_ip: str, volume_id: str, subpath: str, 
 
 def deregister_mount(mount_id: str) -> None:
     _mgmt("DELETE", f"/mounts/{urllib.parse.quote(mount_id)}")
+
+
+# ── Block images (image-backed volumes) ─────────────────────────────────
+
+def images_available() -> bool:
+    return bool((health() or {}).get("images"))
+
+
+def create_image(image_id: str, size: int = 0, source: str = "", readonly: bool = False) -> None:
+    """Create an empty image of ``size`` bytes, or a copy of image ``source`` (snapshotted first)."""
+    _mgmt("PUT", f"/images/{image_id}", {"size": size, "from": source, "readonly": readonly}, timeout=300)
+
+
+def mount_image(image_id: str) -> None:
+    """Mount the image's filesystem at VOLUMES_DIR/<id>, formatting it on first use. Idempotent."""
+    _mgmt("POST", f"/images/{image_id}/mount", timeout=120)
+
+
+def delete_image(image_id: str) -> None:
+    _mgmt("DELETE", f"/images/{image_id}", timeout=60)
 
 
 # ── R2 workspaces ────────────────────────────────────────────────────────

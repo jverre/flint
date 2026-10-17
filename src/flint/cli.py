@@ -210,15 +210,36 @@ def volumes_list():
     if not vols:
         click.echo("No volumes.")
     for v in vols:
-        click.echo(f"  {v['id']}  {v['name']}")
+        size = f"{v['size_gib']} GiB" if v.get("size_gib") else "-"
+        flags = " read-only" if v.get("readonly") else ""
+        click.echo(f"  {v['id']}  {v['name']:<24} {v.get('kind', 'dir'):<5} {size:>9}{flags}")
 
 
 @volumes.command("create")
 @click.argument("name")
-def volumes_create(name):
+@click.option("--size", "size_gib", type=int, default=None, help="Size in GiB (sparse; default 10)")
+def volumes_create(name, size_gib):
     """Create a volume."""
-    v = _volume_call(_daemon_client().create_volume, name)
+    v = _volume_call(_daemon_client().create_volume, name, size_gib)
     click.echo(f"Created volume {v['name']} ({v['id']})")
+
+
+@volumes.command("snapshot")
+@click.argument("volume")
+@click.argument("name")
+def volumes_snapshot(volume, name):
+    """Make NAME, a read-only copy of VOLUME as it is now."""
+    v = _volume_call(_daemon_client().snapshot_volume, volume, name)
+    click.echo(f"Snapshot {v['name']} ({v['id']})")
+
+
+@volumes.command("fork")
+@click.argument("volume")
+@click.argument("name")
+def volumes_fork(volume, name):
+    """Make NAME, a writable copy of VOLUME as it is now."""
+    v = _volume_call(_daemon_client().fork_volume, volume, name)
+    click.echo(f"Forked {v['name']} ({v['id']})")
 
 
 @volumes.command("delete")

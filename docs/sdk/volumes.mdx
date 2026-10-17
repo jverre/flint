@@ -21,6 +21,19 @@ for task in tasks:
     # /results/<child id>/report.md
 ```
 
+## Snapshots and forks
+
+Volumes are block images where the host supports it, so copying one is cheap: copies share every block until one side changes it.
+
+```python
+v1 = results.snapshot("results-v1")    # read-only, frozen as of now
+retry = results.fork("results-retry")  # writable, independent from now on
+
+reader.mount(v1, "/v1", readonly=True)  # any number of sandboxes
+```
+
+You can snapshot or fork a volume while sandboxes are writing to it: the volume's filesystem is frozen for the instant the copy is taken. Image volumes have a size (`Volume.create(name, size_gib=50)`, default 10), which sandboxes see in `df`; it is sparse, so a volume only uses the space written to it.
+
 ## One writer per subtree
 
 A read-write mount owns its subtree. Mounting the same volume read-write over an overlapping subpath (the same directory, or one inside the other) fails with `409` and names the sandbox that holds it. Read-only mounts are unlimited and always allowed. Give each writer its own `subpath` and mount the volume read-only wherever you want to read everything.
@@ -31,7 +44,9 @@ The lock is released when the writer unmounts, or when its sandbox is killed.
 
 | Method | Description |
 |--------|-------------|
-| `Volume.create(name)` | Create an empty volume |
+| `Volume.create(name, size_gib=None)` | Create an empty volume (default 10 GiB, sparse) |
+| `volume.snapshot(name)` | Read-only copy of the volume as it is now |
+| `volume.fork(name)` | Writable copy of the volume as it is now |
 | `Volume.get(name)` | Find a volume by name or ID, or `None` |
 | `Volume.list()` | All volumes |
 | `volume.delete()` | Delete the volume and its files (fails while mounted) |
@@ -43,6 +58,8 @@ The lock is released when the writer unmounts, or when its sandbox is killed.
 
 - **Visibility:** read-only mounts revalidate every second, so readers see new files and changes within about a second of a writer closing them.
 - **Pause and resume:** mounts survive pause/resume and daemon restarts.
+- **Durability:** writes reach the volume's storage within about a second. A sandbox's `fsync` doesn't wait for that yet.
+- **Storage:** an image volume's blocks are content-addressed chunks on the host, and in R2 too when the R2 storage backend is configured, so a host can open a volume it has never seen and fetch only the blocks that are read. Hosts without NBD get plain-directory volumes, which can't be sized or copied.
 - **Isolation:** each mount is authorized for one sandbox only. Another sandbox can't use it, and unmounting revokes access on the host even if the guest kept file handles.
 - **Performance:** every file operation goes to the host over NFS. Use volumes to share files between sandboxes. Keep package installs, builds and databases on the sandbox's own disk, which is much faster for metadata-heavy work.
 - **Requirements:** sandboxes created with `allow_internet_access=False` can't mount volumes (they have no network path to the host). The guest kernel needs an NFSv3 client. Flint's guest kernel, which `flint install-deps` installs, has one.
