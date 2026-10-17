@@ -1,37 +1,43 @@
 ---
 title: "Golden snapshots"
-description: "How the Firecracker backend achieves sub-100ms boot times."
+description: "How the Linux backends start sandboxes in under 100ms."
 ---
 
 <Info>
-This page describes the **Firecracker** backend's boot strategy. Cloud-Hypervisor does a fresh boot against a prepared rootfs (no snapshot load); macOS-VZ uses Virtualization.framework's own start flow. Same `Sandbox` API, different mechanism underneath.
+This page describes the **Firecracker** and **Cloud-Hypervisor** backends. macOS-VZ uses Virtualization.framework's own start flow. Same `Sandbox` API, different mechanism underneath.
 </Info>
 
-The core trick behind the Firecracker backend's fast startup is the golden snapshot. Instead of booting a VM from scratch every time — which takes seconds — Flint boots a VM once, snapshots it at the point where it's fully ready, and then loads that snapshot for every new sandbox.
+The core trick behind fast startup is the golden snapshot. Instead of booting a VM from scratch every time, which takes about half a second, Flint boots a VM once, snapshots it at the point where it's fully ready, and then restores that snapshot for every new sandbox.
 
-Loading a snapshot is much faster than booting because the kernel and init process have already done all their work. The VM just resumes from a known-good state.
+Restoring a snapshot is much faster than booting because the kernel and init process have already done all their work. The VM just resumes from a known-good state.
 
 ## How it works
 
-When you run `setup-rootfs.sh` or start the daemon for the first time, Flint:
+When the daemon starts for the first time, Flint:
 
-1. Boots a Firecracker VM with the Alpine rootfs and kernel
+1. Boots a VM with the Alpine rootfs and kernel
 2. Waits for `flintd` (the guest agent) to become healthy
-3. Pauses the VM and saves the full memory state to disk - this is the golden snapshot
-4. All future sandboxes load from this snapshot instead of booting fresh
+3. Pauses the VM and saves its memory and device state to disk - this is the golden snapshot
+4. All future sandboxes restore from this snapshot instead of booting fresh
 
-The snapshot lives at `$FLINT_DATA_DIR/.golden/`. It includes:
+| Backend | Golden snapshot | Files |
+|---|---|---|
+| Firecracker | `$FLINT_DATA_DIR/.golden/` | `vmstate`, `mem`, `rootfs.ext4` |
+| Cloud-Hypervisor | `$FLINT_DATA_DIR/.golden-ch/snapshot/` | `config.json`, `state.json`, `memory-ranges`, `rootfs.ext4` |
 
-- `vmstate` - Firecracker VM state (registers, device state)
-- `mem` - full VM memory image
+The snapshot keeps the exact disk the golden VM ran on, because the guest's page cache in the memory image has to match it.
 
-## The rootfs pool
+Guest memory and disk images are mostly zeros, so every artifact is stored and copied sparse: a 128 MiB memory image takes about 30 MB on disk.
 
-Even with snapshot loading, there's still a step that takes time: copying the rootfs image for each new sandbox. The rootfs is an ext4 disk image, and copying a few hundred MB takes time.
+On Firecracker, the snapshot is restored lazily: guest memory is a private mapping of `mem`, so pages are read in only when the guest touches them. `mem` and `vmstate` are hard-linked into every sandbox's jail as root-owned read-only files, so all sandboxes share one copy in the page cache and no VM can modify another's starting state. Cloud-Hypervisor copies `memory-ranges` into the new VM during restore.
 
-To fix this, Flint maintains a pool of pre-copied rootfs images at `$FLINT_DATA_DIR/.pool/`. The pool refills in the background whenever you're not using it. When you create a sandbox, it just claims a pre-copied rootfs from the pool rather than copying it on demand.
+If a Cloud-Hypervisor template has no snapshot, sandboxes fall back to a fresh boot.
 
-By default the pool keeps 8 images ready (`POOL_TARGET_SIZE = 8`) with 4 background workers copying them in parallel.
+## The disk pool
+
+Each sandbox still needs its own writable copy of the rootfs. Flint keeps a pool of copies ready so `create()` doesn't wait for one. Workers refill the pool in the background and fsync each copy, so that cost stays off the request path. Creating a sandbox claims a copy with a hard link.
+
+The pool lives on the same filesystem as the sandboxes: `$FLINT_JAILER_BASE_DIR/.pool/` for Firecracker and `$FLINT_DATA_DIR/.pool/` for Cloud-Hypervisor. By default it keeps 8 copies of the default template and 2 of each custom template, with 4 workers. `pool_target_size` can be changed at runtime.
 
 ## Templates
 
@@ -49,12 +55,6 @@ Templates are stored in `$FLINT_DATA_DIR/.templates/{template_id}/`.
 
 ## Pause and resume
 
-Sandbox pause/resume uses the same mechanism. When you call `sandbox.pause()`, Flint:
+When you call `sandbox.pause()`, Flint pauses the VM, saves its state and memory into the sandbox's own directory, and stops the hypervisor process. `sandbox.resume()` restores that sandbox-specific snapshot into a new process, so the sandbox comes back with the same processes, files and memory.
 
-1. Sends a pause command to the Firecracker API
-2. Saves the VM state and memory to disk in the sandbox's own directory
-3. Kills the Firecracker process
-
-When you call `sandbox.resume()`, it loads that sandbox-specific snapshot back into a new Firecracker process - same as creating a new sandbox, but using the sandbox's own saved state instead of the golden template.
-
-This means a resumed sandbox has exactly the same state it had when you paused it - same processes, same files, same memory.
+On Firecracker, pause writes only the memory pages the guest changed since it was last restored. Firecracker tracks dirty pages, and each sandbox gets a pool-prepared copy of the template memory that the first pause writes its changes into. After a resume, that same file backs the VM, and later pauses update it in place. Pause time scales with how much memory the sandbox touched, not with its total memory. If a diff snapshot fails, Flint takes a full one.

@@ -1,29 +1,25 @@
+import json
 import os
-import shutil
 import subprocess
 import time
 import urllib.request
+import uuid
 
 from .config import (
     log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
-    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, DATA_DIR,
+    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, JAILER_UID, JAILER_GID, JAILER_SHARED_DIR,
 )
-from ._netns import _delete_netns, _popen_in_ns, _setup_netns_pyroute2, _enter_netns, _restore_netns
+from ._netns import _delete_netns, _setup_netns_pyroute2, _enter_netns, _restore_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok
+from ._artifacts import dig_holes, shared_readonly, sparse_copy
+from ._jailer import JailSpec, build_jailer_command, cleanup_jailer, make_private
+from ._jailfs import copy_out
+
+_GOLDEN_FILES = ("rootfs.ext4", "vmstate", "mem")
 
 
 def golden_snapshot_exists() -> bool:
-    return all(os.path.exists(f"{GOLDEN_DIR}/{f}") for f in ("rootfs.ext4", "vmstate", "mem"))
-
-
-def _golden_cleanup(process, ns_name, vm_dir):
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-    _delete_netns(ns_name)
-    shutil.rmtree(vm_dir, ignore_errors=True)
+    return all(os.path.exists(f"{GOLDEN_DIR}/{f}") for f in _GOLDEN_FILES)
 
 
 def create_golden_snapshot(
@@ -34,62 +30,103 @@ def create_golden_snapshot(
 ) -> None:
     """Boot a VM, wait for READY, verify agent health, pause, snapshot, store as golden.
 
-    Parameters are configurable to support per-template snapshots.
+    Parameters are configurable to support per-template snapshots. The VM runs
+    through the jailer like any sandbox: template images are tenant-supplied,
+    so this boot gets no more privilege than the sandboxes it seeds. Paths are
+    chroot-relative, so the snapshot references ``rootfs.ext4`` exactly where
+    every sandbox's jail has it.
     """
     log.info("Creating golden snapshot (dir=%s)...", snapshot_dir)
-    vm_id = "golden-snapshot"
-    vm_dir = f"{DATA_DIR}/{vm_id}"
-    socket_path = f"{vm_dir}/firecracker.sock"
-    rootfs_path = f"{vm_dir}/rootfs.ext4"
+    spec = JailSpec(vm_id=f"golden-{uuid.uuid4().hex[:12]}", ns_name=ns_name)
+    socket_path = spec.socket_path_on_host
+    log_path = f"{spec.chroot_base}/firecracker.log"  # outside the chroot
+    process = None
 
-    # 1. Kill stale processes
-    if os.path.exists(socket_path):
-        subprocess.run(["fuser", "-k", socket_path], capture_output=True)
-        time.sleep(0.1)
-
-    # 2. Prepare rootfs
     _delete_netns(ns_name)
-    shutil.rmtree(vm_dir, ignore_errors=True)
-    os.makedirs(vm_dir, exist_ok=True)
-    subprocess.run(["cp", "--reflink=auto", source_rootfs, rootfs_path], check=True)
+    try:
+        os.makedirs(spec.chroot_root)
+        os.chown(spec.chroot_root, JAILER_UID, JAILER_GID)
+        os.link(shared_readonly(KERNEL_PATH, JAILER_SHARED_DIR), f"{spec.chroot_root}/vmlinux")
+        sparse_copy(source_rootfs, f"{spec.chroot_root}/rootfs.ext4")
+        make_private(f"{spec.chroot_root}/rootfs.ext4")
 
-    # 3. Create namespace + TAP
-    _setup_netns_pyroute2(ns_name, tap_name)
+        # The golden VM needs no internet; it only has to bring flintd up.
+        _setup_netns_pyroute2(ns_name, tap_name, internet=False)
 
-    # 4. Start Firecracker in the namespace
-    log_path = f"{vm_dir}/firecracker.log"
-    with open(log_path, "w") as log_fd:
-        process = _popen_in_ns(
-            ns_name,
-            ["firecracker", "--boot-timer", "--api-sock", socket_path, "--id", vm_id],
-            stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
-        )
-    log.info("Golden VM started in ns %s (pid=%d)", ns_name, process.pid)
+        with open(log_path, "w") as log_fd:
+            process = subprocess.Popen(
+                build_jailer_command(spec),
+                stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        log.info("Golden VM started in ns %s (pid=%d)", ns_name, process.pid)
 
-    # 5. Configure VM via API
-    _wait_for_api_socket(socket_path)
-    _fc_put(socket_path, "/boot-source", {"kernel_image_path": KERNEL_PATH, "boot_args": BOOT_ARGS})
+        _wait_for_api_socket(socket_path)
+        _fc_put(socket_path, "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
+        _fc_put(socket_path, "/drives/rootfs", {
+            "drive_id": "rootfs", "path_on_host": "rootfs.ext4",
+            "is_root_device": True, "is_read_only": False,
+        })
+        _fc_put(socket_path, "/network-interfaces/eth0", {
+            "iface_id": "eth0", "guest_mac": GUEST_MAC, "host_dev_name": tap_name,
+        })
+        _fc_put(socket_path, "/actions", {"action_type": "InstanceStart"})
 
-    os.makedirs(snapshot_dir, exist_ok=True)
-    golden_rootfs_path = f"{snapshot_dir}/rootfs.ext4"
-    shutil.copy2(rootfs_path, golden_rootfs_path)
-    _fc_put(socket_path, "/drives/rootfs", {
-        "drive_id": "rootfs", "path_on_host": golden_rootfs_path,
-        "is_root_device": True, "is_read_only": False,
-    })
-    _fc_put(socket_path, "/network-interfaces/eth0", {
-        "iface_id": "eth0", "guest_mac": GUEST_MAC, "host_dev_name": tap_name,
-    })
-    _fc_put(socket_path, "/actions", {"action_type": "InstanceStart"})
+        _wait_for_ready(log_path)
+        _wait_for_agent_and_warm_up(ns_name)
 
-    # 6. Wait for READY
+        resp = _fc_patch(socket_path, "/vm", {"state": "Paused"})
+        if not _fc_status_ok(resp):
+            raise RuntimeError(f"Failed to pause golden VM: {resp}")
+        log.info("Golden VM paused")
+
+        resp = _fc_put(socket_path, "/snapshot/create", {
+            "snapshot_type": "Full", "snapshot_path": "vmstate", "mem_file_path": "mem",
+        })
+        if not _fc_status_ok(resp):
+            raise RuntimeError(f"Golden snapshot creation failed: {resp}")
+
+        # Copy out of the jail (without following links: the template image
+        # ran in this VMM), then swap all files in at once.
+        os.makedirs(snapshot_dir, exist_ok=True)
+        for name in _GOLDEN_FILES:
+            copy_out(f"{spec.chroot_root}/{name}", f"{snapshot_dir}/{name}.tmp")
+        # Guest memory is mostly zeros; holes keep per-VM copies and page cache small.
+        dig_holes(f"{snapshot_dir}/mem.tmp")
+        for name in _GOLDEN_FILES:
+            os.chmod(f"{snapshot_dir}/{name}.tmp", 0o644)
+            os.replace(f"{snapshot_dir}/{name}.tmp", f"{snapshot_dir}/{name}")
+            log.info("Golden %s: %d bytes", name, os.path.getsize(f"{snapshot_dir}/{name}"))
+    except Exception:
+        try:
+            with open(log_path) as f:
+                log.error("Golden snapshot failed — firecracker log:\n%s", f.read()[-2000:])
+        except OSError:
+            pass
+        raise
+    finally:
+        if process is not None:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        _delete_netns(ns_name)
+        cleanup_jailer(spec.chroot_base, spec.vm_id)
+        for name in _GOLDEN_FILES:
+            try:
+                os.unlink(f"{snapshot_dir}/{name}.tmp")
+            except FileNotFoundError:
+                pass
+
+
+def _wait_for_ready(log_path: str, timeout: float = 10.0) -> None:
     t0 = time.monotonic()
-    with open(log_path, "r") as f:
+    with open(log_path) as f:
         while True:
             line = f.readline()
             if not line:
-                if time.monotonic() - t0 > 10:
-                    _golden_cleanup(process, ns_name, vm_dir)
+                if time.monotonic() - t0 > timeout:
                     raise TimeoutError("READY not detected within timeout")
                 time.sleep(0.01)
                 continue
@@ -97,11 +134,12 @@ def create_golden_snapshot(
                 break
     log.info("Golden VM ready (%.0f ms)", (time.monotonic() - t0) * 1000)
 
-    # 7. Verify flintd agent health and warm up
-    t0_agent = time.monotonic()
+
+def _wait_for_agent_and_warm_up(ns_name: str) -> None:
+    """Wait for flintd, then run one exec so the snapshot has a warm exec path."""
+    t0 = time.monotonic()
     agent_url = f"http://{GUEST_IP}:{AGENT_PORT}"
     orig_fd = _enter_netns(ns_name)
-    connected = False
     last_err = None
     try:
         for attempt in range(300):
@@ -109,58 +147,22 @@ def create_golden_snapshot(
                 req = urllib.request.Request(f"{agent_url}/health", method="GET")
                 with urllib.request.urlopen(req, timeout=2.0) as resp:
                     if resp.status == 200:
-                        connected = True
-                        log.info("Agent health OK (%.0f ms, attempt %d)",
-                                 (time.monotonic() - t0_agent) * 1000, attempt + 1)
+                        log.info("Agent health OK (%.0f ms, attempt %d)", (time.monotonic() - t0) * 1000, attempt + 1)
                         break
             except Exception as e:
                 last_err = e
                 time.sleep(0.02)
+        else:
+            raise TimeoutError(f"Golden VM flintd agent not reachable: {last_err}")
 
-        # Warm up with a simple exec (best-effort, don't fail on error)
-        if connected:
-            import json
-            exec_body = json.dumps({"cmd": ["/bin/sh", "-c", "echo WARM"], "timeout": 5}).encode()
-            exec_req = urllib.request.Request(f"{agent_url}/exec", data=exec_body, method="POST")
-            exec_req.add_header("Content-Type", "application/json")
-            try:
-                with urllib.request.urlopen(exec_req, timeout=5.0) as exec_resp:
-                    result = exec_resp.read()
-                    log.info("Agent warm-up exec result: %s", result.decode(errors="replace"))
-            except Exception as e:
-                log.warning("Agent warm-up exec failed (non-fatal): %s", e)
+        # Best-effort: a failed warm-up doesn't make the snapshot unusable.
+        exec_body = json.dumps({"cmd": ["/bin/sh", "-c", "echo WARM"], "timeout": 5}).encode()
+        exec_req = urllib.request.Request(f"{agent_url}/exec", data=exec_body, method="POST")
+        exec_req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(exec_req, timeout=5.0) as exec_resp:
+                log.info("Agent warm-up exec result: %s", exec_resp.read().decode(errors="replace"))
+        except Exception as e:
+            log.warning("Agent warm-up exec failed (non-fatal): %s", e)
     finally:
         _restore_netns(orig_fd)
-    if not connected:
-        log.error("Agent unreachable after %.0f ms, last error: %s",
-                  (time.monotonic() - t0_agent) * 1000, last_err)
-        _golden_cleanup(process, ns_name, vm_dir)
-        raise TimeoutError(f"Golden VM flintd agent not reachable: {last_err}")
-
-    # 8. Pause
-    resp = _fc_patch(socket_path, "/vm", {"state": "Paused"})
-    if not _fc_status_ok(resp):
-        _golden_cleanup(process, ns_name, vm_dir)
-        raise RuntimeError(f"Failed to pause golden VM: {resp}")
-    log.info("Golden VM paused")
-
-    # 9. Create snapshot
-    resp = _fc_put(socket_path, "/snapshot/create", {
-        "snapshot_type": "Full",
-        "snapshot_path": f"{snapshot_dir}/vmstate",
-        "mem_file_path": f"{snapshot_dir}/mem",
-    })
-    if not _fc_status_ok(resp):
-        _golden_cleanup(process, ns_name, vm_dir)
-        raise RuntimeError(f"Golden snapshot creation failed: {resp}")
-
-    # 10. Verify snapshot files
-    for fname in ("rootfs.ext4", "vmstate", "mem"):
-        fpath = f"{snapshot_dir}/{fname}"
-        if not os.path.exists(fpath):
-            _golden_cleanup(process, ns_name, vm_dir)
-            raise RuntimeError(f"Golden snapshot file missing: {fpath}")
-        log.info("Golden %s: %d bytes", fname, os.path.getsize(fpath))
-
-    # 11. Cleanup golden VM
-    _golden_cleanup(process, ns_name, vm_dir)

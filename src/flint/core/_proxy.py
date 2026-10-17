@@ -16,7 +16,7 @@ import signal
 import subprocess
 import tempfile
 
-from .config import log, PROXY_PORT, PROXY_CA_DIR
+from .config import log, HOST_IP, PROXY_PORT, PROXY_CA_DIR
 from ._netns import _popen_in_ns
 
 
@@ -53,6 +53,8 @@ class CredentialProxy:
         cmd = [
             "mitmdump",
             "--mode", "transparent",
+            # Only the guest-facing TAP address: the bridge side must never reach it.
+            "--listen-host", HOST_IP,
             "--listen-port", str(PROXY_PORT),
             "--set", f"confdir={confdir}",
             "--set", "connection_strategy=lazy",

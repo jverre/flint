@@ -133,8 +133,9 @@ def update_template_artifact_status(template_id: str, backend_kind: str, status:
     artifact["status"] = status
     artifacts[backend_kind] = artifact
     entry["artifacts"] = artifacts
-    if backend_kind == "linux-firecracker":
-        entry["status"] = status
+    # Same as register_template_artifact: the template's status follows its
+    # latest build. The SDK's Template.build() polls it.
+    entry["status"] = status
     registry[template_id] = entry
     _save_registry(registry)
 

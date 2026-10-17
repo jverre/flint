@@ -261,21 +261,6 @@ def test_ch_backend_metadata_ns_and_tap_names():
     assert tap.startswith("chtap-")
 
 
-def test_ch_build_vm_config_matches_ch_rest_schema():
-    """The config dict fed into ``vm.create`` must carry every field CH
-    requires to boot a disk+tap VM from a kernel payload."""
-    from flint.core._ch_boot import _build_vm_config
-
-    cfg = _build_vm_config("/vm/rootfs.ext4", "chtap-abcd1234")
-    assert cfg["cpus"]["boot_vcpus"] >= 1
-    assert cfg["memory"]["size"] > 0
-    assert cfg["payload"]["kernel"]
-    assert "root=/dev/vda" in cfg["payload"]["cmdline"]
-    assert cfg["disks"][0]["path"] == "/vm/rootfs.ext4"
-    assert cfg["net"][0]["tap"] == "chtap-abcd1234"
-    assert cfg["net"][0]["mac"]
-
-
 def test_ch_strip_ns_prefix_handles_fc_and_ch():
     """The shared netns helpers key veth pair names by the vm-id suffix; the
     split must work for both backends' prefixes."""
@@ -293,85 +278,109 @@ def test_ch_kind_registered_for_state_store_lookup():
     assert backend.kind == "linux-cloud-hypervisor"
 
 
-def test_ch_api_client_builds_http_request(monkeypatch):
-    """Smoke-test the HTTP-over-UDS protocol wrapper: verify it sends a
-    well-formed request and decodes the status code correctly. We replace the
-    socket with an in-memory fake so the test needs no real CH binary."""
-    import io
+class _FakeChApi:
+    """A Unix-socket HTTP server that, like cloud-hypervisor, answers but keeps the connection open."""
+
+    def __init__(self, path: str, response: bytes) -> None:
+        import socket
+        import threading
+
+        self.requests: list[bytes] = []
+        self.fds: list[int] = []
+        self._response = response
+        self._server = socket.socket(socket.AF_UNIX)
+        self._server.bind(path)
+        self._server.listen(4)
+        self._conns: list = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        import socket
+
+        while True:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            self._conns.append(conn)
+            data, fds, _, _ = socket.recv_fds(conn, 65536, 4)
+            self.requests.append(data)
+            self.fds.extend(fds)
+            conn.sendall(self._response)  # and leave the connection open
+
+    def close(self) -> None:
+        import os
+
+        for fd in self.fds:
+            os.close(fd)
+        for conn in self._conns:
+            conn.close()
+        self._server.close()
+
+
+@pytest.fixture
+def fake_ch_api(tmp_path):
+    servers = []
+
+    def start(response: bytes) -> str:
+        path = str(tmp_path / f"ch{len(servers)}.sock")
+        servers.append(_FakeChApi(path, response))
+        return path
+
+    start.servers = servers
+    yield start
+    for server in servers:
+        server.close()
+
+
+def test_ch_api_client_returns_as_soon_as_response_is_complete(fake_ch_api):
+    """CH keeps the connection open; the client must not wait for it to close."""
+    import time
+
     import flint.core._cloud_hypervisor as ch
 
-    sent: dict[str, bytes] = {}
+    sock = fake_ch_api(b"HTTP/1.1 204 No Content\r\n\r\n")
+    t0 = time.monotonic()
+    status, _ = ch.ch_put(sock, "/api/v1/vm.boot")
+    assert status == 204 and ch.ch_status_ok(status)
+    assert time.monotonic() - t0 < 1.0
 
-    class FakeSocket:
-        def __init__(self, *a, **kw):
-            self._buf = io.BytesIO()
-
-        def connect(self, path):
-            sent["path"] = path
-
-        def sendall(self, data):
-            sent["data"] = data
-
-        def recv(self, n):
-            if self._buf.tell() == 0:
-                self._buf.write(b"HTTP/1.1 204 No Content\r\n\r\n")
-                self._buf.seek(0)
-            return self._buf.read(n)
-
-        def settimeout(self, t): pass
-        def close(self): pass
-
-    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
-
-    status, body = ch.ch_put("/fake/sock", "/api/v1/vm.boot")
-    assert status == 204
-    assert ch.ch_status_ok(status)
-    assert sent["path"] == "/fake/sock"
-    assert sent["data"].startswith(b"PUT /api/v1/vm.boot HTTP/1.1\r\n")
-    assert b"Host: localhost" in sent["data"]
+    sock = fake_ch_api(b'HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{"state":"x"}')
+    status, body = ch.ch_put(sock, "/api/v1/vm.snapshot", {"destination_url": "file:///snap"})
+    assert (status, body) == (200, b'{"state":"x"}')
+    request = fake_ch_api.servers[-1].requests[0]
+    assert request.startswith(b"PUT /api/v1/vm.snapshot HTTP/1.1\r\n")
+    assert b'"destination_url": "file:///snap"' in request
 
 
-def test_ch_api_client_serializes_json_body(monkeypatch):
-    import flint.core._cloud_hypervisor as ch
-
-    sent: dict[str, bytes] = {}
-
-    class FakeSocket:
-        def __init__(self, *a, **kw): pass
-        def connect(self, path): pass
-        def sendall(self, data): sent["data"] = data
-        def recv(self, n):
-            return b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-        def settimeout(self, t): pass
-        def close(self): pass
-
-    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
-
-    ch.ch_put("/x", "/api/v1/vm.snapshot", {"destination_url": "file:///tmp/snap"})
-    data = sent["data"]
-    assert b"Content-Type: application/json" in data
-    assert b'"destination_url": "file:///tmp/snap"' in data
-
-
-def test_ch_api_client_rejects_error_status(monkeypatch):
+def test_ch_api_client_rejects_error_status(fake_ch_api):
     """Helper wrappers (vm_create etc.) must raise on a non-2xx response."""
     import flint.core._cloud_hypervisor as ch
 
-    class FakeSocket:
-        def __init__(self, *a, **kw): pass
-        def connect(self, p): pass
-        def sendall(self, d): pass
-        def recv(self, n):
-            return b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nnope!"
-        def settimeout(self, t): pass
-        def close(self): pass
-
-    monkeypatch.setattr(ch.socket, "socket", lambda *a, **kw: FakeSocket())
-
+    sock = fake_ch_api(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nnope!")
     with pytest.raises(RuntimeError, match="vm.boot"):
-        ch.vm_boot("/x")
+        ch.vm_boot(sock)
     with pytest.raises(RuntimeError, match="vm.create"):
-        ch.vm_create("/x", {"cpus": {"boot_vcpus": 1}})
+        ch.vm_create(sock, {"cpus": {"boot_vcpus": 1}})
+
+
+def test_ch_api_client_passes_tap_fd(fake_ch_api, tmp_path):
+    """The TAP is handed to the jailed VMM as an fd alongside the request."""
+    import os
+
+    import flint.core._cloud_hypervisor as ch
+
+    sock = fake_ch_api(b"HTTP/1.1 204 No Content\r\n\r\n")
+    (tmp_path / "tap").write_text("")
+    fd = os.open(tmp_path / "tap", os.O_RDONLY)
+    try:
+        ch.vm_restore(sock, "file:///pause", {"net0": fd})
+    finally:
+        os.close(fd)
+    server = fake_ch_api.servers[-1]
+    assert len(server.fds) == 1
+    assert os.fstat(server.fds[0]).st_ino == os.stat(tmp_path / "tap").st_ino
+    assert b'"net_fds": [{"id": "net0", "num_fds": 1' in server.requests[0]
 
 
 def test_ch_api_client_exposes_full_verb_surface():

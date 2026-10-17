@@ -56,15 +56,26 @@ The chosen backend is carried on `SandboxManager._backend` and its `kind` is per
 
 ### Firecracker (`firecracker` / `linux-firecracker`)
 
-A Linux backend that runs the `firecracker` binary under `jailer` for additional sandboxing and boots each VM from a **golden snapshot** to hit sub-100ms starts. Pause/resume takes a full snapshot via the FC API and restores from it on resume. Runtime layout: one TAP device per VM inside a per-VM netns, all bridged via `br-flint`.
+A Linux backend that runs the `firecracker` binary under `jailer` and boots each VM from a **golden snapshot** to hit sub-100ms starts. The VM that takes a template's golden snapshot runs under the jailer too. Pause writes a diff snapshot of the pages the guest changed and restores from it on resume. Runtime layout: one TAP device per VM inside a per-VM netns, all bridged via `br-flint`.
 
 Preflight checks: the FC binary, the jailer binary, and the vmlinux kernel image.
 
 ### Cloud-Hypervisor (`cloud-hypervisor` / `linux-cloud-hypervisor`)
 
-Fresh-boot Linux backend. Instead of loading a snapshot, each sandbox boots from a prepared rootfs via Cloud-Hypervisor's REST API over a Unix socket. Pause/resume is a real CH API pause + restore from a per-VM pause directory. Uses the same `br-flint` bridge + netns + TAP infrastructure as Firecracker; no jailer — isolation comes from `--seccomp true` plus the netns.
+Snapshot-restore Linux backend. Each sandbox restores the template's golden snapshot via Cloud-Hypervisor's REST API over a Unix socket, falling back to a fresh boot when a template has no snapshot (see [Golden snapshots](/architecture/golden-snapshots)). Pause/resume is a real CH API pause + restore from a per-VM pause directory. Uses the same `br-flint` bridge + netns + TAP infrastructure as Firecracker.
 
-Preflight checks: the `cloud-hypervisor` binary and a kernel image.
+Cloud-Hypervisor ships no jailer, so Flint jails it to the same standard as Firecracker:
+
+- one chroot per VM at `$FLINT_JAILER_BASE_DIR/cloud-hypervisor/<id>/root` (the jailer's layout);
+- runs as `FLINT_CH_UID` (defaults to the jailer uid) with no supplementary groups, no capabilities and `no_new_privs`;
+- its own cgroup (`/sys/fs/cgroup/cloud-hypervisor/<id>`) and CH's `--seccomp true`;
+- inside the chroot, only the VMM binary, the kernel and golden snapshot files (shared, root-owned, read-only), the VM's own disk, and `/dev/kvm` + `/dev/urandom`. There's no `/proc` and no `/dev/net/tun`: the daemon opens the TAP and passes the fd, so the VMM never holds `CAP_NET_ADMIN` (which would let it rewrite its namespace's firewall).
+
+Golden snapshots are taken by a jailed VMM as well, since template images are tenant-supplied.
+
+On both Linux backends, the daemon treats a jail as hostile once its VMM has run guest code: the VMM owns its chroot and could have swapped any entry for a symlink. Host-side access to jail paths goes through `flint.core._jailfs`, which never follows the last path component. That covers connecting to the API socket, copying snapshot files out, and changing ownership.
+
+Preflight checks: the `cloud-hypervisor` binary, a kernel image, and `setpriv` + `chroot` (util-linux and coreutils) for the jail.
 
 ### macOS Virtualization.framework (`macos-vz` / `darwin-vz`)
 

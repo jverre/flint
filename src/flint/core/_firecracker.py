@@ -4,6 +4,7 @@ import time
 import urllib.request
 
 from .config import log, GUEST_IP, AGENT_PORT
+from ._jailfs import connect_unix
 from ._netns import _enter_netns, _restore_netns
 
 
@@ -19,7 +20,7 @@ def _fc_request(sock_path: str, method: str, path: str, body: dict) -> str:
     ).encode() + payload
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.connect(sock_path)
+        connect_unix(sock, sock_path)
         sock.sendall(request)
         response = sock.recv(4096).decode(errors="replace")
         status_line = response.split("\r\n", 1)[0] if response else "(empty)"
@@ -50,7 +51,7 @@ def _wait_for_api_socket(socket_path: str, timeout: float = 5.0) -> None:
     while True:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.connect(socket_path)
+            connect_unix(s, socket_path)
             return
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             if time.monotonic() - t0 > timeout:

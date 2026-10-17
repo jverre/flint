@@ -9,11 +9,18 @@ import uuid
 from dataclasses import dataclass, field
 
 from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID, JAILER_UID, JAILER_GID
-from ._netns import _ns_name, _delete_netns, _setup_netns_pyroute2, _setup_netns_subprocess
+from ._netns import _delete_netns
+from ._netns_pool import acquire_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _wait_for_agent
 from ._pool import _claim_pool_entry
 from ._template_registry import get_template_dir
-from ._jailer import JailSpec, stage_file_into_chroot, build_jailer_command, cleanup_jailer
+from ._jailer import JailSpec, make_private, stage_private_file, stage_shared_file, build_jailer_command, cleanup_jailer
+from ._artifacts import sparse_copy
+
+
+# Per-VM memory file that pause snapshots are written into (see LinuxFirecrackerBackend.pause).
+PAUSE_MEM = "pause-mem"
+PAUSE_VMSTATE = "pause-vmstate"
 
 
 @dataclass
@@ -77,7 +84,7 @@ def _boot_from_snapshot(
     On success, caller owns the process/netns/chroot and must clean up.
     """
     vm_id = str(uuid.uuid4())
-    ns_name = _ns_name(vm_id)
+    ns_name = ""  # set once the namespace is acquired
     spec = JailSpec(vm_id=vm_id, ns_name=ns_name)
     sid = vm_id[:8]
 
@@ -97,11 +104,16 @@ def _boot_from_snapshot(
         with _timed(timings, "copy_rootfs_ms"):
             if use_pool:
                 pool_entry_dir = _claim_pool_entry(template_id)
-            rootfs_src = f"{pool_entry_dir}/rootfs.ext4" if pool_entry_dir else f"{snapshot_dir}/rootfs.ext4"
-            stage_file_into_chroot(rootfs_src, "rootfs.ext4", spec)
             if pool_entry_dir:
+                stage_private_file(f"{pool_entry_dir}/rootfs.ext4", "rootfs.ext4", spec)
+                # Pre-synced base for the first diff snapshot on pause.
+                stage_private_file(f"{pool_entry_dir}/{PAUSE_MEM}", PAUSE_MEM, spec)
                 shutil.rmtree(pool_entry_dir, ignore_errors=True)
                 pool_entry_dir = None
+            else:
+                rootfs_dest = f"{spec.chroot_root}/rootfs.ext4"
+                sparse_copy(f"{snapshot_dir}/rootfs.ext4", rootfs_dest)
+                make_private(rootfs_dest)
             # The vmstate bakes in the absolute drive path from when the snapshot was
             # created (e.g. /microvms/.golden/rootfs.ext4). Firecracker running inside
             # the jailer chroot resolves absolute symlink targets relative to the chroot
@@ -112,18 +124,19 @@ def _boot_from_snapshot(
             os.makedirs(os.path.dirname(_snapshot_drive_in_chroot), exist_ok=True)
             os.symlink("/rootfs.ext4", _snapshot_drive_in_chroot)
 
-        # 3. Create network namespace + TAP
-        veth_ip = ""
+        # 3. Network namespace + TAP (pre-built by the netns pool when available)
         with _timed(timings, "netns_setup_ms"):
-            if use_pyroute2:
-                veth_ip = _setup_netns_pyroute2(ns_name, GOLDEN_TAP, internet=allow_internet_access)
-            else:
-                veth_ip = _setup_netns_subprocess(ns_name, GOLDEN_TAP, internet=allow_internet_access)
+            net = acquire_netns(
+                "fc-", lambda _ns: GOLDEN_TAP, allow_internet_access,
+                use_pool=use_pool, use_pyroute2=use_pyroute2,
+            )
+            ns_name = spec.ns_name = net.ns_name
+            veth_ip = net.veth_ip
 
         # 4. Stage snapshot files into chroot
         with _timed(timings, "stage_snapshot_ms"):
-            stage_file_into_chroot(f"{snapshot_dir}/vmstate", "vmstate", spec)
-            stage_file_into_chroot(f"{snapshot_dir}/mem", "mem", spec)
+            stage_shared_file(f"{snapshot_dir}/vmstate", "vmstate", spec)
+            stage_shared_file(f"{snapshot_dir}/mem", "mem", spec)
 
         # 5. Start jailer (jailer handles netns entry via --netns flag)
         with _timed(timings, "popen_ms"):
@@ -144,7 +157,8 @@ def _boot_from_snapshot(
             snapshot_body = {
                 "snapshot_path": "vmstate",
                 "mem_backend": {"backend_type": "File", "backend_path": "mem"},
-                "enable_diff_snapshots": False,
+                # Dirty tracking lets pause write only the pages touched since restore.
+                "track_dirty_pages": True,
                 "resume_vm": False,
             }
             if network_overrides:
@@ -191,7 +205,8 @@ def _boot_from_snapshot(
                 pass
         if pool_entry_dir:
             shutil.rmtree(pool_entry_dir, ignore_errors=True)
-        _delete_netns(ns_name)
+        if ns_name:
+            _delete_netns(ns_name)
         cleanup_jailer(spec.chroot_base, vm_id)
         raise
 

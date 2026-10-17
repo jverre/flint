@@ -14,42 +14,63 @@ import socket
 import time
 
 from .config import log
+from ._jailfs import connect_unix
+
+_RESPONSE_TIMEOUT = 60.0
 
 
-def _request(sock_path: str, method: str, path: str, body: dict | None = None) -> tuple[int, bytes]:
+def _response_complete(raw: bytes) -> bool:
+    """True once ``raw`` holds the full HTTP response (headers + Content-Length body)."""
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return False
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            return len(body) >= int(value.strip() or 0)
+    # 204/304 and bodiless responses carry no Content-Length.
+    return True
+
+
+def _request(
+    sock_path: str, method: str, path: str, body: dict | None = None, fds: list[int] | None = None,
+) -> tuple[int, bytes]:
+    """One HTTP request over the API socket. ``fds`` are passed along with SCM_RIGHTS."""
     payload = json.dumps(body).encode() if body is not None else b""
     headers = [
         f"{method} {path} HTTP/1.1",
         "Host: localhost",
         "Accept: application/json",
+        "Connection: close",
+        f"Content-Length: {len(payload)}",
     ]
     if payload:
         headers.append("Content-Type: application/json")
-        headers.append(f"Content-Length: {len(payload)}")
     request = ("\r\n".join(headers) + "\r\n\r\n").encode() + payload
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    raw = b""
     try:
-        sock.connect(sock_path)
-        sock.sendall(request)
-        chunks: list[bytes] = []
-        sock.settimeout(5.0)
+        connect_unix(sock, sock_path)
+        if fds:
+            sent = socket.send_fds(sock, [request], fds)
+            sock.sendall(request[sent:])
+        else:
+            sock.sendall(request)
+        # Snapshot/restore of a large guest can take a while; the timeout only
+        # guards against a wedged VMM. Stop as soon as the response is complete
+        # rather than waiting for the peer to close (it keeps the connection alive).
+        sock.settimeout(_RESPONSE_TIMEOUT)
         while True:
-            try:
-                chunk = sock.recv(4096)
-            except socket.timeout:
-                break
+            chunk = sock.recv(65536)
             if not chunk:
                 break
-            chunks.append(chunk)
-            # cloud-hypervisor closes the connection after the response; we stop
-            # once we have a Content-Length worth or the peer closes.
-            if len(b"".join(chunks)) > 65536:
+            raw += chunk
+            if _response_complete(raw):
                 break
     finally:
         sock.close()
 
-    raw = b"".join(chunks)
     if not raw:
         return 0, b""
     head, _, body_bytes = raw.partition(b"\r\n\r\n")
@@ -65,8 +86,8 @@ def _request(sock_path: str, method: str, path: str, body: dict | None = None) -
     return status_code, body_bytes
 
 
-def ch_put(sock_path: str, path: str, body: dict | None = None) -> tuple[int, bytes]:
-    return _request(sock_path, "PUT", path, body)
+def ch_put(sock_path: str, path: str, body: dict | None = None, fds: list[int] | None = None) -> tuple[int, bytes]:
+    return _request(sock_path, "PUT", path, body, fds)
 
 
 def ch_post(sock_path: str, path: str, body: dict | None = None) -> tuple[int, bytes]:
@@ -104,7 +125,7 @@ def wait_for_api_socket(
             )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            s.connect(socket_path)
+            connect_unix(s, socket_path)
             return
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             if time.monotonic() - t0 > timeout:
@@ -164,12 +185,22 @@ def vm_snapshot(sock_path: str, destination_url: str) -> None:
         raise RuntimeError(f"vm.snapshot failed: {status} {body!r}")
 
 
-def vm_restore(sock_path: str, source_url: str) -> None:
-    status, body = ch_put(
-        sock_path, "/api/v1/vm.restore", {"source_url": source_url}
-    )
+def vm_add_net(sock_path: str, net_config: dict, tap_fd: int) -> None:
+    """Attach a NIC backed by an already-open TAP fd (CH never touches the TAP's config)."""
+    status, body = ch_put(sock_path, "/api/v1/vm.add-net", {**net_config, "fds": [-1]}, [tap_fd])
     if not ch_status_ok(status):
-        raise RuntimeError(f"vm.restore failed: {status} {body!r}")
+        raise RuntimeError(f"vm.add-net failed: {status} {body!r}")
+
+
+def vm_restore(sock_path: str, source_url: str, net_fds: dict[str, int] | None = None) -> None:
+    """Restore a snapshot. ``net_fds`` maps fd-backed NIC ids to fresh TAP fds."""
+    body: dict = {"source_url": source_url}
+    fds = list((net_fds or {}).values())
+    if net_fds:
+        body["net_fds"] = [{"id": net_id, "num_fds": 1, "fds": [-1]} for net_id in net_fds]
+    status, resp = ch_put(sock_path, "/api/v1/vm.restore", body, fds)
+    if not ch_status_ok(status):
+        raise RuntimeError(f"vm.restore failed: {status} {resp!r}")
 
 
 def vmm_shutdown(sock_path: str) -> None:

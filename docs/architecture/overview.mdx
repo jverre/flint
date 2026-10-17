@@ -33,8 +33,8 @@ Flint's hypervisor support is pluggable. Each backend is a class that implements
 
 | Backend | Platform | Boot strategy | Snapshot / restore |
 |---------|----------|---------------|--------------------|
-| `firecracker` | Linux (KVM) | Load golden snapshot | Yes (full snapshot via API) |
-| `cloud-hypervisor` | Linux (KVM) | Fresh boot against prepared rootfs | Yes (pause/restore via API) |
+| `firecracker` | Linux (KVM) | Load golden snapshot | Yes (dirty-page diff snapshot via API) |
+| `cloud-hypervisor` | Linux (KVM) | Golden snapshot restore | Yes (pause/restore via API) |
 | `macos-vz` | macOS Apple Silicon | Virtualization.framework VM | Not yet |
 
 The daemon picks one at startup based on `--backend` / `FLINT_BACKEND` / host default. Third parties can publish their own plugins via the `flint.backends` entry-point group. See [Backends](/cli/backends) for details.
@@ -56,7 +56,7 @@ See the [guest agent](/architecture/guest-agent) page for more.
 
 Copying a rootfs image for each new sandbox takes a few hundred milliseconds on its own. To avoid this, the daemon maintains a pool of pre-copied rootfs images. When you create a sandbox, it just claims one from the pool and starts immediately.
 
-See the [golden snapshots](/architecture/golden-snapshots) page for more on how this and the snapshot system work (Firecracker-specific).
+See the [golden snapshots](/architecture/golden-snapshots) page for more on how this and the snapshot system work.
 
 ## Networking
 

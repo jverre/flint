@@ -1,9 +1,9 @@
 ---
 title: "Networking"
-description: "How sandboxes connect to the host and the internet."
+description: "How sandboxes connect to the host and the internet, and what they can't reach."
 ---
 
-Each sandbox gets its own network namespace. This provides isolation - sandboxes can't talk to each other directly - while still allowing internet access through NAT on the host.
+Each sandbox gets its own network namespace. Sandboxes can reach the internet through NAT on the host, but not each other, the host's services, or private and link-local networks.
 
 ## The network stack
 
@@ -12,14 +12,14 @@ Internet
     |
   Host eth0 (NAT via iptables)
     |
-  br-flint bridge (10.0.0.1/24)
+  br-flint bridge (10.0.0.1/24)       each sandbox port is isolated
     |
   ┌──────────────────────────────────┐
-  │ Network namespace: fc-{vm_id}    │
+  │ Network namespace: fc-{id}       │
   │                                  │
-  │  veth-host (10.0.0.X)            │
+  │  veth (10.0.0.X)  ← ingress firewall, egress policy
   │        │                         │
-  │  TAP device (tap0)               │
+  │  TAP device (172.16.0.1)         │
   │        │                         │
   │  VM eth0 (172.16.0.2)            │
   │  guest agent on 172.16.0.2:5000  │
@@ -32,7 +32,32 @@ A few things worth explaining here:
 - Each sandbox gets a **veth pair** - one end inside its network namespace, one end attached to the bridge.
 - Inside the namespace there's a **TAP device** that the VM uses for its network interface.
 - The VM's guest IP is `172.16.0.2`. The host-side address inside the namespace is `172.16.0.1`.
-- VMs get an address in the `10.0.0.0/24` range for their outbound traffic.
+- Each namespace gets a unique address in `10.0.0.0/24` for its outbound traffic. No two live namespaces ever share one, including across daemon restarts. Storage exports are authorized by this address. The subnet caps a host at 253 namespaces with internet access, pre-built ones included.
+
+## Isolation
+
+The attacker Flint defends against is the code inside a sandbox. Every boundary below is enforced in two places, so one misconfigured layer doesn't open it.
+
+| A sandbox can't reach | Enforced by |
+|---|---|
+| Other sandboxes' namespaces | Bridge port isolation (`isolated on`) + each namespace drops unsolicited traffic arriving on its veth |
+| Services on the host (any address) | Host `FLINT-INPUT` chain + namespace egress policy |
+| Private, loopback, CGNAT, multicast and link-local destinations, including cloud metadata at `169.254.169.254` | Namespace `FLINT-EGRESS` chain + host `FLINT-FORWARD` chain |
+| Another sandbox's credential proxy | The proxy listens only on `172.16.0.1` + the namespace ingress firewall |
+
+The only exception to the egress policy is the workspace storage server, when one is configured: `r2nfs` on the bridge IP, or the S3 Files NFS endpoint. IPv6 is disabled inside sandbox namespaces.
+
+Flint also explicitly allows sandbox traffic out through the host's `FORWARD` chain. Docker sets the host's forward policy to `DROP`, which would otherwise cut sandboxes off from the internet.
+
+## Pre-built namespaces
+
+Building a namespace (TAP, veth, firewall) takes about 40 ms, so the daemon keeps a pool ready: 8 with internet access (`FLINT_NETNS_POOL_SIZE`) and 2 without. A pre-built namespace:
+
+- gets the same rules as one built on demand before any VM uses it, so an idle namespace on the bridge is unreachable;
+- belongs to exactly one sandbox and is deleted with it, never reused;
+- has nothing sandbox-specific (credential proxy, network policy) applied until a sandbox claims it.
+
+Unclaimed namespaces are deleted when the daemon stops, or at the next start after a crash.
 
 ## How the daemon reaches flintd
 
@@ -42,10 +67,10 @@ This is why the guest agent is not directly accessible from outside the Flint da
 
 ## Internet access
 
-If `allow_internet_access=True` (the default), the daemon sets up iptables NAT rules so traffic from the VM can reach the internet through the host's default route.
+If `allow_internet_access=True` (the default), the VM's traffic is NATed out through its veth and then through the host's default route.
 
-If you set `allow_internet_access=False`, the VM is fully isolated - no inbound or outbound internet.
+If you set `allow_internet_access=False`, the namespace has no veth: the VM can reach nothing outside it.
 
 ## Implementation
 
-Networking is set up in `src/flint/core/_netns.py`. By default Flint uses [pyroute2](https://pyroute2.org/) to create and configure the namespace, but you can fall back to shell commands with `use_pyroute2=False` if pyroute2 isn't available.
+Networking is set up in `src/flint/core/_netns.py`, and the pool lives in `src/flint/core/_netns_pool.py`. By default Flint uses [pyroute2](https://pyroute2.org/) to create and configure the namespace, but you can fall back to shell commands with `use_pyroute2=False` if pyroute2 isn't available. Both paths apply the same isolation rules.

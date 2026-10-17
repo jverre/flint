@@ -1,10 +1,31 @@
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
 RecoveryState = Literal["alive", "paused", "dead"]
+
+
+def row_backend_metadata(row: dict) -> dict:
+    """Return the per-sandbox backend_metadata dict from a state-store row.
+
+    Rows can carry it as either a pre-parsed dict (``backend_metadata``) or
+    the raw ``backend_meta_json`` TEXT column. Accept either.
+    """
+    meta = row.get("backend_metadata")
+    if isinstance(meta, dict):
+        return meta
+    raw = row.get("backend_meta_json")
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 @dataclass
