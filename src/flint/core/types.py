@@ -69,6 +69,8 @@ class _SandboxEntry:
     proxy: Any = None  # CredentialProxy instance, if active
     timeout_seconds: float | None = None
     timeout_policy: str | None = None
+    tenant: str = ""
+    availability: str = ""  # cluster availability class; "" outside a cluster
 
     def to_dict(self) -> dict:
         """Return JSON-serializable representation."""
@@ -88,6 +90,8 @@ class _SandboxEntry:
             "network_policy": _redact_policy(self.network_policy),
             "timeout_seconds": self.timeout_seconds,
             "timeout_policy": self.timeout_policy,
+            "tenant": self.tenant,
+            "availability": self.availability,
         }
 
 

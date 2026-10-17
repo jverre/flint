@@ -52,15 +52,45 @@ class SandboxManager:
         # Called with the sandbox ID just before a sandbox is killed.
         self.kill_hooks: list[Callable[[str], None]] = []
 
-    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> str:
-        """Start an interactive VM from a template snapshot. Returns the vm_id."""
+    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None, vm_id: str | None = None, tenant: str = "", availability: str = "") -> str:
+        """Start an interactive VM from a template snapshot. Returns the vm_id.
+
+        ``vm_id`` is chosen by the caller in a cluster (the control plane),
+        so a VM keeps its ID when it moves between hosts.
+        """
         boot = self._backend.create(
             template_id=template_id,
             allow_internet_access=allow_internet_access,
             use_pool=use_pool,
             use_pyroute2=use_pyroute2,
+            vm_id=vm_id,
         )
+        return self._register_boot(boot, template_id, network_policy, tenant, availability)
 
+    def restore(self, vm_id: str, src_dir: str, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, network_policy: dict | None = None, tenant: str = "", availability: str = "") -> str:
+        """Start ``vm_id`` from a snapshot of another VM (paused, checkpointed or
+        forked, possibly on another host) restored into ``src_dir``."""
+        with self._lock:
+            if vm_id in self._sandboxes:
+                raise RuntimeError(f"Sandbox {vm_id} already runs here")
+        if self._state_store:
+            row = self._state_store.get_sandbox(vm_id)
+            if row and row["state"] != SandboxState.DEAD.value:
+                self.kill(vm_id)  # a stale local copy (e.g. paused here before it moved)
+        boot = self._backend.import_snapshot(vm_id, src_dir, allow_internet_access=allow_internet_access)
+        return self._register_boot(boot, template_id, network_policy, tenant, availability)
+
+    def checkpoint(self, sandbox_id: str, snapshot: Callable[[str, dict[str, str]], object]) -> object:
+        """Snapshot a running sandbox without stopping it (see BackendPlugin.checkpoint)."""
+        with self._lock:
+            entry = self._sandboxes.get(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        if entry.state != SandboxState.RUNNING:
+            raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
+        return self._backend.checkpoint(entry, snapshot)
+
+    def _register_boot(self, boot, template_id: str, network_policy: dict | None, tenant: str, availability: str) -> str:
         vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
         agent_url = boot.agent_url
 
@@ -87,6 +117,8 @@ class SandboxManager:
             ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
             timings=boot.timings,
             network_policy=network_policy,
+            tenant=tenant,
+            availability=availability,
         )
 
         # Warmup: send a quick exec to measure time-to-interactive.
@@ -117,6 +149,8 @@ class SandboxManager:
                 chroot_base=boot.chroot_base,
                 backend_kind=entry.backend_kind,
                 backend_meta_json=entry.backend_metadata,
+                tenant=tenant,
+                availability=availability,
             )
 
         # Persist network policy if provided
@@ -225,6 +259,8 @@ class SandboxManager:
             guest_arch=boot.guest_arch,
             transport_ref=boot.transport_ref,
             backend_metadata=dict(boot.backend_metadata),
+            tenant=row.get("tenant") or "",
+            availability=row.get("availability") or "",
         )
 
         with self._lock:
@@ -296,6 +332,8 @@ class SandboxManager:
                     "network_policy": None,
                     "timeout_seconds": None,
                     "timeout_policy": row.get("timeout_policy"),
+                    "tenant": row.get("tenant") or "",
+                    "availability": row.get("availability") or "",
                 }
         return None
 

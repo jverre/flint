@@ -128,6 +128,7 @@ class LinuxFirecrackerBackend(HostBackend):
         allow_internet_access: bool,
         use_pool: bool,
         use_pyroute2: bool,
+        vm_id: str | None = None,
     ) -> BackendBootResult:
         if template_id == DEFAULT_TEMPLATE_ID:
             if not golden_snapshot_exists():
@@ -141,6 +142,7 @@ class LinuxFirecrackerBackend(HostBackend):
             use_pool=use_pool,
             use_pyroute2=use_pyroute2,
             network_overrides=[{"iface_id": "eth0", "host_dev_name": GOLDEN_TAP}],
+            vm_id=vm_id,
         )
         return BackendBootResult(
             process=boot.process,
@@ -179,6 +181,32 @@ class LinuxFirecrackerBackend(HostBackend):
         safe. A full snapshot is the fallback.
         """
         _fc_patch(entry.socket_path, "/vm", {"state": "Paused"})
+        try:
+            self._snapshot_paused(entry)
+        except Exception:
+            _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
+            raise
+
+        if entry.process:
+            entry.process.kill()
+            try:
+                entry.process.wait(timeout=2)
+            except Exception:
+                pass
+
+        entry.state = SandboxState.PAUSED
+        entry.agent_healthy = False
+        entry.process = None
+        entry.pause_state_ref = entry.vm_dir
+
+        if state_store:
+            state_store.transition_state(entry.vm_id, SandboxState.PAUSED)
+            state_store.set_pause_snapshot(entry.vm_id, entry.vm_dir)
+            state_store.update_sandbox(entry.vm_id, pause_state_ref=entry.vm_dir)
+
+    @staticmethod
+    def _snapshot_paused(entry: _SandboxEntry) -> None:
+        """Write the paused VM's state to ``pause-vmstate``/``pause-mem`` in its jail."""
         pause_mem = os.path.join(entry.vm_dir, PAUSE_MEM)
         try:
             try:
@@ -204,25 +232,54 @@ class LinuxFirecrackerBackend(HostBackend):
         except Exception as exc:
             resp = str(exc)
         if not _fc_status_ok(resp):
-            _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
             raise RuntimeError(f"Snapshot create failed: {resp}")
 
-        if entry.process:
-            entry.process.kill()
-            try:
-                entry.process.wait(timeout=2)
-            except Exception:
-                pass
+    # ── Cluster hooks ──────────────────────────────────────────────────────
 
-        entry.state = SandboxState.PAUSED
-        entry.agent_healthy = False
-        entry.process = None
-        entry.pause_state_ref = entry.vm_dir
+    _STATE_FILES = ("rootfs.ext4", PAUSE_VMSTATE, PAUSE_MEM)
 
-        if state_store:
-            state_store.transition_state(entry.vm_id, SandboxState.PAUSED)
-            state_store.set_pause_snapshot(entry.vm_id, entry.vm_dir)
-            state_store.update_sandbox(entry.vm_id, pause_state_ref=entry.vm_dir)
+    def pause_files(self, row: dict) -> tuple[str, dict[str, str]]:
+        return row["vm_dir"], {name: name for name in self._STATE_FILES}
+
+    def checkpoint(self, entry: _SandboxEntry, snapshot):
+        # A diff snapshot writes the pages dirtied since the last one into
+        # pause-mem, which then holds the full memory image, exactly like a
+        # pause; the VM keeps running from its current backing afterwards.
+        _fc_patch(entry.socket_path, "/vm", {"state": "Paused"})
+        try:
+            self._snapshot_paused(entry)
+            return snapshot(entry.vm_dir, {name: name for name in self._STATE_FILES})
+        finally:
+            _fc_patch(entry.socket_path, "/vm", {"state": "Resumed"})
+
+    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
+        from flint.core._jailer import JailSpec, cleanup_jailer, make_private
+        from flint.core._netns_pool import acquire_netns
+
+        spec = JailSpec(vm_id=vm_id, ns_name="")
+        cleanup_jailer(spec.chroot_base, vm_id)  # a stale jail from an earlier life of this ID
+        os.makedirs(spec.chroot_root)
+        os.chown(spec.chroot_root, JAILER_UID, JAILER_GID)
+        net = None
+        try:
+            for name in self._STATE_FILES:
+                dest = os.path.join(spec.chroot_root, name)
+                os.rename(os.path.join(src_dir, name), dest)
+                make_private(dest)
+            net = acquire_netns("fc-", lambda _ns: GOLDEN_TAP, allow_internet_access, use_pool=use_pool)
+            row = {
+                "vm_id": vm_id, "vm_dir": spec.chroot_root, "ns_name": net.ns_name,
+                "chroot_base": spec.chroot_base, "backend_meta_json": json.dumps({"veth_ip": net.veth_ip}),
+            }
+            return self.resume(row)
+        except Exception:
+            if net is not None:
+                _delete_netns(net.ns_name)
+            cleanup_jailer(spec.chroot_base, vm_id)
+            raise
+
+    def template_files(self, template_dir: str) -> list[str]:
+        return ["rootfs.ext4", "vmstate", "mem"]
 
     def resume(self, row: dict) -> BackendBootResult:
         from flint.core._jailer import JailSpec, build_jailer_command

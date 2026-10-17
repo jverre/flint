@@ -77,13 +77,14 @@ def _boot_from_snapshot(
     use_pool: bool = True,
     use_pyroute2: bool = True,
     network_overrides: list[dict] | None = None,
+    vm_id: str | None = None,
 ) -> BootResult:
     """Boot a VM from a template snapshot via the jailer. Returns BootResult.
 
     On failure, cleans up all resources and raises.
     On success, caller owns the process/netns/chroot and must clean up.
     """
-    vm_id = str(uuid.uuid4())
+    vm_id = vm_id or str(uuid.uuid4())
     ns_name = ""  # set once the namespace is acquired
     spec = JailSpec(vm_id=vm_id, ns_name=ns_name)
     sid = vm_id[:8]

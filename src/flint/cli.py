@@ -17,6 +17,13 @@ def cli():
 @click.option("--backend", default=None, type=str, help="Backend plugin to use (e.g. firecracker, cloud-hypervisor, macos-vz)")
 def start(port, data_dir, state_dir, backend):
     """Start the Flint manager daemon."""
+    _set_daemon_env(port, data_dir, state_dir, backend)
+    _check_backend(backend)
+    from flint.daemon.server import FlintDaemon
+    FlintDaemon().run()
+
+
+def _set_daemon_env(port, data_dir, state_dir, backend) -> None:
     if port is not None:
         os.environ["FLINT_PORT"] = str(port)
     if data_dir is not None:
@@ -25,6 +32,10 @@ def start(port, data_dir, state_dir, backend):
         os.environ["FLINT_STATE_DIR"] = state_dir
     if backend is not None:
         os.environ["FLINT_BACKEND"] = backend
+
+
+def _check_backend(backend):
+    """Resolve the backend, installing its dependencies if preflight fails. Returns the plugin."""
     from flint.core.backends import resolve_backend, names, BackendNotFound
     try:
         plugin = resolve_backend()
@@ -68,8 +79,156 @@ def start(port, data_dir, state_dir, backend):
     if platform.system() == "Darwin":
         from flint.core._install import ensure_vz_entitlement
         ensure_vz_entitlement()
+    return plugin
+
+
+def _cluster_binary() -> str:
+    import shutil
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.environ.get("FLINT_CLUSTER_BIN", ""), shutil.which("flint-cluster") or "",
+                 os.path.join(here, "..", "..", "cluster", "flint-cluster")):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return os.path.abspath(cand)
+    raise click.ClickException("flint-cluster binary not found (set FLINT_CLUSTER_BIN or build cluster/)")
+
+
+@cli.command()
+@click.option("--join", "token", default=None, envvar="FLINT_JOIN_TOKEN", help="Join token from the control plane (first start only)")
+@click.option("--advertise", required=True, envvar="FLINT_ADVERTISE_ADDR", help="Address the control plane and other hosts reach this host on")
+@click.option("--listen", default="0.0.0.0", envvar="FLINT_HOST", help="Address the agent API binds to")
+@click.option("--port", default=9400, type=int, envvar="FLINT_PORT", help="Agent API port (mTLS)")
+@click.option("--snapd-port", default=9501, type=int, envvar="FLINT_SNAPD_PORT", help="Port of this host's snapd peer server")
+@click.option("--name", default=None, envvar="FLINT_HOST_NAME", help="Host name (default: hostname)")
+@click.option("--zone", default="", envvar="FLINT_ZONE", help="Failure domain, e.g. the cloud zone")
+@click.option("--label", "labels", multiple=True, help="key=value host label (repeatable)")
+@click.option("--data-dir", default=None, type=str)
+@click.option("--state-dir", default=None, type=str)
+@click.option("--backend", default=None, type=str)
+def agent(token, advertise, listen, port, snapd_port, name, zone, labels, data_dir, state_dir, backend):
+    """Run this machine as a cluster host agent.
+
+    The first start enrols the host with --join (a token from
+    `flint cluster join-token`); later starts reuse the stored identity. Run
+    `flint-cluster snapd` next to it (the systemd units in deploy/ do both).
+    """
+    import socket
+    import subprocess
+    _set_daemon_env(port, data_dir, state_dir, backend)
+    os.environ["FLINT_HOST"] = listen
+    os.environ["FLINT_CLUSTER"] = "1"
+    plugin = _check_backend(backend)
+    from flint.core import config
+    identity = config.CLUSTER_IDENTITY_DIR
+    if not os.path.exists(os.path.join(identity, "host.json")):
+        if not token:
+            raise click.ClickException(f"this host hasn't joined a cluster ({identity}); pass --join <token>")
+        from flint.cluster.agent import host_class
+        cmd = [_cluster_binary(), "join", "--token", token, "--identity", identity,
+               "--name", name or socket.gethostname(),
+               "--agent-url", f"https://{advertise}:{port}", "--snapd-url", f"https://{advertise}:{snapd_port}",
+               "--zone", zone, "--backend", plugin.kind, "--host-class", host_class(plugin)]
+        for label in labels:
+            cmd += ["--label", label]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise click.ClickException(f"join failed: {result.stderr.strip() or result.stdout.strip()}")
+        click.echo(f"Joined the cluster as {result.stdout.strip()}", err=True)
     from flint.daemon.server import FlintDaemon
     FlintDaemon().run()
+
+
+# ── Cluster administration (talks to the control plane: FLINT_URL, FLINT_API_KEY) ──
+
+def _cp(method: str, path: str, **kwargs):
+    import httpx
+    from flint._client.client import auth_headers
+    from flint.core.config import DAEMON_URL
+    resp = httpx.request(method, f"{DAEMON_URL}{path}", headers=auth_headers(), timeout=60.0, **kwargs)
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise click.ClickException(f"{resp.status_code}: {detail}")
+    return resp.json()
+
+
+@cli.group()
+def cluster():
+    """Manage a Flint cluster (set FLINT_URL and FLINT_API_KEY to the control plane)."""
+
+
+@cluster.command("hosts")
+@click.option("-o", "--output", type=click.Choice(["table", "json"]), default="table")
+def cluster_hosts(output):
+    """List hosts."""
+    import json as _json
+    hosts = _cp("GET", "/v1/hosts")["hosts"]
+    if output == "json":
+        click.echo(_json.dumps(hosts, indent=2))
+        return
+    click.echo(f"{'ID':18s} {'NAME':16s} {'ZONE':10s} {'STATE':12s} {'VMS':>5s}  CORDONED")
+    for h in hosts:
+        cap = h.get("capacity") or {}
+        click.echo(f"{h['id']:18s} {h['name'][:16]:16s} {h.get('zone','')[:10]:10s} {h['state']:12s} "
+                   f"{h.get('active_vms', 0):>2d}/{cap.get('max_vms', 0):<2d}  {'yes' if h.get('cordoned') else 'no'}")
+
+
+@cluster.command("join-token")
+@click.option("--zone", default="", help="Zone the joining host is in")
+@click.option("--ttl", default=3600, type=int, help="Seconds the token is valid")
+def cluster_join_token(zone, ttl):
+    """Print a single-use token for `flint agent --join`."""
+    click.echo(_cp("POST", "/v1/join-tokens", json={"zone": zone, "ttl_seconds": ttl})["token"])
+
+
+@cluster.command("cordon")
+@click.argument("host_id")
+def cluster_cordon(host_id):
+    """Stop placing new VMs on a host."""
+    _cp("POST", f"/v1/hosts/{host_id}/cordon")
+    click.echo(f"{host_id} cordoned")
+
+
+@cluster.command("uncordon")
+@click.argument("host_id")
+def cluster_uncordon(host_id):
+    """Return a host to service."""
+    _cp("POST", f"/v1/hosts/{host_id}/uncordon")
+    click.echo(f"{host_id} uncordoned")
+
+
+@cluster.command("drain")
+@click.argument("host_id")
+@click.option("--wait/--no-wait", default=True)
+def cluster_drain(host_id, wait):
+    """Move every VM off a host (live state preserved), then mark it drained."""
+    _cp("POST", f"/v1/hosts/{host_id}/drain")
+    while wait:
+        h = _cp("GET", f"/v1/hosts/{host_id}")["host"]
+        click.echo(f"\r{h['state']}: {len(h.get('vms') or [])} VMs left   ", nl=False)
+        if h["state"] == "drained":
+            click.echo()
+            break
+        time.sleep(2)
+
+
+@cluster.command("token")
+@click.option("--kind", type=click.Choice(["service", "admin"]), default="service")
+@click.option("--name", default="")
+@click.option("--tenant", "tenants", multiple=True, help="Restrict a service token to these tenants")
+def cluster_token(kind, name, tenants):
+    """Create an API token (printed once)."""
+    click.echo(_cp("POST", "/v1/tokens", json={"kind": kind, "name": name, "tenants": list(tenants)})["token"])
+
+
+@cluster.command("vmsets")
+def cluster_vmsets():
+    """List VM sets."""
+    for vs in _cp("GET", "/v1/vmsets")["vmsets"]:
+        st = vs["status"]
+        click.echo(f"{vs['id']:18s} {vs['name'][:20]:20s} {vs['tenant'][:12]:12s} "
+                   f"{st['running']}/{vs['spec']['replicas']} running, {st['standby']} standby  {st['by_zone']}")
 
 
 @cli.group()

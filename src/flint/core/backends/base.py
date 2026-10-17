@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from typing import Any, Callable, ClassVar, Literal
 
 RecoveryState = Literal["alive", "paused", "dead"]
 
@@ -134,6 +134,7 @@ class BackendPlugin(ABC):
         allow_internet_access: bool,
         use_pool: bool,
         use_pyroute2: bool,
+        vm_id: str | None = None,
     ) -> BackendBootResult:
         pass
 
@@ -183,6 +184,33 @@ class BackendPlugin(ABC):
     @abstractmethod
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
         pass
+
+    # ── Cluster hooks: moving a VM's state between hosts ──────────────────
+    #
+    # A snapshot is a set of files: name in the snapshot -> path relative to
+    # a root directory (the VM's jail). The cluster's snapshot store reads
+    # them beneath that root without following symlinks, because the VMM
+    # can write inside its jail.
+
+    def pause_files(self, row: dict) -> tuple[str, dict[str, str]]:
+        """``(root, files)`` holding a paused sandbox's complete state."""
+        raise NotImplementedError(f"backend {self.name!r} can't export snapshots")
+
+    def checkpoint(self, entry, snapshot: Callable[[str, dict[str, str]], Any]) -> Any:
+        """Pause a running VM just long enough to call ``snapshot(root, files)``
+        with a consistent copy of its state, then resume it. Returns what
+        ``snapshot`` returned. The files use :meth:`pause_files` names."""
+        raise NotImplementedError(f"backend {self.name!r} can't checkpoint")
+
+    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
+        """Start ``vm_id`` on this host from a pause or checkpoint snapshot
+        restored into ``src_dir`` (files named as in :meth:`pause_files`).
+        Consumes ``src_dir``'s files."""
+        raise NotImplementedError(f"backend {self.name!r} can't import snapshots")
+
+    def template_files(self, template_dir: str) -> list[str]:
+        """Files of a built template, relative to its directory."""
+        raise NotImplementedError(f"backend {self.name!r} can't export templates")
 
     def install_dependencies(self, **kwargs) -> None:  # pragma: no cover - optional
         """Install any external binaries/kernels this backend needs.

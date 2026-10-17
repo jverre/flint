@@ -151,6 +151,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         allow_internet_access: bool,
         use_pool: bool,
         use_pyroute2: bool,
+        vm_id: str | None = None,
     ) -> BackendBootResult:
         if template_id == DEFAULT_TEMPLATE_ID and not ch_golden_ready(CH_GOLDEN_DIR):
             raise RuntimeError(
@@ -162,6 +163,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             allow_internet_access=allow_internet_access,
             use_pool=use_pool,
             use_pyroute2=use_pyroute2,
+            vm_id=vm_id,
         )
 
         return BackendBootResult(
@@ -255,6 +257,88 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 "veth_ip": boot.veth_ip,
             },
         )
+
+    # ── Cluster hooks ──────────────────────────────────────────────────────
+
+    _PAUSE_FILES = ("config.json", "state.json", "memory-ranges")
+
+    def pause_files(self, row: dict) -> tuple[str, dict[str, str]]:
+        files = {"rootfs.ext4": "rootfs.ext4"}
+        files.update({f"pause/{n}": f"pause/{n}" for n in self._PAUSE_FILES})
+        return ChJail(row["vm_id"]).root, files
+
+    def checkpoint(self, entry: _SandboxEntry, snapshot):
+        from flint.core import _cloud_hypervisor as _ch
+
+        jail = ChJail(entry.vm_id)
+        staging = jail.host_path("/ckpt")
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging)
+        jail.give("/ckpt")
+        _ch.vm_pause(jail.socket_path)
+        try:
+            _ch.vm_snapshot(jail.socket_path, "file:///ckpt")
+            files = {"rootfs.ext4": "rootfs.ext4"}
+            files.update({f"pause/{n}": f"ckpt/{n}" for n in self._PAUSE_FILES})
+            return snapshot(jail.root, files)
+        finally:
+            try:
+                _ch.vm_resume(jail.socket_path)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
+        from flint.core._ch_jail import JAIL_ROOTFS
+        from flint.core._netns_pool import acquire_netns
+
+        jail = ChJail(vm_id)
+        jail.cleanup()  # a stale jail from an earlier life of this ID
+        jail.prepare()
+        net = None
+        try:
+            os.rename(os.path.join(src_dir, "rootfs.ext4"), jail.host_path(JAIL_ROOTFS))
+            jail.give(JAIL_ROOTFS)
+            os.mkdir(jail.host_path("/pause"))
+            for n in self._PAUSE_FILES:
+                os.rename(os.path.join(src_dir, "pause", n), jail.host_path(f"/pause/{n}"))
+                jail.give(f"/pause/{n}")
+            jail.give("/pause")
+            net = acquire_netns("ch-", ch_tap_for_ns, allow_internet_access, use_pool=use_pool)
+            boot = ch_resume_from_pause(
+                vm_id, ns_name=net.ns_name, tap_name=net.tap_name,
+                allow_internet_access=allow_internet_access, veth_ip=net.veth_ip,
+            )
+        except Exception:
+            if net is not None:
+                _delete_netns(net.ns_name)
+            jail.cleanup()
+            raise
+        return BackendBootResult(
+            process=boot.process,
+            pid=boot.process.pid,
+            vm_dir=boot.vm_dir,
+            socket_path=boot.socket_path,
+            ns_name=net.ns_name,
+            guest_ip=GUEST_IP,
+            agent_url=boot.agent_url,
+            chroot_base=boot.chroot_base,
+            backend_vm_ref=vm_id,
+            runtime_dir=boot.vm_dir,
+            guest_arch=platform.machine().lower(),
+            transport_ref=f"netns:{net.ns_name}",
+            timings=dict(boot.timings),
+            t_total=boot.t_total,
+            backend_metadata={
+                "api_socket": boot.socket_path,
+                "ns_name": net.ns_name,
+                "tap_name": net.tap_name,
+                "pause_dir": os.path.join(boot.vm_dir, "pause"),
+                "veth_ip": net.veth_ip,
+            },
+        )
+
+    def template_files(self, template_dir: str) -> list[str]:
+        return ["rootfs.ext4"] + [f"snapshot/{n}" for n in (*self._PAUSE_FILES, "rootfs.ext4")]
 
     def proxy_guest_request(
         self,

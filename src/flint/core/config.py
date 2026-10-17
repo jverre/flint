@@ -125,6 +125,15 @@ VZ_READY_TIMEOUT = float(os.environ.get("FLINT_VZ_READY_TIMEOUT", "60"))
 STORAGE_BACKEND = os.environ.get("FLINT_STORAGE_BACKEND", "local")  # "local" | "s3_files" | "r2"
 WORKSPACE_DIR = os.environ.get("FLINT_WORKSPACE_DIR", "/workspace")
 
+# ── Cluster host agent (`flint agent`) ─────────────────────────────────
+# In a cluster this daemon is a host agent: the control plane drives it over
+# mTLS and it reports to the control plane. See plans/03-cluster.md.
+CLUSTER_MODE = os.environ.get("FLINT_CLUSTER") == "1"
+CLUSTER_IDENTITY_DIR = os.environ.get("FLINT_IDENTITY_DIR", f"{STATE_DIR}/cluster")
+SNAPD_SOCKET = os.environ.get("FLINT_SNAPD_SOCKET", "/run/flint/snapd.sock")
+# Most VMs (running, not paused) this host takes; 0 = derive from memory.
+MAX_VMS = int(os.environ.get("FLINT_MAX_VMS", "0"))
+
 # ── Runtime-editable overrides ──────────────────────────────────────────
 CONFIG_OVERRIDES_PATH = f"{STATE_DIR}/config.json"
 CONFIG_FIELDS = {

@@ -73,8 +73,18 @@ def get_bus() -> EventBus | None:
     return _bus
 
 
+# Called with every published event (from any thread); the cluster agent
+# uses this to forward events to the control plane.
+hooks: list = []
+
+
 def publish(event_type: str, **payload) -> None:
     """Publish to the global bus. No-op if the bus is not yet initialized."""
+    for hook in hooks:
+        try:
+            hook({"type": event_type, "ts": time.time(), **payload})
+        except Exception:
+            log.exception("event hook failed")
     bus = _bus
     if bus is not None:
         bus.publish(event_type, **payload)
