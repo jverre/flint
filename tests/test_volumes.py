@@ -23,6 +23,21 @@ def volume(_ensure_daemon):
 
 
 @pytest.fixture
+def make_volume(_ensure_daemon):
+    """Create volumes on demand; all are deleted after the test (after its sandboxes are killed)."""
+    created: list[Volume] = []
+
+    def make(create=lambda name: Volume.create(name)) -> Volume:
+        vol = create(f"test-{uuid.uuid4().hex[:8]}")
+        created.append(vol)
+        return vol
+
+    yield make
+    for vol in reversed(created):
+        vol.delete()
+
+
+@pytest.fixture
 def make_sandbox(require_sandbox):
     """Create sandboxes on demand; all are killed (releasing their mounts) after the test."""
     created: list[Sandbox] = []
@@ -166,3 +181,44 @@ def test_mounts_are_private_to_their_sandbox(volume, make_sandbox):
     late = make_sandbox()
     late.mount(volume, "/r", subpath="sub", readonly=True)
     assert "etc" not in sh(late, "ls /r").split(), "symlinked subpath resolved outside the volume"
+
+
+def test_snapshot_is_a_frozen_read_only_copy(make_volume, make_sandbox):
+    """A snapshot taken while a sandbox is writing keeps the data as it was then, read-only."""
+    vol = make_volume()
+    assert vol.kind == "image", "this host should serve image volumes (is the nbd module available?)"
+    writer, reader = make_sandbox(), make_sandbox()
+    writer.mount(vol, "/w")
+    sh(writer, "echo v1 > /w/state && sync")
+    snap = make_volume(lambda name: vol.snapshot(name))
+    sh(writer, "echo v2 > /w/state")
+
+    assert snap.readonly and snap.kind == "image"
+    reader.mount(snap, "/snap", readonly=True)
+    assert sh(reader, "cat /snap/state").strip() == "v1"
+    assert sh(writer, "cat /w/state").strip() == "v2"
+    err = mount_error(reader, snap, "/rw")
+    assert err.response.status_code == 400, "a snapshot can't be mounted read-write"
+
+
+def test_fork_is_independent(make_volume, make_sandbox):
+    vol = make_volume()
+    a, b = make_sandbox(), make_sandbox()
+    a.mount(vol, "/v")
+    sh(a, "echo base > /v/f")
+    fork = make_volume(lambda name: vol.fork(name))
+    assert fork.kind == "image" and not fork.readonly
+    b.mount(fork, "/v")
+    sh(b, "echo fork >> /v/f")
+    sh(a, "echo orig >> /v/f")
+    assert sh(b, "cat /v/f").split() == ["base", "fork"]
+    assert sh(a, "cat /v/f").split() == ["base", "orig"]
+
+
+def test_volume_size_is_what_the_sandbox_sees(make_volume, make_sandbox):
+    vol = make_volume(lambda name: Volume.create(name, size_gib=2))
+    assert vol.size_gib == 2
+    sb = make_sandbox()
+    sb.mount(vol, "/v")
+    total_kib = int(sh(sb, "df -P -k /v | tail -1").split()[1])
+    assert 1.8 * 2**20 < total_kib <= 2 * 2**20, f"df reports {total_kib} KiB for a 2 GiB volume"

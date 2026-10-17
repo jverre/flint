@@ -10,16 +10,25 @@ See the [Volumes SDK guide](/sdk/volumes) for the model: one writer per subtree,
 `POST /volumes`
 
 ```json
-{"name": "results"}
+{"name": "results", "size_gib": 10}
 ```
+
+`size_gib` is optional (default 10; sparse).
 
 **Response** `200`
 
 ```json
-{"volume": {"id": "vol-3f2a9c1b7e44", "name": "results", "created_at": 1792241938.57}}
+{"volume": {"id": "vol-3f2a9c1b7e44", "name": "results", "created_at": 1792241938.57,
+            "kind": "image", "size_gib": 10, "readonly": false, "source": null}}
 ```
 
-`400` for an invalid name (1-63 letters, digits, `.`, `_`, `-`), `409` if the name exists.
+`400` for an invalid name (1-63 letters, digits, `.`, `_`, `-`) or size, `409` if the name exists. `kind` is `image` (a block image: sized, copyable) or `dir` (a plain directory, on hosts without NBD).
+
+## Snapshot or fork a volume
+
+`POST /volumes/{id or name}/snapshot` and `POST /volumes/{id or name}/fork`, body `{"name": "results-v1"}`.
+
+A snapshot is a new read-only volume holding the data as it is now; a fork is a new writable one. Both are cheap (they share blocks with the source), work while the source is mounted and being written, and return the new volume. `400` for a `dir` volume.
 
 ## List volumes
 
@@ -55,6 +64,7 @@ See the [Volumes SDK guide](/sdk/volumes) for the model: one writer per subtree,
 
 | Status | Meaning |
 |--------|---------|
+| `400` | Read-write mount of a read-only snapshot |
 | `404` | Volume not found |
 | `409` | Sandbox not running, `path` already in use, or another sandbox holds an overlapping read-write mount |
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/memfs"
@@ -57,6 +58,16 @@ func (h *nfsHandler) Change(fs billy.Filesystem) billy.Change {
 
 // FSStat fills in filesystem statistics.
 func (h *nfsHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.FSStat) error {
+	// A volume reports its real filesystem (an image volume's own size).
+	if v, ok := fs.(*volumeFS); ok {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(v.mount.Dir, &st); err == nil {
+			bs := uint64(st.Bsize)
+			stat.TotalSize, stat.FreeSize, stat.AvailableSize = st.Blocks*bs, st.Bfree*bs, st.Bavail*bs
+			stat.TotalFiles, stat.FreeFiles, stat.AvailableFiles = st.Files, st.Ffree, st.Ffree
+			return nil
+		}
+	}
 	stat.TotalSize = 1 << 40 // 1 TB virtual
 	stat.FreeSize = 1 << 40
 	stat.AvailableSize = 1 << 40

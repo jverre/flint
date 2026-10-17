@@ -17,7 +17,7 @@ func testMgmtHandler(t *testing.T) (http.Handler, *ExportManager) {
 		t.Fatal(err)
 	}
 	exports := newExportManager(mock, cache)
-	return newMgmtHandler(exports, newVolumeManager("")), exports
+	return newMgmtHandler(exports, newVolumeManager(""), nil), exports
 }
 
 // ---------------------------------------------------------------------------
