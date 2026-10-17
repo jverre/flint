@@ -135,7 +135,7 @@ func Attach(conn FileConn, devPath, export string, timeout time.Duration) (*Devi
 		select {
 		case err := <-d.done:
 			d.close()
-			return nil, fmt.Errorf("%s: device stopped while starting: %v", devPath, err)
+			return nil, fmt.Errorf("%s: device stopped while starting: %w", devPath, err)
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -168,6 +168,38 @@ func (d *Device) ioctl(req, arg uintptr) error {
 		return errno
 	}
 	return nil
+}
+
+// AttachFree attaches export to the first free NBD device that takes it,
+// skipping inUse. A device that was just detached can still be busy in the
+// kernel for a moment, so on EBUSY it moves on to the next one, with a new
+// connection from dial (each attempt consumes one).
+func AttachFree(dial func() (FileConn, error), export string, timeout time.Duration, inUse map[string]bool) (*Device, FileConn, error) {
+	skip := map[string]bool{}
+	for dev := range inUse {
+		skip[dev] = true
+	}
+	for attempt := 0; ; attempt++ {
+		dev, err := FreeDevice(skip)
+		if err != nil {
+			return nil, nil, err
+		}
+		conn, err := dial()
+		if err != nil {
+			return nil, nil, err
+		}
+		d, err := Attach(conn, dev, export, timeout)
+		if err == nil {
+			return d, conn, nil
+		}
+		if c, ok := conn.(io.Closer); ok {
+			c.Close()
+		}
+		if !errors.Is(err, syscall.EBUSY) || attempt == 15 {
+			return nil, nil, err
+		}
+		skip[dev] = true
+	}
 }
 
 // FreeDevice returns an NBD device nobody is attached to, skipping inUse.

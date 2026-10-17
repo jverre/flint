@@ -419,37 +419,36 @@ func (m *ImageManager) attachLocked(img *blockstore.Image, readOnly bool) (*atta
 	for _, a := range m.attached {
 		inUse[a.dev] = true
 	}
-	dev, err := nbd.FreeDevice(inUse)
-	if err != nil {
-		return nil, err
-	}
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	serverConn, err := fileConn(fds[0])
-	if err != nil {
-		syscall.Close(fds[1])
-		return nil, err
-	}
-	clientConn, err := fileConn(fds[1])
-	if err != nil {
-		serverConn.Close()
-		return nil, err
-	}
 	export := &nbd.Export{Backend: img, ReadOnly: readOnly}
-	go func() {
-		if err := nbd.Serve(serverConn, func(string) (*nbd.Export, error) { return export, nil }); err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Printf("NBD server for %s: %v", dev, err)
+	// Each attempt gets a socket pair: our end serves the image, the other
+	// goes to the kernel.
+	dial := func() (nbd.FileConn, error) {
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
 		}
-	}()
-	device, err := nbd.Attach(clientConn.(*net.UnixConn), dev, "default", 0)
+		serverConn, err := fileConn(fds[0])
+		if err != nil {
+			syscall.Close(fds[1])
+			return nil, err
+		}
+		clientConn, err := fileConn(fds[1])
+		if err != nil {
+			serverConn.Close()
+			return nil, err
+		}
+		go func() {
+			if err := nbd.Serve(serverConn, func(string) (*nbd.Export, error) { return export, nil }); err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("NBD server: %v", err)
+			}
+		}()
+		return clientConn.(*net.UnixConn), nil
+	}
+	device, conn, err := nbd.AttachFree(dial, "default", 0, inUse)
 	if err != nil {
-		clientConn.Close()
-		serverConn.Close()
 		return nil, err
 	}
-	return &attachment{img: img, dev: dev, device: device, conn: clientConn}, nil
+	return &attachment{img: img, dev: device.Path, device: device, conn: conn.(net.Conn)}, nil
 }
 
 func (m *ImageManager) detach(a *attachment) {

@@ -48,24 +48,24 @@ func handleDiskAttach(w http.ResponseWriter, r *http.Request) {
 	for dev := range disks {
 		inUse[dev] = true
 	}
-	dev, err := nbd.FreeDevice(inUse)
-	if err != nil {
+	if _, err := nbd.FreeDevice(inUse); err != nil {
 		jsonError(w, http.StatusConflict, err.Error()+" (is the guest kernel built with CONFIG_BLK_DEV_NBD?)")
 		return
 	}
-	conn, err := net.DialTimeout("tcp", req.Address, 10*time.Second)
+	dial := func() (nbd.FileConn, error) {
+		conn, err := net.DialTimeout("tcp", req.Address, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*net.TCPConn), nil
+	}
+	device, conn, err := nbd.AttachFree(dial, req.Export, nbdTimeout, inUse)
 	if err != nil {
 		jsonError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	device, err := nbd.Attach(conn.(*net.TCPConn), dev, req.Export, nbdTimeout)
-	if err != nil {
-		conn.Close()
-		jsonError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	disks[dev] = &attachedDisk{device: device, conn: conn}
-	writeJSON(w, map[string]string{"device": dev})
+	disks[device.Path] = &attachedDisk{device: device, conn: conn.(net.Conn)}
+	writeJSON(w, map[string]string{"device": device.Path})
 }
 
 func handleDiskDetach(w http.ResponseWriter, r *http.Request) {
