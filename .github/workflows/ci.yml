@@ -16,10 +16,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
-      - name: Resolve dependencies
+          go-version-file: services/r2nfs/go.mod
+          cache-dependency-path: services/r2nfs/go.sum
+      - name: Download dependencies
         working-directory: services/r2nfs
-        run: go get ./... && go mod tidy
+        run: go mod download
       - name: Build
         working-directory: services/r2nfs
         run: go build -o r2nfs .
@@ -84,7 +85,7 @@ jobs:
         run: uv sync --dev
       - name: Build r2nfs
         working-directory: services/r2nfs
-        run: go get ./... && go mod tidy && go build -o r2nfs .
+        run: go build -o r2nfs .
       - name: Enable KVM access
         run: |
           echo "enable-kvm:start" >> /tmp/step-markers
@@ -117,10 +118,12 @@ jobs:
           echo "install-ch-kernel:start" >> /tmp/step-markers
           set -euxo pipefail
           sudo mkdir -p /root/firecracker-vm
-          ARCH="$(uname -m)"
+          # CH needs a PVH-bootable kernel with virtio-pci; the Firecracker
+          # quickstart kernel has neither, so use CH's own build.
+          KERNEL_TAG="ch-release-v7.2.8-20261009"
           sudo curl -fsSL \
             -o /root/firecracker-vm/vmlinux \
-            "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${ARCH}/kernels/vmlinux.bin"
+            "https://github.com/cloud-hypervisor/linux/releases/download/${KERNEL_TAG}/vmlinux-x86_64"
           sudo ls -la /root/firecracker-vm/vmlinux
           echo "install-ch-kernel:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs
@@ -234,7 +237,7 @@ jobs:
         run: uv sync --dev
       - name: Build r2nfs
         working-directory: services/r2nfs
-        run: go get ./... && go mod tidy && go build -o r2nfs .
+        run: go build -o r2nfs .
       - name: Enable KVM access
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules

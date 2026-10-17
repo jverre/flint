@@ -255,7 +255,10 @@ def ch_teardown(
 def ch_pause_vm(socket_path: str, vm_dir: str) -> str:
     """Pause + snapshot a running CH VM to ``<vm_dir>/pause/``. Returns the pause dir."""
     pause_dir = os.path.join(vm_dir, "pause")
-    os.makedirs(pause_dir, exist_ok=True)
+    # CH refuses to overwrite snapshot files, and any left over from an earlier
+    # pause/resume cycle are stale once the VM has resumed.
+    shutil.rmtree(pause_dir, ignore_errors=True)
+    os.makedirs(pause_dir)
     _ch.vm_pause(socket_path)
     try:
         _ch.vm_snapshot(socket_path, f"file://{pause_dir}")
