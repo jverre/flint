@@ -37,12 +37,16 @@ export GOTOOLCHAIN=local GOPATH=/opt/flint/go GOCACHE=/opt/flint/go-cache
 
 log "source ${REPO}@${REF}"
 if [ -d "$SRC/.git" ]; then
-  git -C "$SRC" fetch -q --depth 1 origin "$REF"
+  git -C "$SRC" fetch -q --depth 1 origin "$REF" || { echo "fetching $REF failed" >&2; exit 1; }
   git -C "$SRC" checkout -q FETCH_HEAD
 else
   mkdir -p "$(dirname "$SRC")"
-  git clone -q --depth 1 --branch "$REF" "$REPO" "$SRC" 2>/dev/null \
-    || { git clone -q "$REPO" "$SRC" && git -C "$SRC" checkout -q "$REF"; }
+  # A branch or tag clones shallow; a commit SHA needs the full history.
+  if ! git clone -q --depth 1 --branch "$REF" "$REPO" "$SRC" 2>/dev/null; then
+    rm -rf "$SRC"
+    git clone -q "$REPO" "$SRC" || { echo "cloning $REPO failed" >&2; exit 1; }
+    git -C "$SRC" checkout -q "$REF" || { echo "no ref $REF in $REPO" >&2; exit 1; }
+  fi
 fi
 
 log "flint-cluster"
