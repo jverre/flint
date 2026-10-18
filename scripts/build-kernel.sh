@@ -4,7 +4,10 @@
 #
 #   scripts/build-kernel.sh [OUTPUT]     (default: ./vmlinux)
 #
-# Env: KERNEL_VERSION (default 6.1.141), FC_CI_VERSION (default v1.13),
+# Env: KERNEL_VERSION (default 6.1.190), FC_CI_VERSION (default v1.13),
+#      FC_CONFIG_VERSION (kernel version of the Firecracker CI config to
+#      start from, default 6.1.141; Firecracker doesn't publish one per
+#      stable release, olddefconfig carries it forward),
 #      BUILD_DIR (default: a temp dir), JOBS (default: nproc).
 # Needs: gcc make flex bison bc libelf-dev libssl-dev.
 #
@@ -15,8 +18,9 @@
 # then bump KERNEL_RELEASE in scripts/install-deps.sh and src/flint/core/_install.py.
 set -euo pipefail
 
-KERNEL_VERSION="${KERNEL_VERSION:-6.1.141}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.1.190}"
 FC_CI_VERSION="${FC_CI_VERSION:-v1.13}"
+FC_CONFIG_VERSION="${FC_CONFIG_VERSION:-6.1.141}"
 OUTPUT="$(realpath -m "${1:-vmlinux}")"
 FRAGMENT="$(cd "$(dirname "$0")/.." && pwd)/assets/kernel/flint.config"
 BUILD_DIR="${BUILD_DIR:-$(mktemp -d)}"
@@ -28,7 +32,7 @@ if [ ! -d "linux-$KERNEL_VERSION" ]; then
 fi
 cd "linux-$KERNEL_VERSION"
 curl -fsSL -o .config \
-  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$FC_CI_VERSION/$ARCH_DIR/vmlinux-$KERNEL_VERSION.config"
+  "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$FC_CI_VERSION/$ARCH_DIR/vmlinux-$FC_CONFIG_VERSION.config"
 scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
 make olddefconfig >/dev/null
 
@@ -41,4 +45,4 @@ done < "$FRAGMENT"
 
 make -j"${JOBS:-$(nproc)}" vmlinux
 install -m 644 vmlinux "$OUTPUT"
-echo "Built $OUTPUT ($KERNEL_VERSION, Firecracker CI $FC_CI_VERSION config + flint.config)"
+echo "Built $OUTPUT ($KERNEL_VERSION, Firecracker CI $FC_CI_VERSION $FC_CONFIG_VERSION config + flint.config)"
