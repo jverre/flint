@@ -32,10 +32,14 @@ type Manifest struct {
 	Size     int64    `json:"size"`
 	Layers   []string `json:"layers"`
 	ReadOnly bool     `json:"readonly,omitempty"`
+	// GuestWritten records that a sandbox has had the raw image, so its
+	// filesystem is untrusted: only guests may mount it, never the host
+	// kernel. Copies inherit it.
+	GuestWritten bool `json:"guest_written,omitempty"`
 }
 
 type layer struct {
-	ChunkSize int64            `json:"chunk_size"`
+	ChunkSize int64             `json:"chunk_size"`
 	Chunks    map[string]string `json:"chunks"` // chunk index -> chunk key, or zeroChunk
 }
 
@@ -336,6 +340,22 @@ func (img *Image) copyManifest() Manifest {
 	m := img.manifest
 	m.Layers = append([]string(nil), m.Layers...)
 	return m
+}
+
+// MarkGuestWritten persistently records that a sandbox writes the raw image.
+func (img *Image) MarkGuestWritten() error {
+	img.mu.Lock()
+	defer img.mu.Unlock()
+	if img.manifest.GuestWritten {
+		return nil
+	}
+	next := img.manifest
+	next.GuestWritten = true
+	if err := writeJSON(filepath.Join(img.dir, manifestFile), next); err != nil {
+		return err
+	}
+	img.manifest = next
+	return nil
 }
 
 // Close syncs and closes the image.

@@ -64,8 +64,8 @@ def ensure_running() -> None:
     """Adopt the running server if it serves what this daemon needs, else (re)start it."""
     want_r2 = config.STORAGE_BACKEND == "r2"
     current = health()
-    # "images" is missing from servers built before image-backed volumes.
-    if current and current.get("volumes_dir") == VOLUMES_DIR and current.get("r2") == want_r2 and "images" in current:
+    # "nbd" is missing from servers built before exclusive volumes.
+    if current and current.get("volumes_dir") == VOLUMES_DIR and current.get("r2") == want_r2 and "nbd" in current:
         return
     if current:
         log.info("Replacing NFS server (volumes_dir=%s r2=%s; want %s r2=%s)",
@@ -90,6 +90,8 @@ def ensure_running() -> None:
         f"--mgmt=127.0.0.1:{config.R2NFS_MGMT_PORT}",
         f"--volumes-dir={VOLUMES_DIR}",
         f"--images-dir={IMAGES_DIR}",
+        f"--nbd-listen={config.BRIDGE_IP}:{config.NBD_PORT}",
+        f"--nbd-ro-listen={config.BRIDGE_IP}:{config.NBD_RO_PORT}",
     ]
     env = os.environ.copy()
     if want_r2:
@@ -164,8 +166,21 @@ def mount_image(image_id: str) -> None:
     _mgmt("POST", f"/images/{image_id}/mount", timeout=120)
 
 
+def unmount_image(image_id: str) -> None:
+    _mgmt("DELETE", f"/images/{image_id}/mount", timeout=60)
+
+
 def delete_image(image_id: str) -> None:
     _mgmt("DELETE", f"/images/{image_id}", timeout=60)
+
+
+def export_image(name: str, image_id: str, client_ip: str, readonly: bool) -> None:
+    """Let ``client_ip`` attach the image over NBD as export ``name``. Idempotent."""
+    _mgmt("PUT", f"/nbd/{name}", {"image": image_id, "client_ip": client_ip, "readonly": readonly})
+
+
+def unexport_image(name: str) -> None:
+    _mgmt("DELETE", f"/nbd/{name}")
 
 
 # ── R2 workspaces ────────────────────────────────────────────────────────

@@ -156,3 +156,7 @@ R2_CACHE_DIR = os.environ.get("FLINT_R2_CACHE_DIR", os.path.join(STATE_DIR, "r2-
 R2_CACHE_SIZE_MB = int(os.environ.get("FLINT_R2_CACHE_SIZE_MB", "1024"))
 R2NFS_PORT = int(os.environ.get("FLINT_R2NFS_PORT", "2049"))
 R2NFS_MGMT_PORT = int(os.environ.get("FLINT_R2NFS_MGMT_PORT", "9200"))
+# Sandboxes attach exclusive volumes (read-write) and snapshots of them
+# (read-only) over NBD from the same server.
+NBD_PORT = int(os.environ.get("FLINT_NBD_PORT", "10809"))
+NBD_RO_PORT = int(os.environ.get("FLINT_NBD_RO_PORT", "10810"))

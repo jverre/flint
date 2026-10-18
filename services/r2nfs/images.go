@@ -12,33 +12,59 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/jverre/flint/services/r2nfs/blockstore"
-	"github.com/pojntfx/go-nbd/pkg/client"
-	"github.com/pojntfx/go-nbd/pkg/server"
+	"github.com/jverre/flint/services/r2nfs/nbd"
 	"golang.org/x/sys/unix"
 )
 
-// ImageManager serves block images (blockstore) to the host as NBD devices
-// and mounts their filesystems where volumes are served from, so an
-// image-backed volume is shared exactly like a directory volume.
+// ImageManager serves block images (blockstore) two ways:
+//
+//   - Mounted on the host (shared volumes): attached to a host NBD device and
+//     mounted where volumes are served from, so an image-backed volume is
+//     shared over NFS exactly like a directory volume.
+//   - Exported to a sandbox (exclusive volumes, and read-only snapshots of
+//     them): served over NBD on the bridge to the one client IP allowed to
+//     attach it, whose own kernel mounts the filesystem.
+//
+// An image a sandbox has written is marked guest-written and the host never
+// mounts it again: its filesystem is untrusted input for the host kernel.
 type ImageManager struct {
 	dir        string // image directories: dir/<id>
 	store      blockstore.Store
 	volumesDir string // image <id> is mounted at volumesDir/<id>
 
+	servingNBD atomic.Bool // sandboxes can attach exports
+
 	mu       sync.Mutex
-	attached map[string]*attachment
+	attached map[string]*attachment  // host-mounted images, by image id
+	exported map[string]*sharedImage // images open for exports, by image id
+	exports  map[string]*nbdExport   // by export name
+}
+
+// sharedImage is an image opened once for all its exports.
+type sharedImage struct {
+	img  *blockstore.Image
+	refs int
+}
+
+// nbdExport lets one client IP attach one image. Revoking it makes the
+// image unreachable through connections already open.
+type nbdExport struct {
+	name, imageID, clientIP string
+	readOnly                bool
+	revoked                 atomic.Bool
 }
 
 type attachment struct {
-	img     *blockstore.Image
-	dev     string
-	devFile *os.File
-	done    chan error // client.Connect's result: the device was disconnected
+	img    *blockstore.Image
+	dev    string
+	device *nbd.Device
+	conn   net.Conn // our end of the socket the kernel serves the device over
 }
 
 func newImageManager(dir, volumesDir string, remote blockstore.Remote) (*ImageManager, error) {
@@ -55,7 +81,10 @@ func newImageManager(dir, volumesDir string, remote blockstore.Remote) (*ImageMa
 	if remote != nil {
 		store = &blockstore.TieredStore{Local: local, Remote: prefixedRemote{"blocks/", remote}}
 	}
-	m := &ImageManager{dir: dir, store: store, volumesDir: volumesDir, attached: map[string]*attachment{}}
+	m := &ImageManager{
+		dir: dir, store: store, volumesDir: volumesDir,
+		attached: map[string]*attachment{}, exported: map[string]*sharedImage{}, exports: map[string]*nbdExport{},
+	}
 	go m.flushLoop()
 	return m, nil
 }
@@ -100,7 +129,7 @@ func (p prefixedRemote) PutObject(ctx context.Context, key string, data []byte) 
 	return p.r.PutObject(ctx, p.prefix+key, data)
 }
 
-func (m *ImageManager) imageDir(id string) string { return filepath.Join(m.dir, id) }
+func (m *ImageManager) imageDir(id string) string  { return filepath.Join(m.dir, id) }
 func (m *ImageManager) mountPath(id string) string { return filepath.Join(m.volumesDir, id) }
 
 // Create makes image id: empty and size bytes, or a copy of image from
@@ -114,7 +143,7 @@ func (m *ImageManager) Create(id string, size int64, from string, readOnly bool)
 		if err != nil {
 			return err
 		}
-		manifest.Size, manifest.Layers = src.Size, src.Layers
+		manifest.Size, manifest.Layers, manifest.GuestWritten = src.Size, src.Layers, src.GuestWritten
 	}
 	img, err := blockstore.Create(m.imageDir(id), m.store, manifest)
 	if err != nil {
@@ -124,8 +153,13 @@ func (m *ImageManager) Create(id string, size int64, from string, readOnly bool)
 }
 
 // snapshotLocked snapshots image id, freezing its filesystem while it does
-// if the image is mounted, and returns the resulting manifest.
+// if the image is mounted on the host, and returns the resulting manifest.
+// An image exported to a sandbox is snapshotted through its open instance;
+// the caller freezes the sandbox's filesystem first.
 func (m *ImageManager) snapshotLocked(id string) (blockstore.Manifest, error) {
+	if sh := m.exported[id]; sh != nil {
+		return sh.img.Snapshot()
+	}
 	if a := m.attached[id]; a != nil && !a.img.Manifest().ReadOnly {
 		thaw, err := freeze(m.mountPath(id))
 		if err != nil {
@@ -151,6 +185,9 @@ func (m *ImageManager) Mount(id string) error {
 	if m.attached[id] != nil {
 		return nil
 	}
+	if m.exported[id] != nil {
+		return fmt.Errorf("image %s is attached to a sandbox", id)
+	}
 	path := m.mountPath(id)
 	// A mount left by a previous run of this server is dead: its device went
 	// with the process.
@@ -160,6 +197,10 @@ func (m *ImageManager) Mount(id string) error {
 	img, err := blockstore.Open(m.imageDir(id), m.store)
 	if err != nil {
 		return err
+	}
+	if img.Manifest().GuestWritten {
+		img.Close()
+		return fmt.Errorf("image %s has been written by a sandbox; the host won't mount it", id)
 	}
 	readOnly := img.Manifest().ReadOnly
 	a, err := m.attachLocked(img, readOnly)
@@ -211,8 +252,159 @@ func (m *ImageManager) Unmount(id string) {
 // Delete removes image id (unmounting it first). Its chunks stay in the
 // store; other images may share them.
 func (m *ImageManager) Delete(id string) error {
+	m.mu.Lock()
+	exported := m.exported[id] != nil
+	m.mu.Unlock()
+	if exported {
+		return fmt.Errorf("image %s is attached to a sandbox", id)
+	}
 	m.Unmount(id)
 	return os.RemoveAll(m.imageDir(id))
+}
+
+// Export lets clientIP attach image imageID over NBD as export name. A
+// read-write export is exclusive, and its first connection marks the image
+// guest-written;
+// read-only exports are only of read-only images (snapshots), and any
+// number may coexist. Exporting the same name again with the same
+// parameters is a no-op, so the daemon can replay after a restart.
+func (m *ImageManager) Export(name, imageID, clientIP string, readOnly bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e := m.exports[name]; e != nil {
+		if e.imageID == imageID && e.clientIP == clientIP && e.readOnly == readOnly {
+			return nil
+		}
+		return fmt.Errorf("export %s exists for another image or client", name)
+	}
+	if m.attached[imageID] != nil {
+		return fmt.Errorf("image %s is mounted on the host; unmount it first", imageID)
+	}
+	for _, e := range m.exports {
+		if e.imageID == imageID && (!readOnly || !e.readOnly) {
+			return fmt.Errorf("image %s is attached read-write to another sandbox", imageID)
+		}
+	}
+	sh := m.exported[imageID]
+	if sh == nil {
+		img, err := blockstore.Open(m.imageDir(imageID), m.store)
+		if err != nil {
+			return err
+		}
+		sh = &sharedImage{img: img}
+	}
+	manifest := sh.img.Manifest()
+	var err error
+	switch {
+	case readOnly && !manifest.ReadOnly:
+		err = fmt.Errorf("only read-only images (snapshots) can be attached read-only")
+	case !readOnly && manifest.ReadOnly:
+		err = fmt.Errorf("image %s is read-only", imageID)
+	}
+	if err != nil {
+		if sh.refs == 0 {
+			sh.img.Close()
+		}
+		return err
+	}
+	sh.refs++
+	m.exported[imageID] = sh
+	m.exports[name] = &nbdExport{name: name, imageID: imageID, clientIP: clientIP, readOnly: readOnly}
+	log.Printf("Exported image %s as %s to %s (readonly=%v)", imageID, name, clientIP, readOnly)
+	return nil
+}
+
+// Unexport revokes an export and closes its image when no export uses it.
+func (m *ImageManager) Unexport(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.exports[name]
+	if e == nil {
+		return
+	}
+	e.revoked.Store(true)
+	delete(m.exports, name)
+	if sh := m.exported[e.imageID]; sh != nil {
+		if sh.refs--; sh.refs == 0 {
+			delete(m.exported, e.imageID)
+			if err := sh.img.Close(); err != nil {
+				log.Printf("closing image %s: %v", e.imageID, err)
+			}
+		}
+	}
+	log.Printf("Unexported %s", name)
+}
+
+// ServeNBD accepts sandboxes' NBD connections on l. Each client can attach
+// only the exports registered for its IP with this listener's mode.
+func (m *ImageManager) ServeNBD(l net.Listener, readOnly bool) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			// Notices sandboxes that died without hanging up.
+			tcp.SetKeepAlive(true)
+			tcp.SetKeepAlivePeriod(30 * time.Second)
+		}
+		clientIP := extractIP(conn.RemoteAddr())
+		go func() {
+			if err := nbd.Serve(conn, m.lookup(clientIP, readOnly)); err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("NBD client %s: %v", clientIP, err)
+			}
+		}()
+	}
+}
+
+func (m *ImageManager) lookup(clientIP string, readOnly bool) nbd.Lookup {
+	return func(name string) (*nbd.Export, error) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		e := m.exports[name]
+		if e == nil || e.clientIP != clientIP || e.readOnly != readOnly {
+			return nil, fmt.Errorf("no export %q for %s", name, clientIP)
+		}
+		img := m.exported[e.imageID].img
+		// From the first connection on, the sandbox may write anything.
+		if !readOnly {
+			if err := img.MarkGuestWritten(); err != nil {
+				return nil, err
+			}
+		}
+		return &nbd.Export{Backend: &exportBackend{e: e, img: img}, ReadOnly: readOnly}, nil
+	}
+}
+
+// exportBackend serves an export until it is revoked.
+type exportBackend struct {
+	e   *nbdExport
+	img *blockstore.Image
+}
+
+var errExportRevoked = errors.New("export revoked")
+
+func (b *exportBackend) ReadAt(p []byte, off int64) (int, error) {
+	if b.e.revoked.Load() {
+		return 0, errExportRevoked
+	}
+	return b.img.ReadAt(p, off)
+}
+
+func (b *exportBackend) WriteAt(p []byte, off int64) (int, error) {
+	if b.e.revoked.Load() {
+		return 0, errExportRevoked
+	}
+	return b.img.WriteAt(p, off)
+}
+
+func (b *exportBackend) Size() (int64, error) { return b.img.Size() }
+
+func (b *exportBackend) Sync() error {
+	if b.e.revoked.Load() {
+		return errExportRevoked
+	}
+	return b.img.Sync()
 }
 
 // Count returns the number of mounted images.
@@ -223,93 +415,50 @@ func (m *ImageManager) Count() int {
 }
 
 func (m *ImageManager) attachLocked(img *blockstore.Image, readOnly bool) (*attachment, error) {
-	dev, err := m.freeDeviceLocked()
-	if err != nil {
-		return nil, err
-	}
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	serverConn, err := fileConn(fds[0])
-	if err != nil {
-		syscall.Close(fds[1])
-		return nil, err
-	}
-	clientConn, err := fileConn(fds[1])
-	if err != nil {
-		serverConn.Close()
-		return nil, err
-	}
-	go func() {
-		exports := []*server.Export{{Name: "default", Backend: img}}
-		if err := server.Handle(serverConn, exports, &server.Options{ReadOnly: readOnly}); err != nil && !errors.Is(err, net.ErrClosed) {
-			log.Printf("NBD server for %s: %v", dev, err)
-		}
-		serverConn.Close()
-	}()
-	devFile, err := os.OpenFile(dev, os.O_RDWR, 0)
-	if err != nil {
-		clientConn.Close()
-		serverConn.Close()
-		return nil, err
-	}
-	a := &attachment{img: img, dev: dev, devFile: devFile, done: make(chan error, 1)}
-	ready := make(chan struct{})
-	go func() {
-		a.done <- client.Connect(clientConn.(*net.UnixConn), devFile, &client.Options{
-			BlockSize:   4096,
-			OnConnected: func() { close(ready) },
-		})
-		clientConn.Close()
-	}()
-	select {
-	case <-ready:
-		return a, nil
-	case err := <-a.done:
-		devFile.Close()
-		return nil, fmt.Errorf("attaching %s: %v", dev, err)
-	case <-time.After(10 * time.Second):
-		client.Disconnect(devFile)
-		devFile.Close()
-		return nil, fmt.Errorf("attaching %s: timed out", dev)
-	}
-}
-
-func (m *ImageManager) detach(a *attachment) {
-	client.Disconnect(a.devFile)
-	select {
-	case <-a.done:
-	case <-time.After(5 * time.Second):
-		log.Printf("NBD %s: disconnect timed out", a.dev)
-	}
-	a.devFile.Close()
-	if err := a.img.Close(); err != nil {
-		log.Printf("closing image on %s: %v", a.dev, err)
-	}
-}
-
-// freeDeviceLocked finds an NBD device nobody is connected to.
-func (m *ImageManager) freeDeviceLocked() (string, error) {
 	inUse := map[string]bool{}
 	for _, a := range m.attached {
 		inUse[a.dev] = true
 	}
-	devs, _ := filepath.Glob("/sys/block/nbd*")
-	for _, sys := range devs {
-		dev := "/dev/" + filepath.Base(sys)
-		if inUse[dev] {
-			continue
+	export := &nbd.Export{Backend: img, ReadOnly: readOnly}
+	// Each attempt gets a socket pair: our end serves the image, the other
+	// goes to the kernel.
+	dial := func() (nbd.FileConn, error) {
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
 		}
-		if _, err := os.Stat(filepath.Join(sys, "pid")); err == nil {
-			continue // connected (another process, or a dying attachment)
+		serverConn, err := fileConn(fds[0])
+		if err != nil {
+			syscall.Close(fds[1])
+			return nil, err
 		}
-		if size, err := os.ReadFile(filepath.Join(sys, "size")); err == nil && strings.TrimSpace(string(size)) != "0" {
-			continue
+		clientConn, err := fileConn(fds[1])
+		if err != nil {
+			serverConn.Close()
+			return nil, err
 		}
-		return dev, nil
+		go func() {
+			if err := nbd.Serve(serverConn, func(string) (*nbd.Export, error) { return export, nil }); err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("NBD server: %v", err)
+			}
+		}()
+		return clientConn.(*net.UnixConn), nil
 	}
-	return "", errors.New("no free NBD device")
+	device, conn, err := nbd.AttachFree(dial, "default", 0, inUse)
+	if err != nil {
+		return nil, err
+	}
+	return &attachment{img: img, dev: device.Path, device: device, conn: conn.(net.Conn)}, nil
+}
+
+func (m *ImageManager) detach(a *attachment) {
+	if err := a.device.Disconnect(); err != nil {
+		log.Printf("NBD %s: %v", a.dev, err)
+	}
+	a.conn.Close()
+	if err := a.img.Close(); err != nil {
+		log.Printf("closing image on %s: %v", a.dev, err)
+	}
 }
 
 func fileConn(fd int) (net.Conn, error) {

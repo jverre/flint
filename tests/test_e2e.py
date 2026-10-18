@@ -323,6 +323,12 @@ def test_template_build_and_run(backend_kind):
         sandbox.kill()
 
 
+def test_localhost_works_in_the_sandbox(sandbox):
+    """Programs can serve and connect on 127.0.0.1 (the guest agent listens on all addresses)."""
+    result = sandbox.commands.run("wget -q -T 5 -O - http://127.0.0.1:5000/health")
+    assert result.exit_code == 0, f"loopback unreachable: {result.stdout}{result.stderr}"
+
+
 # ── Network policy ─────────────────────────────────────────────────────────
 
 

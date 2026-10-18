@@ -256,10 +256,12 @@ def volumes_delete(volume):
 @click.argument("path")
 @click.option("--subpath", default="", help="Mount only this directory of the volume")
 @click.option("--readonly", "--ro", is_flag=True, default=False, help="Mount read-only")
-def volumes_mount(vm_id, volume, path, subpath, readonly):
+@click.option("--exclusive", is_flag=True, default=False, help="Mount as this sandbox's own disk (fast; nobody else can mount it)")
+def volumes_mount(vm_id, volume, path, subpath, readonly, exclusive):
     """Mount VOLUME at PATH inside running sandbox VM_ID."""
-    _volume_call(_daemon_client().mount, vm_id, volume, path, subpath=subpath, readonly=readonly)
-    click.echo(f"Mounted {volume}:/{subpath} at {path} ({'ro' if readonly else 'rw'})")
+    _volume_call(_daemon_client().mount, vm_id, volume, path, subpath=subpath, readonly=readonly, exclusive=exclusive)
+    mode = "exclusive" if exclusive else ("ro" if readonly else "rw")
+    click.echo(f"Mounted {volume}:/{subpath} at {path} ({mode})")
 
 
 @volumes.command("unmount")

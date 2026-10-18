@@ -34,5 +34,11 @@ func newServer() *http.ServeMux {
 	mux.HandleFunc("POST /mount/nfs", handleMountNFS)
 	mux.HandleFunc("DELETE /mount/nfs", handleUnmountNFS)
 
+	// Block devices served by the host over NBD (exclusive volumes)
+	mux.HandleFunc("POST /disks/attach", handleDiskAttach)
+	mux.HandleFunc("POST /disks/detach", handleDiskDetach)
+	mux.HandleFunc("POST /fs/freeze", handleFreeze(true))
+	mux.HandleFunc("POST /fs/thaw", handleFreeze(false))
+
 	return mux
 }

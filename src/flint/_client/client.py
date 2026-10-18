@@ -264,10 +264,11 @@ class DaemonClient:
         _raise_for_status(resp)
         return resp.json()["mounts"]
 
-    def mount(self, vm_id: str, volume: str, path: str, *, subpath: str = "", readonly: bool = False) -> dict:
+    def mount(self, vm_id: str, volume: str, path: str, *, subpath: str = "", readonly: bool = False,
+              exclusive: bool = False) -> dict:
         resp = self._http.post(
             f"/vms/{vm_id}/mounts",
-            json={"volume": volume, "path": path, "subpath": subpath, "readonly": readonly},
+            json={"volume": volume, "path": path, "subpath": subpath, "readonly": readonly, "exclusive": exclusive},
         )
         _raise_for_status(resp)
         return resp.json()["mount"]

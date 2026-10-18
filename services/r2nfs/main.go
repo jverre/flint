@@ -37,6 +37,8 @@ func main() {
 	cacheSizeMB := flag.Int("cache-size-mb", 1024, "Maximum cache size in MB")
 	volumesDir := flag.String("volumes-dir", "", "Host directory holding volumes (enables volume mounts)")
 	imagesDir := flag.String("images-dir", "", "Host directory holding block images (enables image-backed volumes)")
+	nbdListen := flag.String("nbd-listen", "", "Address sandboxes attach read-write images on (NBD)")
+	nbdROListen := flag.String("nbd-ro-listen", "", "Address sandboxes attach read-only images on (NBD)")
 	flag.Parse()
 
 	r2Enabled := *accountID != "" && *accessKey != "" && *secretKey != ""
@@ -72,6 +74,28 @@ func main() {
 		if images, err = newImageManager(*imagesDir, *volumesDir, remote); err != nil {
 			log.Printf("Image-backed volumes disabled: %v", err)
 			images = nil
+		}
+	}
+
+	if images != nil {
+		for _, l := range []struct {
+			addr     string
+			readOnly bool
+		}{{*nbdListen, false}, {*nbdROListen, true}} {
+			if l.addr == "" {
+				continue
+			}
+			ln, err := net.Listen("tcp", l.addr)
+			if err != nil {
+				log.Fatalf("Failed to listen on %s: %v", l.addr, err)
+			}
+			go func(readOnly bool) {
+				if err := images.ServeNBD(ln, readOnly); err != nil {
+					log.Fatalf("NBD listener: %v", err)
+				}
+			}(l.readOnly)
+			images.servingNBD.Store(true)
+			log.Printf("NBD listening on %s (readonly=%v)", l.addr, l.readOnly)
 		}
 	}
 
@@ -197,6 +221,31 @@ func registerImageRoutes(mux *http.ServeMux, images *ImageManager) {
 		images.Unmount(id)
 		writeOK(w)
 	}))
+	// Exports: {id} names the export; the body names the image.
+	mux.HandleFunc("PUT /nbd/{id}", withImage(func(w http.ResponseWriter, r *http.Request, name string) {
+		var req struct {
+			Image    string `json:"image"`
+			ClientIP string `json:"client_ip"`
+			ReadOnly bool   `json:"readonly"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid json"))
+			return
+		}
+		if !isValidID(req.Image) || net.ParseIP(req.ClientIP) == nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("image and client_ip are required"))
+			return
+		}
+		if err := images.Export(name, req.Image, req.ClientIP, req.ReadOnly); err != nil {
+			writeJSONError(w, http.StatusConflict, err)
+			return
+		}
+		writeOK(w)
+	}))
+	mux.HandleFunc("DELETE /nbd/{id}", withImage(func(w http.ResponseWriter, r *http.Request, name string) {
+		images.Unexport(name)
+		writeOK(w)
+	}))
 }
 
 // newMgmtHandler builds the HTTP handler for the management API.
@@ -299,6 +348,7 @@ func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *Vol
 		json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok", "exports": exports.Count(), "mounts": volumes.Count(),
 			"r2": exports.r2 != nil, "volumes_dir": volumes.root, "images": images != nil,
+			"nbd": images != nil && images.servingNBD.Load(),
 		})
 	})
 }

@@ -54,19 +54,20 @@ A snapshot is a new read-only volume holding the data as it is now; a fork is a 
 | `path` | string | required | Absolute mount point in the sandbox (created if missing) |
 | `subpath` | string | `""` | Mount only this directory of the volume (created if missing) |
 | `readonly` | bool | `false` | Read-only mount |
+| `exclusive` | bool | `false` | Give this sandbox the volume as its own disk (image volumes; read-write). Fast, but no other sandbox can mount the volume meanwhile |
 
 **Response** `200`
 
 ```json
 {"mount": {"id": "mnt-…", "volume_id": "vol-3f2a9c1b7e44", "vm_id": "…", "path": "/results",
-           "subpath": "", "readonly": true, "created_at": 1792241990.1}}
+           "subpath": "", "readonly": true, "exclusive": false, "created_at": 1792241990.1}}
 ```
 
 | Status | Meaning |
 |--------|---------|
 | `400` | Read-write mount of a read-only snapshot |
 | `404` | Volume not found |
-| `409` | Sandbox not running, `path` already in use, or another sandbox holds an overlapping read-write mount |
+| `409` | Sandbox not running, `path` already in use, another sandbox holds an overlapping read-write mount, the volume is mounted exclusively elsewhere (or is mounted at all, for an exclusive mount), or the volume has been a sandbox's exclusive disk and this isn't an exclusive mount |
 
 Publishes `volume.attached` on the [events stream](/api-reference/overview).
 

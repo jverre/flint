@@ -408,7 +408,7 @@ def _extract_and_install(tarball: Path, tmpdir: Path, fc_version: str, arch: str
 
 # Flint's guest kernel (scripts/build-kernel.sh): boots on Firecracker and
 # Cloud Hypervisor and has the NFS client volumes need.
-KERNEL_RELEASE = "guest-kernel-6.1.141-flint1"
+KERNEL_RELEASE = "guest-kernel-6.1.141-flint2"
 
 
 def _install_kernel(kernel_release: str, arch: str, kernel_dir: str) -> None:

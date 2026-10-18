@@ -42,7 +42,8 @@ mount -t devtmpfs dev /dev 2>/dev/null
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
 
-# Configure network
+# Configure network (loopback too: programs expect localhost to work)
+ip link set lo up
 ip addr add 172.16.0.2/30 dev eth0
 ip link set eth0 up
 ip route add default via 172.16.0.1

@@ -241,12 +241,13 @@ BLOCKED_EGRESS = (
 def storage_endpoints() -> tuple[tuple[str, str, int], ...]:
     """``(ip, proto, port)`` the guest must reach for storage, despite BLOCKED_EGRESS.
 
-    Always Flint's own NFS server on the bridge (volumes, and R2 workspaces);
-    plus the S3 Files endpoint when that backend is configured.
+    Always Flint's own storage server on the bridge: NFS (shared volumes, R2
+    workspaces) and NBD (exclusive volumes); plus the S3 Files endpoint when
+    that backend is configured.
     """
     from . import config
 
-    endpoints = [(BRIDGE_IP, "tcp", config.R2NFS_PORT)]
+    endpoints = [(BRIDGE_IP, "tcp", port) for port in (config.R2NFS_PORT, config.NBD_PORT, config.NBD_RO_PORT)]
     if config.STORAGE_BACKEND == "s3_files" and config.S3_FILES_NFS_ENDPOINT:
         host = config.S3_FILES_NFS_ENDPOINT.split(":", 1)[0]
         ips = {info[4][0] for info in socket.getaddrinfo(host, 2049, socket.AF_INET, socket.SOCK_STREAM)}
