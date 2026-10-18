@@ -43,13 +43,13 @@ provider and built-in tenant-aware observability in open source.
 
 | # | Component | Status |
 |---|-----------|--------|
-| 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (current daemon) |
+| 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (the daemon; `flint agent` runs it as a cluster host) |
 | 2 | **Guest agent** (`flintd`): exec, PTY, files, processes | Exists |
 | 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Partial, see [01](01-tenant-isolation.md) |
-| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Partial (FastAPI, single host, no auth) |
-| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial (in-memory bus) |
-| 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist |
-| 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Not started |
+| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, tokens and `tenant` exist ([03](03-cluster.md)); no checked-in OpenAPI spec; the single daemon still has no auth |
+| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: the cluster persists tenant-tagged events (`/v1/events`); no export |
+| 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist; Terraform deploys clusters (no workload provider yet) |
+| 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Cordon, drain, migration (snapshot-based) and VM-set rolling updates exist ([03](03-cluster.md)); no health gates, backups or live migration |
 
 ## Phases
 
@@ -82,10 +82,17 @@ Details in [02-api-and-surfaces.md](02-api-and-surfaces.md).
 
 ### Phase 3: cluster
 
-- Split the daemon: host agent (current code) + control plane (Postgres,
-  scheduler, reconcilers). Control plane likely in Go (Terraform provider
-  must be Go anyway; single static binary).
-- Per-tenant networks spanning hosts (WireGuard overlay).
+Details in [03-cluster.md](03-cluster.md).
+
+- Split the daemon: host agent (current code, Python) + control plane
+  (`flint-server`, Go: Postgres, scheduler, host registry, CA, gateway).
+- Portable snapshots (`flint-snapd`): template, pause, checkpoint and fork
+  are one chunked artifact in object storage, restorable on any host.
+- High availability: per-VM availability classes, fencing, recovery,
+  `VMSet` replicas spread across zones, drain by migration.
+- Cloud-agnostic Terraform deployment: cloud-init/systemd package, then thin
+  per-cloud modules.
+- Per-tenant networks spanning hosts (WireGuard overlay), later.
 - Terraform provider (workloads) + admin provider.
 - Web dashboard: fleet → tenant → VM → hosts.
 
@@ -119,7 +126,7 @@ Phase 1, in this order:
    Isolation and security features stay in the open core either way.
 2. **Default Linux hypervisor**: Cloud Hypervisor (long-lived, live migration)
    vs Firecracker (density, fastest starts).
-3. **Control plane language**: keep Python for the host agent; Go for the
-   control plane is the current leaning.
+3. **Control plane language**: decided: Go for the control plane, Python
+   stays for the host agent (see [03](03-cluster.md)).
 4. **Hard vs soft tenancy across hosts**: shared hosts with per-tenant
    networks, or optional dedicated hosts per tenant.

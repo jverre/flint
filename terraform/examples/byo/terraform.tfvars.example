@@ -1,0 +1,10 @@
+servers = [{ address = "10.0.0.10" }]
+hosts = [
+  { address = "10.0.1.11", zone = "rack-1" },
+  { address = "10.0.2.12", zone = "rack-2" },
+]
+ssh_private_key         = "-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+database_url            = "postgres://flint:secret@10.0.0.20:5432/flint?sslmode=require"
+store_url               = "s3://flint-snapshots/prod"
+store_access_key_id     = "AKIA..."
+store_secret_access_key = "..."

@@ -148,13 +148,14 @@ def ch_boot(
     allow_internet_access: bool = True,
     use_pool: bool = True,
     use_pyroute2: bool = True,
+    vm_id: str | None = None,
 ) -> ChBootResult:
     """Start a jailed cloud-hypervisor VM for ``template_id``.
 
     Restores the template's golden snapshot when it has one (~100 ms), else
     boots the kernel from scratch (~500 ms).
     """
-    vm_id = str(uuid.uuid4())
+    vm_id = vm_id or str(uuid.uuid4())
     jail = ChJail(vm_id)
     ns_name = ""  # set once the namespace is acquired
     sid = vm_id[:8]

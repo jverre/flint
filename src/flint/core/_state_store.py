@@ -71,6 +71,8 @@ class StateStore:
             "backend_kind TEXT NOT NULL DEFAULT 'linux-firecracker'",
             "pause_state_ref TEXT",
             "backend_meta_json TEXT",
+            "tenant TEXT NOT NULL DEFAULT ''",
+            "availability TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 self._conn.execute(f"ALTER TABLE sandboxes ADD COLUMN {column_def}")
@@ -100,19 +102,22 @@ class StateStore:
         backend_kind: str = "linux-firecracker",
         pause_state_ref: str | None = None,
         backend_meta_json: dict | None = None,
+        tenant: str = "",
+        availability: str = "",
     ) -> None:
         now = time.time()
         self._conn.execute(
             """INSERT OR REPLACE INTO sandboxes
                (vm_id, pid, vm_dir, socket_path, ns_name, state, template_id,
                 created_at, updated_at, boot_time_ms, timings_json, daemon_pid, chroot_base,
-                backend_kind, pause_state_ref, backend_meta_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                backend_kind, pause_state_ref, backend_meta_json, tenant, availability)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (vm_id, pid, vm_dir, socket_path, ns_name, state.value, template_id,
              now, now, boot_time_ms,
              json.dumps(timings_json) if timings_json else None,
              daemon_pid, chroot_base, backend_kind, pause_state_ref,
-             json.dumps(backend_meta_json) if backend_meta_json else None),
+             json.dumps(backend_meta_json) if backend_meta_json else None,
+             tenant, availability),
         )
         self._conn.execute(
             "INSERT INTO state_log (vm_id, from_state, to_state, timestamp, daemon_pid) VALUES (?, ?, ?, ?, ?)",

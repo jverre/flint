@@ -10,9 +10,12 @@ import pytest
 
 from flint import Sandbox, Volume
 
-from .conftest import TEST_PORT
+from .conftest import AUTH, BASE_URL, TEST_PORT, WS_BASE, api
 
-BASE = f"http://127.0.0.1:{TEST_PORT}"
+# Host-local: inspects one daemon (skipped against a cluster control plane).
+pytestmark = pytest.mark.usefixtures("daemon_only")
+
+BASE = BASE_URL
 
 
 @pytest.fixture
@@ -82,12 +85,12 @@ def test_volume_crud(_ensure_daemon):
     try:
         assert Volume.get(name) == vol
         assert vol in Volume.list()
-        assert httpx.post(f"{BASE}/volumes", json={"name": name}).status_code == 409
-        assert httpx.post(f"{BASE}/volumes", json={"name": "../escape"}).status_code == 400
+        assert api.post(f"{BASE}/volumes", json={"name": name}).status_code == 409
+        assert api.post(f"{BASE}/volumes", json={"name": "../escape"}).status_code == 400
     finally:
         vol.delete()
     assert Volume.get(name) is None
-    assert httpx.delete(f"{BASE}/volumes/{vol.id}").status_code == 404
+    assert api.delete(f"{BASE}/volumes/{vol.id}").status_code == 404
 
 
 def test_children_write_parent_reads_live(volume, make_sandbox):
@@ -149,7 +152,7 @@ def test_kill_releases_mounts(volume, make_sandbox):
     a.kill()
     b.mount(volume, "/w", subpath="job")
     assert sh(b, "cat /w/f").strip() == "partial"
-    assert httpx.delete(f"{BASE}/volumes/{volume.id}").status_code == 409, "can't delete a mounted volume"
+    assert api.delete(f"{BASE}/volumes/{volume.id}").status_code == 409, "can't delete a mounted volume"
 
 
 def test_32_mounts_in_one_sandbox(volume, make_sandbox):

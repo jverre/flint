@@ -1,0 +1,18 @@
+[Unit]
+Description=Flint cluster host agent (flint agent)
+Documentation=https://github.com/jverre/flint/blob/main/plans/03-cluster.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/flint/flint.env
+# First start joins with FLINT_JOIN_TOKEN; flint-snapd.path then starts snapd.
+ExecStart=/usr/local/bin/flint agent
+Restart=always
+RestartSec=2
+# VMs outlive the agent process (it re-attaches to them on restart).
+KillMode=process
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

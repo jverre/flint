@@ -13,6 +13,7 @@ import time
 import httpx
 import pytest
 
+from .conftest import AUTH, BASE_URL, WS_BASE, api
 from flint import Sandbox, Template
 
 
@@ -58,8 +59,7 @@ def test_connect_to_existing(sandbox):
 
 
 def test_health_reports_backend(backend_kind):
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/health", timeout=5.0)
     resp.raise_for_status()
     assert resp.json()["backend_kind"] == backend_kind
 
@@ -251,8 +251,7 @@ def test_multiple_sandboxes(require_sandbox):
 
 def test_health_reports_storage_backend():
     """Health endpoint exposes the active storage backend and its health."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/health", timeout=5.0)
     resp.raise_for_status()
     data = resp.json()
     # storage_backend should always be present (defaults to "local").
@@ -471,9 +470,8 @@ def test_get_vm_details(sandbox):
 def test_file_stat(sandbox):
     """Stat a file and verify metadata is returned."""
     sandbox.write_file("/tmp/stat-test.txt", "hello")
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(
-        f"http://127.0.0.1:{port}/vms/{sandbox.id}/files/stat",
+    resp = api.get(
+        f"{BASE_URL}/vms/{sandbox.id}/files/stat",
         params={"path": "/tmp/stat-test.txt"},
         timeout=10.0,
     )
@@ -484,9 +482,8 @@ def test_file_stat(sandbox):
 
 def test_mkdir(sandbox):
     """Create a nested directory via the mkdir endpoint."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.post(
-        f"http://127.0.0.1:{port}/vms/{sandbox.id}/files/mkdir",
+    resp = api.post(
+        f"{BASE_URL}/vms/{sandbox.id}/files/mkdir",
         params={"path": "/tmp/test-dir/nested", "parents": True},
         timeout=10.0,
     )
@@ -499,9 +496,8 @@ def test_mkdir(sandbox):
 def test_delete_file(sandbox):
     """Write a file, delete it via API, verify it's gone."""
     sandbox.write_file("/tmp/del-test.txt", "to be deleted")
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.delete(
-        f"http://127.0.0.1:{port}/vms/{sandbox.id}/files",
+    resp = api.delete(
+        f"{BASE_URL}/vms/{sandbox.id}/files",
         params={"path": "/tmp/del-test.txt"},
         timeout=10.0,
     )
@@ -531,8 +527,7 @@ def test_write_file_with_mode(sandbox):
 
 def test_list_templates():
     """List templates and verify the default template exists."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(f"http://127.0.0.1:{port}/templates", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/templates", timeout=5.0)
     resp.raise_for_status()
     data = resp.json()
     assert "templates" in data
@@ -543,8 +538,7 @@ def test_list_templates():
 
 def test_get_template_default():
     """Get the default template by ID."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(f"http://127.0.0.1:{port}/templates/default", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/templates/default", timeout=5.0)
     resp.raise_for_status()
     tmpl = resp.json()["template"]
     assert tmpl is not None
@@ -552,9 +546,8 @@ def test_get_template_default():
 
 def test_get_template_not_found():
     """Requesting a nonexistent template returns 404."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(
-        f"http://127.0.0.1:{port}/templates/nonexistent-template-xyz",
+    resp = api.get(
+        f"{BASE_URL}/templates/nonexistent-template-xyz",
         timeout=5.0,
     )
     assert resp.status_code == 404
@@ -565,9 +558,8 @@ def test_get_template_not_found():
 
 def test_list_processes(sandbox):
     """List processes running inside the sandbox."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.get(
-        f"http://127.0.0.1:{port}/vms/{sandbox.id}/processes",
+    resp = api.get(
+        f"{BASE_URL}/vms/{sandbox.id}/processes",
         timeout=10.0,
     )
     # Guest agent may or may not implement this endpoint
@@ -580,9 +572,8 @@ def test_list_processes(sandbox):
 
 def test_create_process(sandbox):
     """Spawn a process inside the sandbox and verify it returns a PID."""
-    port = os.environ["FLINT_PORT"]
-    resp = httpx.post(
-        f"http://127.0.0.1:{port}/vms/{sandbox.id}/processes",
+    resp = api.post(
+        f"{BASE_URL}/vms/{sandbox.id}/processes",
         json={"cmd": ["/bin/sh", "-c", "echo proc_ok"]},
         timeout=10.0,
     )

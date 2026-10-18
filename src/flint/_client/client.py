@@ -6,16 +6,20 @@ from typing import Callable
 import httpx
 import websockets.sync.client as ws_sync
 
-from flint.core.config import DAEMON_URL
+from flint.core.config import API_KEY, DAEMON_URL, TENANT
 
 DEFAULT_URL = DAEMON_URL
+
+
+def auth_headers(api_key: str = API_KEY) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
 class _TerminalConnection:
     """Manages a WebSocket connection to a VM terminal."""
 
-    def __init__(self, ws_url: str, on_output: Callable[[bytes], None]) -> None:
-        self._ws = ws_sync.connect(ws_url)
+    def __init__(self, ws_url: str, on_output: Callable[[bytes], None], headers: dict[str, str] | None = None) -> None:
+        self._ws = ws_sync.connect(ws_url, additional_headers=headers or None)
         self._on_output = on_output
         self._closed = False
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -60,10 +64,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
 
 
 class DaemonClient:
-    def __init__(self, base_url: str = DEFAULT_URL) -> None:
+    def __init__(self, base_url: str = DEFAULT_URL, api_key: str = API_KEY, tenant: str = TENANT) -> None:
         self._base_url = base_url
         self._ws_base_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
-        self._http = httpx.Client(base_url=base_url, timeout=120.0)
+        self._headers = auth_headers(api_key)
+        self._tenant = tenant
+        self._http = httpx.Client(base_url=base_url, timeout=120.0, headers=self._headers)
         self._terminals: dict[str, _TerminalConnection] = {}
 
     def close(self) -> None:
@@ -72,15 +78,16 @@ class DaemonClient:
         self._terminals.clear()
         self._http.close()
 
-    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None) -> dict:
-        body = None
+    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None, tenant: str | None = None, availability: str | None = None) -> dict:
+        body = {}
         if network_policy is not None:
-            body = {"network_policy": network_policy}
-        resp = self._http.post(
-            "/vms",
-            params={"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2},
-            json=body,
-        )
+            body["network_policy"] = network_policy
+        if availability is not None:
+            body["availability"] = availability
+        params = {"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2}
+        if tenant or self._tenant:
+            params["tenant"] = tenant or self._tenant
+        resp = self._http.post("/vms", params=params, json=body or None)
         resp.raise_for_status()
         return resp.json()["vm"]
 
@@ -106,7 +113,7 @@ class DaemonClient:
         if vm_id in self._terminals:
             self.disconnect_terminal(vm_id)
         ws_url = f"{self._ws_base_url}/vms/{vm_id}/terminal"
-        self._terminals[vm_id] = _TerminalConnection(ws_url, on_output)
+        self._terminals[vm_id] = _TerminalConnection(ws_url, on_output, self._headers)
 
     def send_input(self, vm_id: str, data: bytes) -> None:
         conn = self._terminals.get(vm_id)
@@ -183,6 +190,13 @@ class DaemonClient:
         self.disconnect_terminal(vm_id)
         resp = self._http.post(f"/vms/{vm_id}/pause")
         resp.raise_for_status()
+
+    def fork(self, vm_id: str, count: int = 1) -> list[dict]:
+        """Fork a running VM into ``count`` new VMs (cluster control plane only)."""
+        resp = self._http.post(f"/vms/{vm_id}/fork", json={"count": count}, timeout=300.0)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Fork failed ({resp.status_code}): {resp.text}")
+        return resp.json()["vms"]
 
     def resume(self, vm_id: str) -> dict:
         resp = self._http.post(f"/vms/{vm_id}/resume")
@@ -299,7 +313,7 @@ class DaemonClient:
     @staticmethod
     def is_daemon_running(base_url: str = DEFAULT_URL) -> bool:
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=1.0)
+            resp = httpx.get(f"{base_url}/health", timeout=1.0, headers=auth_headers())
             return resp.status_code == 200
         except Exception:
             return False

@@ -1,0 +1,1 @@
+../terraform/modules/flint-cloudinit/files/install.sh

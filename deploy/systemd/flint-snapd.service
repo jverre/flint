@@ -1,0 +1,17 @@
+[Unit]
+Description=Flint host snapshot store, peer server and fence (flint-cluster snapd)
+Documentation=https://github.com/jverre/flint/blob/main/plans/03-cluster.md
+After=network-online.target
+Wants=network-online.target
+# Started by flint-snapd.path once the agent has joined (snapd needs its identity).
+
+[Service]
+EnvironmentFile=/etc/flint/flint.env
+ExecStart=/usr/local/bin/flint-cluster snapd
+# Independent of the agent on purpose: it fences the agent's VMs if the agent
+# hangs, and (with FLINT_WATCHDOG_DEVICE) the host watchdog covers snapd itself.
+Restart=always
+RestartSec=1
+RuntimeDirectory=flint
+RuntimeDirectoryPreserve=yes
+

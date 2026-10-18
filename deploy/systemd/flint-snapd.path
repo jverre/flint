@@ -1,0 +1,9 @@
+[Unit]
+Description=Start Flint snapd once this host has joined a cluster
+
+[Path]
+PathExists=/var/lib/flint/state/cluster/host.json
+Unit=flint-snapd.service
+
+[Install]
+WantedBy=multi-user.target

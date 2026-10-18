@@ -20,6 +20,7 @@ from flint.core.config import (
     WORKSPACE_DIR,
 )
 from flint.core.manager import SandboxManager
+from flint.core.types import SandboxState
 from flint.core._template_registry import (
     list_templates, get_template, delete_template as _delete_template,
 )
@@ -130,41 +131,77 @@ def health():
     if daemon.storage:
         result["storage_backend"] = daemon.storage.kind
         result["storage_healthy"] = daemon.storage.is_running()
+    if daemon.cluster:
+        result["cluster_host_id"] = daemon.cluster.host_id
+        result["host_class"] = daemon.cluster.host_class
     return result
 
 
+def _running_count(mgr: SandboxManager) -> int:
+    with mgr._lock:
+        return sum(1 for e in mgr._sandboxes.values() if e.state != SandboxState.PAUSED)
+
+
 @app.post("/vms")
-async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True):
+async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, tenant: str = ""):
+    """Create a VM. A cluster control plane also passes, in the body:
+    ``vm_id`` (it assigns IDs), ``tenant``, ``availability``, ``snapshot``
+    (restore a paused/checkpointed/forked VM from the snapshot store instead
+    of booting the template) and ``template_snapshot`` (where to fetch a
+    template this host doesn't have yet)."""
     print(f"POST /vms — creating VM (template={template_id}, internet={allow_internet_access})...")
     daemon = _get_daemon()
     mgr = _require_manager()
-    if template_id == DEFAULT_TEMPLATE_ID and not daemon.golden_ready:
-        raise HTTPException(status_code=503, detail="Golden snapshot not ready")
-    # Parse optional network_policy from request body
-    network_policy = None
+    data: dict = {}
     body = await request.body()
     if body:
         try:
-            data = json.loads(body)
+            data = json.loads(body) or {}
         except (json.JSONDecodeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
-        network_policy = data.get("network_policy")
-        if network_policy is not None:
-            _validate_network_policy(network_policy)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    network_policy = data.get("network_policy")
+    if network_policy is not None:
+        _validate_network_policy(network_policy)
+    vm_id = data.get("vm_id") or None
+    tenant = data.get("tenant") or tenant
+    availability = data.get("availability") or ""
+    snapshot = data.get("snapshot")
+    template_snapshot = data.get("template_snapshot")
+    if (vm_id or snapshot or template_snapshot) and not daemon.cluster:
+        raise HTTPException(status_code=400, detail="vm_id and snapshots are only accepted from a cluster control plane")
+    if template_id == DEFAULT_TEMPLATE_ID and not daemon.golden_ready and not snapshot:
+        raise HTTPException(status_code=503, detail="Golden snapshot not ready")
+    if daemon.cluster:
+        from flint.cluster.agent import capacity
+        if _running_count(mgr) >= capacity()["max_vms"]:
+            # 507 tells the scheduler this host is full; it tries another.
+            raise HTTPException(status_code=507, detail="host is full")
+
+    def _create() -> str:
+        if snapshot:
+            return daemon.cluster.restore_vm(
+                vm_id, snapshot, template_id=template_id, allow_internet_access=allow_internet_access,
+                network_policy=network_policy, tenant=tenant, availability=availability,
+            )
+        if template_snapshot:
+            daemon.cluster.ensure_template(template_id, template_snapshot)
+        return mgr.create(
+            template_id=template_id,
+            allow_internet_access=allow_internet_access,
+            use_pool=use_pool,
+            use_pyroute2=use_pyroute2,
+            network_policy=network_policy,
+            vm_id=vm_id,
+            tenant=tenant,
+            availability=availability,
+        )
 
     # Run in executor to avoid blocking the event loop (create can take 10s+ on failure)
     loop = asyncio.get_event_loop()
     try:
-        vm_id = await loop.run_in_executor(
-            None,
-            lambda: mgr.create(
-                template_id=template_id,
-                allow_internet_access=allow_internet_access,
-                use_pool=use_pool,
-                use_pyroute2=use_pyroute2,
-                network_policy=network_policy,
-            ),
-        )
+        vm_id = await loop.run_in_executor(None, _create)
     except Exception as e:
         log.exception("POST /vms — VM creation failed")
         print(f"POST /vms — VM creation failed: {e}")
@@ -186,13 +223,16 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
             except Exception as e:
                 log.warning("Storage setup failed for %s: %s", vm_id[:8], e)
 
+    if data.get("timeout_seconds"):
+        mgr.set_timeout(vm_id, float(data["timeout_seconds"]), data.get("timeout_policy") or "kill")
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     if daemon.storage:
         result["storage_backend"] = daemon.storage.kind
         result["workspace_dir"] = WORKSPACE_DIR
     _write_state(daemon)
     _events.publish("vm.created", vm=result)
-    _logs.append(vm_id, f"VM created from template '{template_id}' in {result.get('ready_time_ms', 0):.0f} ms")
+    how = f"snapshot '{snapshot['id']}'" if snapshot else f"template '{template_id}'"
+    _logs.append(vm_id, f"VM created from {how} in {result.get('ready_time_ms', 0):.0f} ms")
     for step, ms in (result.get("timings") or {}).items():
         _logs.append(vm_id, f"  timing.{step} = {ms:.1f} ms")
     print(f"POST /vms — created {vm_id[:8]}")
@@ -224,32 +264,54 @@ def delete_vm(vm_id: str):
     print(f"DELETE /vms/{vm_id[:8]}")
     daemon = _get_daemon()
     mgr = _require_manager()
-    entry_dict = mgr.get_dict(vm_id)
-    if entry_dict is None:
+    if mgr.get_dict(vm_id) is None:
         print(f"DELETE /vms/{vm_id[:8]} — not found")
         raise HTTPException(status_code=404, detail="VM not found")
-    # Tear down storage before killing the VM (no-op for local backend).
-    if daemon.storage:
-        entry = mgr.get_entry(vm_id)
-        veth_ip = ""
-        if entry:
-            veth_ip = (entry.backend_metadata or {}).get("veth_ip", "")
-        daemon.storage.teardown_sandbox(vm_id, veth_ip)
-    mgr.kill(vm_id)
-    _write_state(daemon)
-    _events.publish("vm.deleted", vm_id=vm_id)
-    _logs.append(vm_id, "VM killed")
+    daemon.kill_vm(vm_id)
     print(f"DELETE /vms/{vm_id[:8]} — killed")
     return {"ok": True}
 
 
+async def _optional_json(request: Request) -> dict:
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+    return data if isinstance(data, dict) else {}
+
+
 @app.post("/vms/{vm_id}/pause")
-def pause_vm(vm_id: str):
+async def pause_vm(vm_id: str, request: Request):
+    """Pause. In a cluster, ``{"snapshot_id": ...}`` also exports the paused
+    state to the snapshot store so the VM can be resumed on any host."""
     print(f"POST /vms/{vm_id[:8]}/pause")
     daemon = _get_daemon()
     mgr = _require_manager()
+    data = await _optional_json(request)
+    snapshot_id = data.get("snapshot_id")
+    if snapshot_id and not daemon.cluster:
+        raise HTTPException(status_code=400, detail="snapshot export needs cluster mode")
+
+    def _pause() -> dict | None:
+        if not snapshot_id:
+            mgr.pause(vm_id)
+            return None
+        with daemon.cluster.api_pause(vm_id):
+            mgr.pause(vm_id)
+            try:
+                return daemon.cluster.export_pause(vm_id, snapshot_id, upload=data.get("upload") or "sync")
+            except Exception:
+                # The control plane will treat this pause as failed: leave the VM
+                # running, as it believes, rather than paused with no snapshot.
+                log.exception("[%s] pause export failed; resuming", vm_id[:8])
+                mgr.resume(vm_id)
+                raise
+
     try:
-        mgr.pause(vm_id)
+        snap = await asyncio.get_event_loop().run_in_executor(None, _pause)
     except Exception as e:
         log.exception("POST /vms/%s/pause — failed", vm_id[:8])
         print(f"POST /vms/{vm_id[:8]}/pause — failed: {e}")
@@ -258,7 +320,10 @@ def pause_vm(vm_id: str):
     _events.publish("vm.paused", vm_id=vm_id)
     _logs.append(vm_id, "VM paused")
     print(f"POST /vms/{vm_id[:8]}/pause — paused")
-    return {"ok": True}
+    result: dict = {"ok": True}
+    if snap:
+        result["snapshot"] = snap
+    return result
 
 
 @app.post("/vms/{vm_id}/resume")
@@ -272,12 +337,38 @@ def resume_vm(vm_id: str):
         log.exception("POST /vms/%s/resume — failed", vm_id[:8])
         print(f"POST /vms/{vm_id[:8]}/resume — failed: {e}")
         raise HTTPException(status_code=500, detail=f"Resume failed: {e}")
+    if daemon.cluster:
+        daemon.cluster.forget_pause(vm_id)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)
     _events.publish("vm.resumed", vm=result)
     _logs.append(vm_id, "VM resumed")
     print(f"POST /vms/{vm_id[:8]}/resume — resumed")
     return {"vm": result}
+
+
+@app.post("/vms/{vm_id}/checkpoint")
+async def checkpoint_vm(vm_id: str, request: Request):
+    """Cluster only: snapshot a running VM without stopping it (fork, durable VMs)."""
+    daemon = _get_daemon()
+    if not daemon.cluster:
+        raise HTTPException(status_code=400, detail="checkpoints need cluster mode")
+    _require_entry(vm_id)
+    data = await _optional_json(request)
+    if not data.get("snapshot_id"):
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: daemon.cluster.checkpoint(
+                vm_id, data["snapshot_id"], data.get("kind") or "checkpoint",
+                parent=data.get("parent") or "", upload=data.get("upload") or "sync",
+            ),
+        )
+    except Exception as e:
+        log.exception("POST /vms/%s/checkpoint — failed", vm_id[:8])
+        raise HTTPException(status_code=500, detail=f"Checkpoint failed: {e}")
+    _events.publish("vm.checkpoint", vm_id=vm_id, snapshot_id=data["snapshot_id"], timings=result.get("timings"))
+    return result
 
 
 @app.patch("/vms/{vm_id}")
@@ -527,6 +618,8 @@ def build_template_endpoint(body: dict):
     print(f"POST /templates/build — building {template_id}...")
 
     daemon = _get_daemon()
+    if daemon.cluster:
+        daemon.cluster.forget_template(template_id)  # a rebuild gets published again
 
     def _run_build():
         try:
@@ -567,6 +660,8 @@ def delete_template_endpoint(template_id: str):
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
     daemon = _get_daemon()
+    if daemon.cluster:
+        daemon.cluster.forget_template(template_id)
     daemon.backend.delete_template_artifact(template_id, tmpl)
     artifacts = tmpl.get("artifacts") or {}
     for artifact in artifacts.values():
@@ -726,6 +821,21 @@ class FlintDaemon:
         self.storage = None
         self.volumes: Volumes | None = None
         self.metrics: MetricsSampler | None = None
+        self.cluster = None  # ClusterAgent when running as a cluster host agent
+
+    def kill_vm(self, vm_id: str) -> None:
+        """Delete a sandbox (running or paused) and everything it holds."""
+        mgr = self.manager
+        if self.storage:
+            entry = mgr.get_entry(vm_id)
+            veth_ip = (entry.backend_metadata or {}).get("veth_ip", "") if entry else ""
+            self.storage.teardown_sandbox(vm_id, veth_ip)
+        mgr.kill(vm_id)
+        if self.cluster:
+            self.cluster.forget_pause(vm_id)
+        _write_state(self)
+        _events.publish("vm.deleted", vm_id=vm_id)
+        _logs.append(vm_id, "VM killed")
 
     def run(self) -> None:
         self.started_at = time.time()
@@ -743,8 +853,18 @@ class FlintDaemon:
         self.volumes.replay()
         self._start_health_monitor()
         self._start_lifecycle()
+        self._start_cluster_agent()
         self._install_signal_handlers()
         self._serve()
+
+    def _start_cluster_agent(self) -> None:
+        from flint.core import config as _cfg
+        if not _cfg.CLUSTER_MODE:
+            return
+        from flint.cluster.agent import ClusterAgent
+        self.cluster = ClusterAgent(self)
+        self.cluster.start()
+        print(f"Cluster host agent: host {self.cluster.host_id}, control plane {self.cluster.server}")
 
     def _init_dirs(self) -> None:
         os.makedirs(DAEMON_DIR, exist_ok=True)
@@ -833,6 +953,8 @@ class FlintDaemon:
                 self._health_monitor.stop()
             if self._lifecycle_manager:
                 self._lifecycle_manager.stop()
+            if self.cluster:
+                self.cluster.stop()
             # Detach from VMs without killing them — they'll be recovered on restart
             if self.manager:
                 with self.manager._lock:
@@ -873,5 +995,32 @@ class FlintDaemon:
                 self.backend._runtime.run_loop()  # blocks forever
                 return
 
+        if self.cluster:
+            self._serve_cluster()
+            return
         # The timeout is a backstop: a stuck handler mustn't keep the daemon alive.
         uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning", timeout_graceful_shutdown=5)
+
+    def _serve_cluster(self) -> None:
+        """Serve over mTLS: only the control plane's certificates get in.
+        The host certificate is reloaded when snapd renews it."""
+        cfg = uvicorn.Config(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning",
+                             timeout_graceful_shutdown=5, **self.cluster.server_ssl())
+        cfg.load()
+        ctx, files = cfg.ssl, self.cluster.server_ssl()
+        mtime = [os.path.getmtime(files["ssl_certfile"])]
+
+        def _reload_cert():
+            while True:
+                time.sleep(30)
+                try:
+                    m = os.path.getmtime(files["ssl_certfile"])
+                    if m != mtime[0]:
+                        ctx.load_cert_chain(files["ssl_certfile"], files["ssl_keyfile"])
+                        mtime[0] = m
+                        log.info("cluster: reloaded host certificate")
+                except Exception:
+                    log.exception("cluster: certificate reload failed")
+
+        threading.Thread(target=_reload_cert, daemon=True, name="cert-reload").start()
+        uvicorn.Server(cfg).run()

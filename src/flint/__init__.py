@@ -1,9 +1,31 @@
-from flint.sandbox import Sandbox, CommandResult
-from flint.template import Template, TemplateInfo
-from flint.volume import Volume
-from flint.agents import Agent
+__all__ = ["Sandbox", "CommandResult", "Template", "TemplateInfo", "Volume", "Agent", "configure", "main"]
 
-__all__ = ["Sandbox", "CommandResult", "Template", "TemplateInfo", "Volume", "Agent", "main"]
+# Imported on first use, so `flint start`/`flint agent` can set FLINT_* before
+# flint.core.config reads them (the CLI is imported through this package).
+_EXPORTS = {
+    "Sandbox": "flint.sandbox",
+    "CommandResult": "flint.sandbox",
+    "Template": "flint.template",
+    "TemplateInfo": "flint.template",
+    "Volume": "flint.volume",
+    "Agent": "flint.agents",
+    "configure": "flint.sandbox",
+}
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module 'flint' has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(__all__)
 
 
 def main() -> None:

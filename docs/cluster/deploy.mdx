@@ -1,0 +1,89 @@
+---
+title: "Deploy a cluster"
+description: "Terraform for any cloud or bare metal, or by hand."
+---
+
+A cluster needs:
+
+- one or more **servers** for the control plane (any Linux, 1 vCPU / 1 GiB is plenty to start);
+- **hosts** with `/dev/kvm`: bare metal, or cloud instances with nested virtualization;
+- **Postgres** (managed is best) and an **S3-compatible bucket**.
+
+## With Terraform
+
+The Terraform is layered so each cloud only adds what's specific to it:
+
+| Layer | Path | What it does |
+|-------|------|--------------|
+| PKI | `terraform/modules/flint-pki` | Generates both CAs, the admin token and a reusable host join token. Only the `tls` and `random` providers. |
+| Node config | `terraform/modules/flint-cloudinit` | Renders a server's or host's cloud-init: `/etc/flint/flint.env` plus the installer. No cloud provider. |
+| Machines | `terraform/examples/byo` | Installs a cluster on machines you have, over SSH. |
+
+Because the PKI is generated up front, hosts can be created in the same `apply` as the servers, or by an autoscaling group, and join on boot.
+
+### On machines you already have
+
+```bash
+cd terraform/examples/byo
+cp terraform.tfvars.example terraform.tfvars   # servers, hosts, Postgres, bucket, SSH key
+terraform init && terraform apply
+
+export FLINT_URL=$(terraform output -raw api_url)
+export FLINT_API_KEY=$(terraform output -raw admin_token)
+flint cluster hosts
+```
+
+### On a cloud
+
+Feed the module's `user_data` to your instances:
+
+```hcl
+module "pki" {
+  source        = "github.com/jverre/flint//terraform/modules/flint-pki"
+  host_endpoint = "https://flint-hosts.internal:9301"    # your internal LB
+}
+
+module "host" {
+  source         = "github.com/jverre/flint//terraform/modules/flint-cloudinit"
+  role           = "host"
+  store_url      = "s3://my-bucket/flint"
+  join_token     = module.pki.join_token
+  zone           = "us-east-1a"
+}
+
+resource "aws_launch_template" "host" {
+  user_data = base64encode(module.host.user_data)
+  # ... an instance type with nested virtualization, or .metal
+}
+```
+
+Servers take `role = "server"`, the `database_url`, `host_endpoint`, `admin_token = module.pki.admin_token`, `join_secret = module.pki.join_secret` and `pki = module.pki` outputs. Put a TCP load balancer in front of the servers' ports 9300 (API) and 9301 (hosts).
+
+## By hand
+
+On each machine, write `/etc/flint/flint.env` (see `deploy/flint.env.example`), then:
+
+```bash
+sudo FLINT_ROLE=server bash deploy/install.sh   # or FLINT_ROLE=host
+```
+
+The installer builds Flint from a git ref (`FLINT_REF`), installs the systemd units (`flint-server`, or `flint-agent` + `flint-snapd`) and starts them. Without CA files and a join secret, the first server generates the CAs; mint host join tokens with:
+
+```bash
+flint cluster join-token --zone rack-1
+# on the host:
+FLINT_JOIN_TOKEN=flintjoin1... flint agent --advertise auto --zone rack-1
+```
+
+## Ports
+
+| Port | On | Open to |
+|------|----|---------|
+| 9300 | servers | API clients (your backend, operators), via the LB |
+| 9301 | servers | hosts, via the LB |
+| 9400 | hosts | servers (mTLS) |
+| 9501 | hosts | other hosts (mTLS, snapshot chunks) |
+
+## Upgrades
+
+Servers are stateless: replace them one at a time behind the load balancer. Hosts: `flint cluster drain <host>` moves their VMs away, then replace or upgrade the machine and it rejoins.

@@ -30,4 +30,6 @@ Your app can show each user exactly their own data, and export everything to sta
 
 Flint starts as a single command on a laptop and grows into a multi-host cluster, with a fleet-wide admin view and safe rollouts for the team running it.
 
+In a cluster, a VM's memory and disk are snapshots any host can restore: forks land wherever there's room, paused VMs resume on any host, and `durable` VMs come back on another host when theirs dies. Deploy it with Terraform on any cloud or your own machines: see [docs/cluster](docs/cluster/overview.mdx) and [terraform/](terraform/).
+
 https://github.com/user-attachments/assets/5fdbf10e-7e7a-4688-9414-5bde4d4ed428

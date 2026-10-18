@@ -122,15 +122,18 @@ def create_golden_snapshot(
 
 def _wait_for_ready(log_path: str, timeout: float = 10.0) -> None:
     t0 = time.monotonic()
+    seen = ""
     with open(log_path) as f:
         while True:
-            line = f.readline()
-            if not line:
+            chunk = f.read()
+            if not chunk:
                 if time.monotonic() - t0 > timeout:
                     raise TimeoutError("READY not detected within timeout")
                 time.sleep(0.01)
                 continue
-            if "READY" in line:
+            # The serial console arrives in fragments; a marker can span reads.
+            seen = (seen + chunk)[-4096:]
+            if "READY" in seen:
                 break
     log.info("Golden VM ready (%.0f ms)", (time.monotonic() - t0) * 1000)
 

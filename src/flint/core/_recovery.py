@@ -44,6 +44,8 @@ class RecoveryEngine:
             probe, entry = self._manager._backend.recover_row(row)
 
             if probe == "alive" and entry is not None:
+                entry.tenant = row.get("tenant") or ""
+                entry.availability = row.get("availability") or ""
                 with self._manager._lock:
                     self._manager._sandboxes[vm_id] = entry
                 self._store.update_sandbox(vm_id, daemon_pid=daemon_pid)

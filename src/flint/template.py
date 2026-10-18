@@ -17,7 +17,8 @@ class TemplateInfo:
 
 
 def _get_client() -> DaemonClient:
-    return DaemonClient()
+    from flint.sandbox import _get_client as _shared
+    return _shared()
 
 
 class Template:
@@ -117,37 +118,34 @@ class Template:
     def build(self, poll_interval: float = 2.0, timeout: float = 600.0) -> TemplateInfo:
         """Build the template via the daemon. Blocks until complete."""
         dockerfile = self._to_dockerfile()
-        client = _get_client()
-        try:
-            result = client.build_template(
-                name=self._name,
-                dockerfile=dockerfile,
-                rootfs_size_mb=self._rootfs_size_mb,
-            )
-            template_id = result["template_id"]
+        client = _get_client()  # shared: don't close it
+        result = client.build_template(
+            name=self._name,
+            dockerfile=dockerfile,
+            rootfs_size_mb=self._rootfs_size_mb,
+        )
+        template_id = result["template_id"]
 
-            # Poll until build completes.  The build runs in a background
-            # thread on the daemon — the template may not appear in the
-            # registry for a short window after the POST returns, so treat
-            # None as "not yet registered" rather than an error.
-            start = time.monotonic()
-            while True:
-                elapsed = time.monotonic() - start
-                if elapsed > timeout:
-                    raise RuntimeError(
-                        f"Template {template_id} build timed out after {timeout}s"
+        # Poll until build completes.  The build runs in a background
+        # thread on the daemon — the template may not appear in the
+        # registry for a short window after the POST returns, so treat
+        # None as "not yet registered" rather than an error.
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                raise RuntimeError(
+                    f"Template {template_id} build timed out after {timeout}s"
+                )
+            info = client.get_template(template_id)
+            if info is not None:
+                status = info.get("status", "unknown")
+                if status == "ready":
+                    return TemplateInfo(
+                        template_id=template_id,
+                        name=self._name,
+                        status="ready",
                     )
-                info = client.get_template(template_id)
-                if info is not None:
-                    status = info.get("status", "unknown")
-                    if status == "ready":
-                        return TemplateInfo(
-                            template_id=template_id,
-                            name=self._name,
-                            status="ready",
-                        )
-                    if status == "failed":
-                        raise RuntimeError(f"Template build failed: {template_id}")
-                time.sleep(poll_interval)
-        finally:
-            client.close()
+                if status in ("failed", "error"):  # a daemon says failed, a cluster error
+                    raise RuntimeError(f"Template build failed: {template_id}")
+            time.sleep(poll_interval)

@@ -43,6 +43,37 @@ jobs:
         working-directory: guest/flintd
         run: go build -o flintd .
 
+  go-cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cluster/go.mod
+          cache-dependency-path: cluster/go.sum
+      - name: Vet
+        working-directory: cluster
+        run: go vet ./...
+      - name: Test
+        working-directory: cluster
+        run: go test -race -count=1 ./...
+      - name: Build
+        working-directory: cluster
+        run: go build -o flint-cluster ./cmd/flint-cluster
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Format
+        run: terraform fmt -check -recursive terraform
+      - name: Validate
+        run: |
+          for d in terraform/modules/* terraform/examples/*; do
+            (cd "$d" && terraform init -backend=false -input=false >/dev/null && terraform validate)
+          done
+
   unit:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +99,9 @@ jobs:
       fail-fast: false
       matrix:
         backend: [firecracker, cloud-hypervisor]
+        # daemon: tests/ against one daemon. cluster: tests/cluster against a
+        # two-host cluster (Postgres and S3 in Docker).
+        suite: [daemon, cluster]
     env:
       FLINT_BACKEND: ${{ matrix.backend }}
     steps:
@@ -80,7 +114,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: cluster/go.mod
       - name: Install Python dependencies
         run: uv sync --dev
       - name: Build r2nfs
@@ -153,17 +187,26 @@ jobs:
           " 2>&1 | tee -a /tmp/probe.log
       - name: Run tests
         id: tests
+        if: matrix.suite == 'daemon'
         run: |
-          sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/ -v -m "not slow" 2>&1 | tee /tmp/pytest.log
+          sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/ --ignore=tests/cluster -v -m "not slow" 2>&1 | tee /tmp/pytest.log
           exit ${PIPESTATUS[0]}
         timeout-minutes: 10
+      - name: Run cluster tests
+        if: matrix.suite == 'cluster'
+        run: |
+          (cd cluster && go build -o "$RUNNER_TEMP/flint-cluster" ./cmd/flint-cluster)
+          sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" "FLINT_CLUSTER_BIN=$RUNNER_TEMP/flint-cluster" \
+            uv run python -m pytest tests/cluster -v -m "not slow" 2>&1 | tee /tmp/pytest.log
+          exit ${PIPESTATUS[0]}
+        timeout-minutes: 25
       - name: Post diagnostics comment on failure
         if: failure() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
-            echo "### CI failure: \`e2e (${FLINT_BACKEND})\`"
+            echo "### CI failure: \`e2e (${FLINT_BACKEND}, ${{ matrix.suite }})\`"
             echo
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo

@@ -32,7 +32,7 @@ from ._jailfs import own
 from .config import JAILER_BASE_DIR, JAILER_SHARED_DIR, log
 
 CH_JAIL_DIR = f"{JAILER_BASE_DIR}/cloud-hypervisor"
-CH_CGROUP_ROOT = "/sys/fs/cgroup/cloud-hypervisor"
+CH_CGROUP_ROOT = f"/sys/fs/cgroup/{os.environ.get('FLINT_CH_PARENT_CGROUP', 'cloud-hypervisor')}"
 
 # Paths as the VMM sees them inside its chroot.
 JAIL_BINARY = "/cloud-hypervisor"

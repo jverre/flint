@@ -7,10 +7,9 @@ import time
 
 import websockets.sync.client as ws_sync
 
-from .conftest import TEST_PORT
+from .conftest import AUTH, BASE_URL, TEST_PORT, WS_BASE, api
 
 
-WS_BASE = f"ws://127.0.0.1:{TEST_PORT}"
 
 
 def _collect(lines: list, ws) -> None:
@@ -24,7 +23,7 @@ def _collect(lines: list, ws) -> None:
 
 def test_log_stream_delivers_lifecycle_lines(sandbox):
     # Daemon emits lifecycle log lines on create (timings etc.). Give it a tick.
-    ws = ws_sync.connect(f"{WS_BASE}/vms/{sandbox.id}/logs", open_timeout=5)
+    ws = ws_sync.connect(f"{WS_BASE}/vms/{sandbox.id}/logs", open_timeout=5, additional_headers=AUTH or None)
     lines: list = []
     t = threading.Thread(target=_collect, args=(lines, ws), daemon=True)
     t.start()

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from flint.agents.catalog import AgentDefinition, get_agent, list_agents
 from flint.sandbox import Sandbox, CommandResult
 from flint.template import Template, TemplateInfo
-from flint._client.client import DaemonClient
 
 log = logging.getLogger(__name__)
 
@@ -25,9 +24,10 @@ def _template_is_ready(template_id: str) -> TemplateInfo | None:
 
     Returns TemplateInfo if the template is cached and ready, None otherwise.
     """
-    client = DaemonClient()
+    from flint.sandbox import _get_client
+
     try:
-        info = client.get_template(template_id)
+        info = _get_client().get_template(template_id)
         if info is not None and info.get("status") == "ready":
             return TemplateInfo(
                 template_id=template_id,
@@ -36,8 +36,6 @@ def _template_is_ready(template_id: str) -> TemplateInfo | None:
             )
     except Exception:
         pass
-    finally:
-        client.close()
     return None
 
 

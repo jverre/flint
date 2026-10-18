@@ -7,14 +7,22 @@ import time
 
 import httpx
 
-# Set test isolation env vars BEFORE importing flint.
-TEST_PORT = "9101"
-TEST_DATA_DIR = os.path.join(tempfile.gettempdir(), "flint-test-data")
-TEST_STATE_DIR = os.path.join(tempfile.gettempdir(), "flint-test-state")
+# Set test isolation env vars BEFORE importing flint. FLINT_TEST_* override
+# them, so two checkouts can run their suites on one machine side by side.
+TEST_PORT = os.environ.get("FLINT_TEST_PORT", "9101")
+TEST_DATA_DIR = os.environ.get("FLINT_TEST_DATA_DIR", os.path.join(tempfile.gettempdir(), "flint-test-data"))
+TEST_STATE_DIR = os.environ.get("FLINT_TEST_STATE_DIR", os.path.join(tempfile.gettempdir(), "flint-test-state"))
 
 os.environ["FLINT_PORT"] = TEST_PORT
 os.environ["FLINT_DATA_DIR"] = TEST_DATA_DIR
 os.environ["FLINT_STATE_DIR"] = TEST_STATE_DIR
+
+# FLINT_URL points the whole suite at an already running endpoint instead of
+# a daemon started here, e.g. a cluster control plane (with FLINT_API_KEY).
+BASE_URL = os.environ.setdefault("FLINT_URL", f"http://127.0.0.1:{TEST_PORT}").rstrip("/")
+WS_BASE = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+AUTH = {"Authorization": f"Bearer {os.environ['FLINT_API_KEY']}"} if os.environ.get("FLINT_API_KEY") else {}
+api = httpx.Client(headers=AUTH, timeout=30.0)
 
 # On macOS, point VZ asset paths to the real install location so the test
 # daemon can find the kernel + rootfs even though FLINT_DATA_DIR is overridden.
@@ -51,8 +59,12 @@ def _read_daemon_log() -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_daemon():
+def _ensure_daemon(request):
     global _daemon_process
+    cluster_dir = os.path.join(os.path.dirname(__file__), "cluster")
+    if all(str(item.fspath).startswith(cluster_dir) for item in request.session.items):
+        yield  # cluster tests run their own cluster
+        return
     if Sandbox.is_daemon_running():
         yield
         return
@@ -111,7 +123,7 @@ def _ensure_daemon():
 def _sandbox_probe(_ensure_daemon):
     """Try to create a sandbox once per session. Cache the result."""
     global _sandbox_creation_result
-    resp = httpx.get(f"http://127.0.0.1:{TEST_PORT}/health", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/health", timeout=5.0)
     resp.raise_for_status()
     health = resp.json()
     if not health.get("golden_snapshot_ready", False):
@@ -145,9 +157,17 @@ def sandbox(require_sandbox):
 
 @pytest.fixture(scope="session")
 def backend_health(_ensure_daemon):
-    resp = httpx.get(f"http://127.0.0.1:{TEST_PORT}/health", timeout=5.0)
+    resp = api.get(f"{BASE_URL}/health", timeout=5.0)
     resp.raise_for_status()
     return resp.json()
+
+
+@pytest.fixture(scope="session")
+def daemon_only(backend_health):
+    """Skip a test that checks something host-local (volumes, per-daemon config,
+    jail directories) when the suite runs against a cluster control plane."""
+    if backend_health.get("role") == "control-plane":
+        pytest.skip("host-local feature: not served by the cluster control plane")
 
 
 @pytest.fixture(scope="session")
