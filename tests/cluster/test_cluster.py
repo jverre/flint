@@ -6,6 +6,7 @@ Run as root:  sudo -E .venv/bin/python -m pytest tests/cluster -v
 import json
 import os
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -146,13 +147,22 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
     hosts["b"].freeze()  # the agent hangs; snapd (the fence) keeps running
     t0 = time.time()
     killed_at = recovered_at = None
-    while time.time() - t0 < 40 and not (killed_at and recovered_at):
-        if killed_at is None and not running(pid):
-            killed_at = time.time() - t0
+
+    def watch_pid():  # its own thread: API calls below can be slow while b hangs
+        nonlocal killed_at
+        while killed_at is None and time.time() - t0 < 40:
+            if not running(pid):
+                killed_at = time.time() - t0
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=watch_pid, daemon=True)
+    watcher.start()
+    while time.time() - t0 < 40 and recovered_at is None:
         st = state(durable)
-        if recovered_at is None and st.get("state") == "Started" and host_of(cluster, durable) == "a":
+        if st.get("state") == "Started" and host_of(cluster, durable) == "a":
             recovered_at = time.time() - t0
         time.sleep(0.1)
+    watcher.join(max(0.0, 40 - (time.time() - t0)))
     assert killed_at is not None, f"the fence never killed the durable VM\n{cluster.diagnostics()}"
     assert recovered_at is not None, f"durable VM not recovered\n{cluster.diagnostics()}"
     assert killed_at < recovered_at, f"recovered at {recovered_at:.1f}s before the old copy was fenced at {killed_at:.1f}s"
@@ -277,12 +287,16 @@ def test_credentials_and_tenants_are_isolated(cluster, hosts, make_vm):
 
 @pytest.mark.slow
 def test_template_built_on_one_host_boots_on_another(cluster, hosts, make_vm):
-    r = cluster.api.post("/templates/build", json={"name": "cluster-e2e-tpl", "tenant": TENANT,
-                                                   "dockerfile": "FROM alpine:3.20\nRUN echo built-in-template > /etc/tpl-marker\n"})
+    from flint.core._template_build import _generate_dockerfile  # what the SDK's Template sends
+
+    dockerfile = _generate_dockerfile("alpine:3.20", [{"type": "run", "cmd": "echo built-in-template > /etc/tpl-marker"}])
+    r = cluster.api.post("/templates/build", json={"name": "cluster-e2e-tpl", "tenant": TENANT, "dockerfile": dockerfile})
     assert r.status_code == 200, r.text
     tid, builder = r.json()["template_id"], r.json()["build_host"]
     try:
-        wait_for(lambda: cluster.api.get(f"/templates/{tid}").json()["template"]["status"] == "ready", 900, "the template build")
+        status = lambda: cluster.api.get(f"/templates/{tid}").json()["template"]["status"]
+        wait_for(lambda: status() in ("ready", "error"), 900, "the template build")
+        assert status() == "ready", f"template build failed\n{cluster.diagnostics()}"
         other = next(n for n, h in hosts.items() if h.host_id != builder)
         vm = make_vm(on=other, template_id=tid)
         assert host_of(cluster, vm) == other

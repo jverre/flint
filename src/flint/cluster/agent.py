@@ -15,6 +15,7 @@ Runs next to the daemon's API (which the control plane drives over mTLS):
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import os
 import platform
@@ -110,6 +111,7 @@ class ClusterAgent:
         self._pauses_path = os.path.join(self.dir, "pauses.json")
         self._pauses = self._load_json(self._pauses_path)
         self._exporting: set[str] = set()
+        self._api_pausing: set[str] = set()
         self.last_lease_ok = 0.0
         self._lease_path = os.path.join(self.dir, "lease.json")
 
@@ -255,7 +257,9 @@ class ClusterAgent:
             if row["vm_id"] in out:
                 continue
             rep = {"vm_id": row["vm_id"], "state": row["state"]}
-            if row["state"] == SandboxState.PAUSED.value and row["vm_id"] in self._pauses:
+            if row["vm_id"] in self._api_pausing:
+                rep["state"] = SandboxState.RUNNING.value
+            elif row["state"] == SandboxState.PAUSED.value and row["vm_id"] in self._pauses:
                 rep["pause_snapshot_id"] = self._pauses[row["vm_id"]]
             out[row["vm_id"]] = rep
         return list(out.values())
@@ -301,7 +305,7 @@ class ClusterAgent:
         """A VM paused by its own timeout policy still gets a snapshot, so it can resume elsewhere."""
         for row in self.daemon._state_store.list_in_state(SandboxState.PAUSED):
             vm_id = row["vm_id"]
-            if vm_id in self._pauses or vm_id in self._exporting:
+            if vm_id in self._pauses or vm_id in self._exporting or vm_id in self._api_pausing:
                 continue
             self._exporting.add(vm_id)
             try:
@@ -310,6 +314,19 @@ class ClusterAgent:
                 log.warning("cluster: exporting pause of %s failed: %s", vm_id[:8], e)
             finally:
                 self._exporting.discard(vm_id)
+
+    @contextlib.contextmanager
+    def api_pause(self, vm_id: str):
+        """A pause the control plane asked for, export included. Until it
+        returns, the VM keeps reporting Running: the control plane learns the
+        outcome from the response, and a failed export resumes the VM."""
+        with self._lock:
+            self._api_pausing.add(vm_id)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._api_pausing.discard(vm_id)
 
     def forget_pause(self, vm_id: str) -> None:
         with self._lock:

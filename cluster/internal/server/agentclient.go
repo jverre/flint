@@ -162,11 +162,13 @@ func (s *Server) checkpointOnHost(ctx context.Context, h *Host, vmID string, req
 	return &out, nil
 }
 
+// getOnHost fetches a VM's live view from its host. It's an optional extra
+// on top of the catalog, so a slow or hung host gets 2 seconds, not more.
 func (s *Server) getOnHost(ctx context.Context, h *Host, vmID string) (map[string]any, error) {
 	var out struct {
 		VM map[string]any `json:"vm"`
 	}
-	if err := s.agentDo(ctx, h, http.MethodGet, "/vms/"+vmID, nil, &out, 10*time.Second); err != nil {
+	if err := s.agentDo(ctx, h, http.MethodGet, "/vms/"+vmID, nil, &out, 2*time.Second); err != nil {
 		return nil, err
 	}
 	return out.VM, nil

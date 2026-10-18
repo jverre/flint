@@ -296,10 +296,19 @@ async def pause_vm(vm_id: str, request: Request):
         raise HTTPException(status_code=400, detail="snapshot export needs cluster mode")
 
     def _pause() -> dict | None:
-        mgr.pause(vm_id)
-        if snapshot_id:
-            return daemon.cluster.export_pause(vm_id, snapshot_id, upload=data.get("upload") or "sync")
-        return None
+        if not snapshot_id:
+            mgr.pause(vm_id)
+            return None
+        with daemon.cluster.api_pause(vm_id):
+            mgr.pause(vm_id)
+            try:
+                return daemon.cluster.export_pause(vm_id, snapshot_id, upload=data.get("upload") or "sync")
+            except Exception:
+                # The control plane will treat this pause as failed: leave the VM
+                # running, as it believes, rather than paused with no snapshot.
+                log.exception("[%s] pause export failed; resuming", vm_id[:8])
+                mgr.resume(vm_id)
+                raise
 
     try:
         snap = await asyncio.get_event_loop().run_in_executor(None, _pause)

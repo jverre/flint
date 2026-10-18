@@ -220,7 +220,7 @@ class Host:
         with open(os.path.join(self.identity, "host.json")) as f:
             self.host_id = json.load(f)["host_id"]
         self.snapd = Proc(f"snapd-{self.name}", [
-            self.c.binary, "snapd", "--identity", self.identity, "--cache", f"{self.root}/cache",
+            self.c.binary, "snapd", "--identity", self.identity, "--cache", f"{self.root}/cache", "--cache-gb", "2",
             "--store", self.c.store_url, "--socket", self.socket, "--peer-listen", f"0.0.0.0:{self.snapd_port}",
         ], self.env(), os.path.join(self.c.logs, f"snapd-{self.name}.log"))
         self.snapd.start()
@@ -351,7 +351,8 @@ class Cluster:
             self.db_url = f"postgres://flint:flint@127.0.0.1:{self.port + 7}/flint?sslmode=disable"
         if not self.store_url:
             self._docker(f"flint-test-s3-{self.port}", ["-p", f"127.0.0.1:{self.port + 8}:8333",
-                         "chrislusf/seaweedfs:latest", "server", "-s3", "-dir=/data", "-master.volumeSizeLimitMB=256"])
+                         "chrislusf/seaweedfs:latest", "server", "-s3", "-dir=/data",
+                         "-master.volumeSizeLimitMB=512", "-volume.max=64"])
             endpoint = f"http://127.0.0.1:{self.port + 8}"
             wait_for(lambda: httpx.put(f"{endpoint}/flint-test").status_code in (200, 409), 60, "the S3 store")
             self.store_url = f"s3://flint-test/run-{int(time.time())}?endpoint={endpoint}"
@@ -429,7 +430,9 @@ class Cluster:
         for lb in self.lbs:
             lb.close()
         for c in self.containers:
-            subprocess.run(["docker", "rm", "-f", c], capture_output=True)
+            with open(os.path.join(self.logs, f"{c}.log"), "wb") as f:
+                subprocess.run(["docker", "logs", c], stdout=f, stderr=subprocess.STDOUT)
+            subprocess.run(["docker", "rm", "-f", "-v", c], capture_output=True)
 
     @staticmethod
     def _cleanup_host_network(h: Host) -> None:

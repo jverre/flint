@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -88,7 +90,12 @@ func (s *Server) ensureAdminToken(ctx context.Context, tok string) error {
 	return err
 }
 
-func (s *Server) authenticate(r *http.Request) (*Principal, bool) {
+// errBadToken means the request carries no valid token. Any other error from
+// authenticate means we couldn't check it (the database is unreachable), which
+// is the server's problem, not the caller's.
+var errBadToken = errors.New("missing or invalid API token")
+
+func (s *Server) authenticate(r *http.Request) (*Principal, error) {
 	h := r.Header.Get("Authorization")
 	tok := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 	if tok == "" || tok == h {
@@ -96,7 +103,7 @@ func (s *Server) authenticate(r *http.Request) (*Principal, bool) {
 		tok = r.URL.Query().Get("token")
 	}
 	if tok == "" {
-		return nil, false
+		return nil, errBadToken
 	}
 	id, secret, ok := parseToken(tok)
 	if !ok {
@@ -108,17 +115,20 @@ func (s *Server) authenticate(r *http.Request) (*Principal, bool) {
 	} else {
 		var tenants string
 		err := s.db.QueryRow(r.Context(), `SELECT kind, secret_hash, tenants FROM tokens WHERE id = ?`, id).Scan(&row.kind, &row.hash, &tenants)
+		if isNotFound(err) {
+			return nil, errBadToken
+		}
 		if err != nil {
-			return nil, false
+			return nil, err
 		}
 		json.Unmarshal([]byte(tenants), &row.tenants)
 		row.loaded = time.Now()
 		tokenCache.Store(id, row)
 	}
 	if subtle.ConstantTimeCompare([]byte(row.hash), []byte(pki.HashSecret(secret))) != 1 {
-		return nil, false
+		return nil, errBadToken
 	}
-	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants}, true
+	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants}, nil
 }
 
 type ctxKey int
@@ -133,9 +143,14 @@ func principal(r *http.Request) *Principal {
 // requireAuth wraps API handlers; admin=true restricts to admin tokens.
 func (s *Server) requireAuth(admin bool, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		p, ok := s.authenticate(r)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "missing or invalid API token")
+		p, err := s.authenticate(r)
+		if errors.Is(err, errBadToken) {
+			writeErr(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+		if err != nil {
+			log.Printf("auth: checking token: %v", err)
+			writeErr(w, http.StatusServiceUnavailable, "cannot verify API token right now")
 			return
 		}
 		if admin && !p.IsAdmin() {

@@ -178,6 +178,8 @@ func newS3Remote(u *url.URL) (*s3Remote, error) {
 	}
 	endpoint := q.Get("endpoint")
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// Snapshot uploads are worth retrying through a store's bad patch.
+		o.RetryMaxAttempts = 8
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
