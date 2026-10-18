@@ -99,6 +99,17 @@ func Attach(conn FileConn, devPath, export string, timeout time.Duration) (*Devi
 		sock.Close()
 		return nil, err
 	}
+	// Claim the device for as long as it's attached (the lock goes with the
+	// file), so another process choosing a free device at the same moment
+	// can't configure it under us: it sees EBUSY and moves on.
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		sock.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			err = syscall.EBUSY
+		}
+		return nil, fmt.Errorf("%s: %w", devPath, err)
+	}
 	d := &Device{Path: devPath, file: file, sock: sock, done: make(chan error, 1)}
 	for _, op := range []struct {
 		req, arg uintptr
