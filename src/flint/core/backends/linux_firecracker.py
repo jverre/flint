@@ -73,12 +73,13 @@ class LinuxFirecrackerBackend(HostBackend):
         )
 
     def install_dependencies(self, **kwargs) -> None:
-        from flint.core._install import install_deps as _install_deps
+        from flint.core._install import KERNEL_RELEASE, install_deps as _install_deps
 
         _install_deps(
-            fc_version=kwargs.get("fc_version", "latest"),
+            fc_version=kwargs.get("version", "latest"),
             install_dir=kwargs.get("install_dir", "/usr/local/bin"),
             kernel_dir=kwargs.get("kernel_dir", "/root/firecracker-vm"),
+            kernel_release=kwargs.get("kernel_release") or KERNEL_RELEASE,
             skip_kernel=kwargs.get("skip_kernel", False),
         )
 

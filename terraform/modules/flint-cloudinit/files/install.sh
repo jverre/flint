@@ -84,7 +84,7 @@ log "r2nfs (volumes)"
 log "hypervisor and guest kernel"
 INSTALL_DIR=/usr/local/bin KERNEL_DIR=/root/firecracker-vm bash "$SRC/scripts/install-deps.sh"
 if [ "$BACKEND" = cloud-hypervisor ]; then
-  flint install-deps --backend cloud-hypervisor || true
+  flint install-deps --backend cloud-hypervisor --skip-kernel
 fi
 
 if [ ! -f /root/firecracker-vm/rootfs.ext4 ]; then

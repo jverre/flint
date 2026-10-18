@@ -145,12 +145,7 @@ jobs:
         run: |
           echo "install-ch:start" >> /tmp/step-markers
           set -euxo pipefail
-          CH_VERSION="v46.0"
-          URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
-          curl -fsSL -o /tmp/cloud-hypervisor "$URL"
-          ls -la /tmp/cloud-hypervisor
-          file /tmp/cloud-hypervisor
-          sudo install -m 755 /tmp/cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          sudo -E env "PATH=$PATH" uv run flint install-deps --backend cloud-hypervisor --version v46.0 --skip-kernel
           /usr/local/bin/cloud-hypervisor --version
           echo "install-ch:end" >> /tmp/step-markers
       - name: Download Alpine minirootfs

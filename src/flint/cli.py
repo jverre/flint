@@ -281,25 +281,46 @@ def stop(vm_id):
 
 
 @cli.command("install-deps")
-@click.option("--version", "fc_version", default="latest", help="Firecracker version to install (default: latest)")
+@click.option("--backend", default="firecracker", show_default=True, help="Backend whose hypervisor to install (firecracker, cloud-hypervisor)")
+@click.option("--version", "version", default="latest", help="Hypervisor version to install (default: latest)")
 @click.option("--install-dir", default="/usr/local/bin", help="Directory to install binaries (default: /usr/local/bin)")
 @click.option("--kernel-dir", default="/root/firecracker-vm", help="Directory to store vmlinux (default: /root/firecracker-vm)")
 @click.option("--kernel-release", default=None, help="Flint guest kernel release tag (default: the one this version of Flint was tested with)")
 @click.option("--skip-kernel", is_flag=True, default=False, help="Skip vmlinux download")
 @click.option("--check", is_flag=True, default=False, help="Print installed versions and exit")
-def install_deps(fc_version, install_dir, kernel_dir, kernel_release, skip_kernel, check):
-    """Install firecracker, jailer, and vmlinux kernel."""
-    from flint.core._install import KERNEL_RELEASE, check_deps, install_deps as _install_deps
+def install_deps(backend, version, install_dir, kernel_dir, kernel_release, skip_kernel, check):
+    """Install a backend's hypervisor and the guest kernel."""
+    from flint.core._install import check_deps
+    from flint.core.backends import BackendNotFound, get_backend, names
+    try:
+        plugin = get_backend(backend)
+    except BackendNotFound:
+        click.echo(f"Error: unknown backend {backend!r}. Available: {', '.join(names())}", err=True)
+        raise SystemExit(2)
     if check:
-        all_present = check_deps(install_dir=install_dir, kernel_dir=kernel_dir)
-        raise SystemExit(0 if all_present else 1)
-    _install_deps(
-        fc_version=fc_version,
-        install_dir=install_dir,
-        kernel_dir=kernel_dir,
-        kernel_release=kernel_release or KERNEL_RELEASE,
-        skip_kernel=skip_kernel,
-    )
+        if plugin.name == "firecracker":
+            raise SystemExit(0 if check_deps(install_dir=install_dir, kernel_dir=kernel_dir) else 1)
+        problems = plugin.preflight()
+        for p in problems:
+            click.echo(f"  - {p}")
+        raise SystemExit(1 if problems else 0)
+    if os.geteuid() != 0:
+        click.echo("Error: this command must be run as root (sudo flint install-deps)", err=True)
+        raise SystemExit(1)
+    try:
+        plugin.install_dependencies(
+            version=version,
+            install_dir=install_dir,
+            kernel_dir=kernel_dir,
+            kernel_release=kernel_release,
+            skip_kernel=skip_kernel,
+        )
+    except NotImplementedError:
+        click.echo(f"Error: backend {plugin.name!r} has no install_dependencies hook", err=True)
+        raise SystemExit(2)
+    except Exception as exc:
+        click.echo(f"Error: installing {plugin.name!r} dependencies failed: {exc}", err=True)
+        raise SystemExit(1)
 
 
 @cli.command("setup-macos")

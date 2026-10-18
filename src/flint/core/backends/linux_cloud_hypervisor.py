@@ -84,9 +84,18 @@ class LinuxCloudHypervisorBackend(HostBackend):
         return os.path.exists(os.path.join(template_dir, "rootfs.ext4"))
 
     def install_dependencies(self, **kwargs) -> None:
-        install_dir = kwargs.get("install_dir", "/usr/local/bin")
-        version = kwargs.get("version", "latest")
-        _install_ch_binary(install_dir=install_dir, version=version)
+        from flint.core._install import KERNEL_RELEASE, _detect_arch, _install_kernel, install_cloud_hypervisor
+
+        install_cloud_hypervisor(
+            version=kwargs.get("version", "latest"),
+            install_dir=kwargs.get("install_dir", "/usr/local/bin"),
+        )
+        if not kwargs.get("skip_kernel", False):
+            _install_kernel(
+                kwargs.get("kernel_release") or KERNEL_RELEASE,
+                _detect_arch(),
+                kwargs.get("kernel_dir", "/root/firecracker-vm"),
+            )
 
     def ensure_runtime_ready(self) -> None:
         _ensure_bridge()
@@ -609,46 +618,6 @@ class LinuxCloudHypervisorBackend(HostBackend):
         # Sandboxes created before CH was jailed kept their files in the data dir.
         if vm_dir and not vm_dir.startswith(CH_JAIL_DIR):
             shutil.rmtree(vm_dir, ignore_errors=True)
-
-
-def _install_ch_binary(*, install_dir: str, version: str) -> None:
-    """Download the cloud-hypervisor binary release into ``install_dir``.
-
-    Uses the GitHub release asset for the current host architecture. Raises on
-    failure; caller can catch and report.
-    """
-    import subprocess
-    import urllib.request
-
-    arch = platform.machine().lower()
-    if arch in ("x86_64", "amd64"):
-        asset_arch = "x86_64"
-    elif arch in ("aarch64", "arm64"):
-        asset_arch = "aarch64"
-    else:
-        raise RuntimeError(f"cloud-hypervisor has no release asset for {arch!r}")
-
-    if version == "latest":
-        with urllib.request.urlopen(
-            "https://api.github.com/repos/cloud-hypervisor/cloud-hypervisor/releases/latest",
-            timeout=30,
-        ) as resp:
-            import json as _json
-            tag = _json.load(resp)["tag_name"]
-    else:
-        tag = version if version.startswith("v") else f"v{version}"
-
-    url = (
-        f"https://github.com/cloud-hypervisor/cloud-hypervisor/releases/"
-        f"download/{tag}/cloud-hypervisor-static"
-        f"{'' if asset_arch == 'x86_64' else '-aarch64'}"
-    )
-    os.makedirs(install_dir, exist_ok=True)
-    target = os.path.join(install_dir, "cloud-hypervisor")
-    log.info("Downloading cloud-hypervisor %s from %s -> %s", tag, url, target)
-    urllib.request.urlretrieve(url, target)
-    os.chmod(target, 0o755)
-    subprocess.run([target, "--version"], check=True, capture_output=True)
 
 
 from .registry import register as _register
