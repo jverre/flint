@@ -9,7 +9,7 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// onCommit - note this is a no-op, as we always push writes to the backing store.
+// onCommit flushes the file's unstable writes (see onWrite) to stable storage.
 func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
 	handle, err := xdr.ReadOpaque(w.req.Body)
@@ -24,6 +24,18 @@ func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusServerFault, os.ErrPermission}
+	}
+
+	file, err := fs.Open(fs.Join(path...))
+	if err != nil {
+		return &NFSStatusError{NFSStatusIO, err}
+	}
+	if s, ok := file.(syncer); ok {
+		err = s.Sync()
+	}
+	file.Close()
+	if err != nil {
+		return &NFSStatusError{NFSStatusIO, err}
 	}
 
 	writer := bytes.NewBuffer([]byte{})

@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"sort"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
@@ -45,60 +47,58 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	contents, verifier, err := getDirListingWithVerifier(userHandle, obj.Handle, obj.CookieVerif)
+	contents, dotdotCookie, verifier, err := getDirListing(fs, p, obj.Cookie)
 	if err != nil {
 		return err
 	}
-	if obj.Cookie > 0 && obj.CookieVerif > 0 && verifier != obj.CookieVerif {
-		return &NFSStatusError{NFSStatusBadCookie, nil}
-	}
 
 	entities := make([]readDirEntity, 0)
-	maxBytes := uint32(100) // conservative overhead measure
+	// Reply size (READDIR3resok) as encoded: status, directory attributes,
+	// verifier, the first value-follows flag and eof, then per entry its
+	// fileid, name, cookie and next value-follows flag.
+	maxBytes := uint32(4 + 88 + 8 + 4 + 4)
+	entrySize := func(name string) uint32 { return 8 + xdrOpaqueSize(len(name)) + 8 + 4 }
 
-	started := obj.Cookie == 0
-	if started {
+	if obj.Cookie <= cookieDot {
 		// add '.' and '..' to entities
+		if obj.Cookie == 0 {
+			dotFileID := uint64(0)
+			if da := tryStat(fs, p); da != nil {
+				dotFileID = da.Fileid
+			}
+			entities = append(entities, readDirEntity{Name: []byte("."), Cookie: cookieDot, Next: true, FileID: dotFileID})
+			maxBytes += entrySize(".")
+		}
 		dotdotFileID := uint64(0)
 		if len(p) > 0 {
-			dda := tryStat(fs, p[0:len(p)-1])
-			if dda != nil {
+			if dda := tryStat(fs, p[0:len(p)-1]); dda != nil {
 				dotdotFileID = dda.Fileid
 			}
 		}
-		dotFileID := uint64(0)
-		da := tryStat(fs, p)
-		if da != nil {
-			dotFileID = da.Fileid
-		}
-		entities = append(entities,
-			readDirEntity{Name: []byte("."), Cookie: 0, Next: true, FileID: dotFileID},
-			readDirEntity{Name: []byte(".."), Cookie: 1, Next: true, FileID: dotdotFileID},
-		)
+		entities = append(entities, readDirEntity{Name: []byte(".."), Cookie: dotdotCookie, Next: true, FileID: dotdotFileID})
+		maxBytes += entrySize("..")
 	}
 
 	eof := true
 	maxEntities := userHandle.HandleLimit() / 2
-	for i, c := range contents {
-		// cookie equates to index within contents + 2 (for '.' and '..')
-		cookie := uint64(i + 2)
-		if started {
-			maxBytes += 512 // TODO: better estimation.
-			if maxBytes > obj.Count || len(entities) > maxEntities {
-				eof = false
-				break
-			}
-
-			attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
-			entities = append(entities, readDirEntity{
-				FileID: attrs.Fileid,
-				Name:   []byte(c.Name()),
-				Cookie: cookie,
-				Next:   true,
-			})
-		} else if cookie == obj.Cookie {
-			started = true
+	for _, c := range contents {
+		size := entrySize(c.name)
+		if maxBytes+size > obj.Count || len(entities) > maxEntities {
+			eof = false
+			break
 		}
+		info := c.stat(fs, p)
+		if info == nil {
+			continue // removed since the listing was read
+		}
+		maxBytes += size
+		attrs := ToFileAttribute(info, path.Join(append(p, c.name)...))
+		entities = append(entities, readDirEntity{
+			FileID: attrs.Fileid,
+			Name:   []byte(c.name),
+			Cookie: c.cookie,
+			Next:   true,
+		})
 	}
 
 	writer := bytes.NewBuffer([]byte{})
@@ -137,42 +137,120 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	return nil
 }
 
-func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uint64) ([]fs.FileInfo, uint64, error) {
-	// figure out what directory it is.
-	fs, p, err := userHandle.FromHandle(fsHandle)
-	if err != nil {
-		return nil, 0, &NFSStatusError{NFSStatusStale, err}
-	}
+// DirNamesReader is implemented by filesystems that can list a directory's
+// names without stat-ing every entry. Readdir then stats only the entries
+// that go into a reply.
+type DirNamesReader interface {
+	ReadDirNames(path string) ([]string, error)
+}
 
-	path := fs.Join(p...)
-	// see if the verifier has this dir cached:
-	if vh, ok := userHandle.(CachingHandler); verifier != 0 && ok {
-		entries := vh.DataForVerifier(path, verifier)
-		if entries != nil {
-			return entries, verifier, nil
+// dirEntry is an entry of a directory listing; info is nil until stat-ed.
+type dirEntry struct {
+	pos    uint64 // readDirPos(name)
+	cookie uint64 // where to resume after it: the next entry's pos
+	name   string
+	info   fs.FileInfo
+}
+
+// stat returns the entry's attributes, or nil if it no longer exists.
+func (e *dirEntry) stat(fs billy.Filesystem, dir []string) fs.FileInfo {
+	if e.info == nil {
+		if info, err := fs.Lstat(fs.Join(append(dir, e.name)...)); err == nil {
+			e.info = info
 		}
 	}
-	// load the entries.
-	contents, err := fs.ReadDir(path)
+	return e.info
+}
+
+// Cookies: 0 starts a listing, cookieDot resumes after '.', cookieEnd is
+// after the last entry, and any other cookie resumes at the first entry
+// whose position (a hash of its name, readDirPos) is at least the cookie.
+//
+// Positions don't depend on the rest of the directory, so a client resumes
+// at the right place even if entries were added or removed meanwhile. And
+// like Linux's own server, an entry's cookie is the position of the entry
+// after it: when the entry a client just read is removed (`rm -r` removes
+// as it lists), the entry before it, or '..', now carries that cookie, so
+// the client finds where it was in a fresh listing instead of searching
+// the whole directory for a cookie that no longer exists.
+const (
+	cookieDot = 1
+	cookieEnd = ^uint64(0)
+)
+
+// getDirListing reads directory p fresh and returns its entries from cookie
+// on, in position order, the cookie of '..' (where its first entry is), and
+// the directory's cookie verifier, which never changes because cookies
+// never go stale.
+func getDirListing(fs billy.Filesystem, p []string, cookie uint64) ([]dirEntry, uint64, uint64, error) {
+	path := fs.Join(p...)
+	var entries []dirEntry
+	var err error
+	if nr, ok := fs.(DirNamesReader); ok {
+		var names []string
+		if names, err = nr.ReadDirNames(path); err == nil {
+			entries = make([]dirEntry, len(names))
+			for i, name := range names {
+				entries[i] = dirEntry{pos: readDirPos(name), name: name}
+			}
+		}
+	} else {
+		var infos []os.FileInfo
+		if infos, err = fs.ReadDir(path); err == nil {
+			entries = make([]dirEntry, len(infos))
+			for i, info := range infos {
+				entries[i] = dirEntry{pos: readDirPos(info.Name()), name: info.Name(), info: info}
+			}
+		}
+	}
 	if err != nil {
 		if os.IsPermission(err) {
-			return nil, 0, &NFSStatusError{NFSStatusAccess, err}
+			return nil, 0, 0, &NFSStatusError{NFSStatusAccess, err}
 		}
-		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
+		return nil, 0, 0, &NFSStatusError{NFSStatusNotDir, err}
 	}
 
-	sort.Slice(contents, func(i, j int) bool {
-		return contents[i].Name() < contents[j].Name()
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].pos != entries[j].pos {
+			return entries[i].pos < entries[j].pos
+		}
+		return entries[i].name < entries[j].name
 	})
-
-	if vh, ok := userHandle.(CachingHandler); ok {
-		// let the user handler make a verifier if it can.
-		v := vh.VerifierFor(path, contents)
-		return contents, v, nil
+	dotdotCookie := uint64(cookieEnd)
+	if len(entries) > 0 {
+		dotdotCookie = entries[0].pos
 	}
+	for i := range entries {
+		entries[i].cookie = cookieEnd
+		if i+1 < len(entries) {
+			entries[i].cookie = entries[i+1].pos
+		}
+	}
+	if cookie > cookieDot {
+		entries = entries[sort.Search(len(entries), func(i int) bool { return entries[i].pos >= cookie }):]
+	}
+	return entries, dotdotCookie, hashPathAndContents(path, nil), nil
+}
 
-	id := hashPathAndContents(path, contents)
-	return contents, id, nil
+// readDirPos is the position of the directory entry called name: a 64-bit
+// hash of its name, clear of the special cookies.
+func readDirPos(name string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(name))
+	pos := h.Sum64()
+	if pos <= cookieDot {
+		return cookieDot + 1
+	}
+	if pos == cookieEnd {
+		return cookieEnd - 1
+	}
+	return pos
+}
+
+// xdrOpaqueSize is the encoded size of variable-length opaque data or a
+// string of n bytes: its length, then the bytes padded to 4.
+func xdrOpaqueSize(n int) uint32 {
+	return 4 + uint32(n+3)&^3
 }
 
 func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {

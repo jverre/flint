@@ -89,9 +89,9 @@ func newImageManager(dir, volumesDir string, remote blockstore.Remote) (*ImageMa
 	return m, nil
 }
 
-// flushInterval bounds how much a crash of this process can lose: NFS COMMIT
-// doesn't reach the host filesystem (go-nfs answers it itself), so mounted
-// images are flushed on a timer instead.
+// flushInterval bounds how much a crash of this process can lose of what
+// clients haven't synced yet: an NFS COMMIT (a guest's fsync) flushes its
+// file through to the image right away, everything else within a second.
 const flushInterval = time.Second
 
 func (m *ImageManager) flushLoop() {

@@ -209,6 +209,24 @@ func (v *volumeFS) ReadDir(name string) ([]os.FileInfo, error) {
 	return v.Filesystem.ReadDir(name)
 }
 
+// ReadDirNames lists a directory without stat-ing its entries (go-nfs's
+// DirNamesReader): readdir then stats only the entries it replies with.
+func (v *volumeFS) ReadDirNames(name string) ([]string, error) {
+	if err := v.check(false); err != nil {
+		return nil, err
+	}
+	p, err := v.hostPath(name)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := os.OpenFile(p, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	return dir.Readdirnames(-1)
+}
+
 func (v *volumeFS) Readlink(name string) (string, error) {
 	if err := v.check(false); err != nil {
 		return "", err

@@ -51,70 +51,83 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	contents, verifier, err := getDirListingWithVerifier(userHandle, obj.Handle, obj.CookieVerif)
+	contents, dotdotCookie, verifier, err := getDirListing(fs, p, obj.Cookie)
 	if err != nil {
 		return err
 	}
-	if obj.Cookie > 0 && obj.CookieVerif > 0 && verifier != obj.CookieVerif {
-		return &NFSStatusError{NFSStatusBadCookie, nil}
-	}
 
 	entities := make([]readDirPlusEntity, 0)
+	// Directory information (what a READDIR reply would carry), limited by
+	// DirCount, and the whole reply (READDIRPLUS3resok) as encoded, limited
+	// by MaxCount: status, directory attributes, verifier, the first
+	// value-follows flag and eof, then per entry its fileid, name, cookie,
+	// optional attributes and handle, and next value-follows flag.
 	dirBytes := uint32(0)
-	maxBytes := uint32(100) // conservative overhead measure
+	maxBytes := uint32(4 + 88 + 8 + 4 + 4)
+	dirSize := func(name string) uint32 { return 8 + xdrOpaqueSize(len(name)) + 8 }
+	entrySize := func(e readDirPlusEntity) uint32 {
+		size := dirSize(string(e.Name)) + 4 + 4 + 4
+		if e.Attributes != nil {
+			size += 84
+		}
+		if e.Handle != nil {
+			size += xdrOpaqueSize(len(*e.Handle))
+		}
+		return size
+	}
 
-	started := obj.Cookie == 0
-	if started {
+	if obj.Cookie <= cookieDot {
 		// add '.' and '..' to entities
+		if obj.Cookie == 0 {
+			dotFileID := uint64(0)
+			da := tryStat(fs, p)
+			if da != nil {
+				dotFileID = da.Fileid
+			}
+			entities = append(entities, readDirPlusEntity{Name: []byte("."), Cookie: cookieDot, Next: true, FileID: dotFileID, Attributes: da})
+		}
 		dotdotFileID := uint64(0)
 		if len(p) > 0 {
-			dda := tryStat(fs, p[0:len(p)-1])
-			if dda != nil {
+			if dda := tryStat(fs, p[0:len(p)-1]); dda != nil {
 				dotdotFileID = dda.Fileid
 			}
 		}
-		dotFileID := uint64(0)
-		da := tryStat(fs, p)
-		if da != nil {
-			dotFileID = da.Fileid
+		entities = append(entities, readDirPlusEntity{Name: []byte(".."), Cookie: dotdotCookie, Next: true, FileID: dotdotFileID})
+		for _, e := range entities {
+			dirBytes += dirSize(string(e.Name))
+			maxBytes += entrySize(e)
 		}
-		entities = append(entities,
-			readDirPlusEntity{Name: []byte("."), Cookie: 0, Next: true, FileID: dotFileID, Attributes: da},
-			readDirPlusEntity{Name: []byte(".."), Cookie: 1, Next: true, FileID: dotdotFileID},
-		)
 	}
 
 	eof := true
 	maxEntities := userHandle.HandleLimit() / 2
-	fb := 0
-	fss := 0
-	for i, c := range contents {
-		// cookie equates to index within contents + 2 (for '.' and '..')
-		cookie := uint64(i + 2)
-		fb++
-		if started {
-			fss++
-			dirBytes += uint32(len(c.Name()) + 20)
-			maxBytes += 512 // TODO: better estimation.
-			if dirBytes > obj.DirCount || maxBytes > obj.MaxCount || len(entities) > maxEntities {
-				eof = false
-				break
-			}
-
-			filePath := joinPath(p, c.Name())
-			handle := userHandle.ToHandle(fs, filePath)
-			attrs := ToFileAttribute(c, path.Join(filePath...))
-			entities = append(entities, readDirPlusEntity{
-				FileID:     attrs.Fileid,
-				Name:       []byte(c.Name()),
-				Cookie:     cookie,
-				Attributes: attrs,
-				Handle:     &handle,
-				Next:       true,
-			})
-		} else if cookie == obj.Cookie {
-			started = true
+	for _, c := range contents {
+		if dirBytes+dirSize(c.name) > obj.DirCount || len(entities) > maxEntities {
+			eof = false
+			break
 		}
+		info := c.stat(fs, p)
+		if info == nil {
+			continue // removed since the listing was read
+		}
+		filePath := joinPath(p, c.name)
+		handle := userHandle.ToHandle(fs, filePath)
+		attrs := ToFileAttribute(info, path.Join(filePath...))
+		e := readDirPlusEntity{
+			FileID:     attrs.Fileid,
+			Name:       []byte(c.name),
+			Cookie:     c.cookie,
+			Attributes: attrs,
+			Handle:     &handle,
+			Next:       true,
+		}
+		if maxBytes+entrySize(e) > obj.MaxCount {
+			eof = false
+			break
+		}
+		dirBytes += dirSize(c.name)
+		maxBytes += entrySize(e)
+		entities = append(entities, e)
 	}
 
 	writer := bytes.NewBuffer([]byte{})

@@ -28,6 +28,7 @@ require (
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 )
 
-// go-nfs v0.0.4 with name-based readdir cookies and honest write stability;
+// go-nfs v0.0.4 with readdir cookies that survive deletes, real COMMITs and
+// O(depth) handle lookups;
 // see third_party/go-nfs/FLINT.md.
 replace github.com/willscott/go-nfs => ./third_party/go-nfs

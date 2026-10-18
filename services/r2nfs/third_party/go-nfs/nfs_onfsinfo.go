@@ -57,7 +57,7 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 		Wtmax:       1 << 30,
 		Wtpref:      1 << 30,
 		Wtmult:      4096,
-		Dtpref:      8192,
+		Dtpref:      1 << 20, // readdir replies are sized exactly
 		Maxfilesize: 1 << 62, // wild guess. this seems big.
 		TimeDelta:   1,       // nanosecond precision.
 		Properties:  0,

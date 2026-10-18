@@ -28,6 +28,11 @@ type writeArgs struct {
 	Data   []byte
 }
 
+// syncer is a file that can be flushed to stable storage.
+type syncer interface {
+	Sync() error
+}
+
 func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
 	var req writeArgs
@@ -82,6 +87,21 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
 	}
+	// A file that can sync (an *os.File) only reaches stable storage when
+	// synced: do that now if the client asked for a stable write, otherwise
+	// say the write is unstable so the client COMMITs it (and resends it if
+	// the server restarts in between, which changes the verifier).
+	committed := fileSync
+	if s, ok := file.(syncer); ok {
+		committed = unstable
+		if req.How != uint32(unstable) {
+			if err := s.Sync(); err != nil {
+				file.Close()
+				return &NFSStatusError{NFSStatusIO, err}
+			}
+			committed = fileSync
+		}
+	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("error closing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
@@ -98,7 +118,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(writtenCount)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fileSync); err != nil {
+	if err := xdr.Write(writer, committed); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	if err := xdr.Write(writer, w.Server.ID); err != nil {

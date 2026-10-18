@@ -85,9 +85,11 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 	}
 
 	if f, ok := c.activeHandles.Get(id); ok {
-		for _, k := range c.activeHandles.Keys() {
-			candidate, _ := c.activeHandles.Peek(k)
-			if hasPrefix(f.p, candidate.p) {
+		// Refresh the handles of the directories above it too, by walking up
+		// its path (not by scanning the whole cache, which made every request
+		// cost as much as the number of cached handles).
+		for i := 0; i < len(f.p); i++ {
+			for _, k := range c.getReverseHandles(f.f.Join(f.p[:i]...)) {
 				_, _ = c.activeHandles.Get(k)
 			}
 		}
@@ -157,18 +159,6 @@ func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) er
 // HandleLimit exports how many file handles can be safely stored by this cache.
 func (c *CachingHandler) HandleLimit() int {
 	return c.cacheLimit
-}
-
-func hasPrefix(path, prefix []string) bool {
-	if len(prefix) > len(path) {
-		return false
-	}
-	for i, e := range prefix {
-		if path[i] != e {
-			return false
-		}
-	}
-	return true
 }
 
 type verifier struct {

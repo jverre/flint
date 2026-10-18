@@ -112,6 +112,18 @@ def test_children_write_parent_reads_live(volume, make_sandbox):
     assert {m["path"]: m["readonly"] for m in parent.mounts} == {"/results": True}
 
 
+def test_large_directory_lists_and_removes(volume, make_sandbox):
+    """A directory far bigger than one readdir reply lists completely and `rm -r` removes it."""
+    sb = make_sandbox()
+    sb.mount(volume, "/data")
+    sh(sb, "touch /data/keep && mkdir /data/big && cd /data/big && seq 1 3000 | sed 's/^/file-/' | xargs touch")
+    assert sh(sb, "ls /data/big | wc -l").strip() == "3000"
+    removed = sb.commands.run("rm -r /data/big", timeout=120)
+    assert removed.exit_code == 0, f"rm -r failed: {removed.stdout}{removed.stderr}"
+    listing = sh(sb, "ls /data").split()
+    assert "keep" in listing and "big" not in listing, listing
+
+
 def test_one_writer_per_subtree(volume, make_sandbox):
     a, b = make_sandbox(), make_sandbox()
     a.mount(volume, "/w", subpath="shared")
