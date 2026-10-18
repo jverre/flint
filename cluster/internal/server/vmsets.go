@@ -195,11 +195,7 @@ func (s *Server) createVMSetMember(ctx context.Context, vs *VMSet, siblings []*V
 	v := &VM{ID: uuid.NewString(), Tenant: vs.Tenant, State: VMPending, TemplateID: vs.Spec.TemplateID,
 		Availability: vs.Spec.Availability, Spec: VMSpec{AllowInternet: internet}, VMSetID: vs.ID, Role: role,
 		Labels: map[string]string{"vmset": vs.Name}}
-	if err := s.insertVM(ctx, v); err != nil {
-		return nil, err
-	}
-	if _, _, err := s.placeAndCreate(ctx, v, placeReq{Spread: vs.Spec.Spread, SpreadCounts: counts}, nil); err != nil {
-		s.deleteVMRow(ctx, v.ID)
+	if _, err := s.createVM(ctx, v, placeReq{Spread: vs.Spec.Spread, SpreadCounts: counts}); err != nil {
 		return nil, err
 	}
 	s.emit(ctx, "vmset.member_created", vs.Tenant, v.ID, v.HostID, map[string]any{"vmset_id": vs.ID, "vm_id": v.ID, "role": role})

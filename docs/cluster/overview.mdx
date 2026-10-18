@@ -78,6 +78,8 @@ A host that stops heartbeating but keeps writing its **storage heartbeat** (a se
 
 The control plane itself is stateless replicas plus Postgres: killing a replica changes nothing for clients behind the load balancer, and another replica takes over the reconcilers within seconds. Use a highly available Postgres (any managed one) for a highly available cluster.
 
+**Operations survive replicas.** Every change to a VM (create, pause, resume, fork, checkpoint, migrate, recover, delete) holds that VM's lock in Postgres for as long as it runs, so two replicas never act on the same VM at once. Each one is also recorded with its progress, written before each step. If the replica running it dies, the leader takes it over once the lock lapses (about 10 seconds): it checks what the hosts actually have, then finishes the operation or rolls it back. A move caught half-way ends with the VM running on exactly one host. A replica cut off from Postgres stops its operations before its locks can lapse. Send an [`Idempotency-Key`](/api-reference/cluster#retrying-safely) to retry requests safely.
+
 ## VM sets
 
 A VM set keeps N copies of a template running, spread across zones, with paused standbys ready to replace a failed member with a snapshot restore instead of a fresh boot:

@@ -83,9 +83,6 @@ type Server struct {
 	cpClient tls.Certificate
 	agents   *http.Client
 
-	// hostLocks serializes operations that move a VM.
-	vmLocks sync.Map // vm id -> *sync.Mutex
-
 	leader   bool
 	leaderMu sync.Mutex
 }
@@ -330,9 +327,4 @@ func (s *Server) isLeader() bool {
 	s.leaderMu.Lock()
 	defer s.leaderMu.Unlock()
 	return s.leader
-}
-
-func (s *Server) vmLock(id string) *sync.Mutex {
-	m, _ := s.vmLocks.LoadOrStore(id, &sync.Mutex{})
-	return m.(*sync.Mutex)
 }

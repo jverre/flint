@@ -212,6 +212,93 @@ def test_control_plane_survives_losing_a_replica(cluster, hosts, make_vm):
         wait_for(lambda: httpx.get(f"http://127.0.0.1:{cluster.port + 10 + leader}/health").status_code == 200, 30, "replica restart")
 
 
+def replica_api(cluster, i: int) -> httpx.Client:
+    """Talk to one control-plane replica directly, bypassing the load balancer."""
+    return httpx.Client(base_url=f"http://127.0.0.1:{cluster.port + 10 + i}", headers=cluster.api.headers, timeout=180)
+
+
+def copies(hosts, vm_id: str) -> list[str]:
+    return [n for n, h in hosts.items() if vm_id in h.agent_vms()]
+
+
+def test_concurrent_operations_on_one_vm_through_two_replicas_are_serialised(cluster, hosts, make_vm):
+    vm = make_vm(on="a")
+    vm.commands.run("echo before > /root/m; (sleep 900 &); true")
+    results = {}
+
+    def call(name, i, path):
+        results[name] = replica_api(cluster, i).post(f"/vms/{vm.id}/{path}")
+
+    threads = [threading.Thread(target=call, args=("migrate", 0, "migrate")),
+               threading.Thread(target=call, args=("pause", 1, "pause"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    codes = {k: (r.status_code, r.text[:300]) for k, r in results.items()}
+    # Each request either ran (one after the other) or was told the VM was busy.
+    assert all(c in (200, 409) for c, _ in codes.values()), codes
+    assert any(c == 200 for c, _ in codes.values()), codes
+    final = state(vm)
+    expected = "Paused" if results["pause"].status_code == 200 else "Started"
+    assert final["state"] == expected, (codes, final)
+    if final["state"] == "Paused":
+        vm.resume()
+    assert vm.read_file("/root/m") == b"before\n"
+    assert vm.commands.run("pgrep -f 'sleep 900'").stdout.strip(), "the VM's processes survived"
+    wait_for(lambda: copies(hosts, vm.id) == [host_of(cluster, vm)], 30,
+             f"exactly one copy of the VM, on its catalog host (copies: {copies(hosts, vm.id)})")
+
+
+def test_move_interrupted_by_a_replica_crash_is_finished_by_the_leader(cluster, hosts, make_vm):
+    vm = make_vm(on="a")
+    vm.commands.run("echo kept > /root/m; true")
+    health = lambda i: httpx.get(f"http://127.0.0.1:{cluster.port + 10 + i}/health", timeout=5).json()
+    victim = next(i for i in range(len(cluster.servers)) if not health(i)["leader"])
+    # Freeze the target so the restore hangs and the move is caught half-way.
+    hosts["b"].freeze()
+    try:
+        threading.Thread(target=lambda: replica_api(cluster, victim).post(f"/vms/{vm.id}/migrate"), daemon=True).start()
+        wait_for(lambda: state(vm).get("cluster_state") == "migrating", 15, "the move to start")
+        cluster.servers[victim].kill()
+    finally:
+        hosts["b"].thaw()
+    try:
+        recovered = lambda: [e for e in cluster.api.get("/v1/events", params={"since": 0, "type": "operation.recovered"}).json()["events"]
+                             if e.get("vm_id") == vm.id]
+        wait_for(lambda: recovered(), 40, "the leader to take over the interrupted move")
+        wait_for(lambda: state(vm).get("state") == "Started", 30, f"the VM to run again ({state(vm)})")
+        assert vm.read_file("/root/m") == b"kept\n"
+        wait_for(lambda: copies(hosts, vm.id) == [host_of(cluster, vm)], 30,
+                 f"exactly one copy of the VM, on its catalog host (copies: {copies(hosts, vm.id)})")
+        # The VM takes new operations: its lock was released.
+        vm.pause()
+        vm.resume()
+        assert vm.commands.run("cat /root/m").stdout == "kept\n"
+    finally:
+        cluster.servers[victim].start()
+        wait_for(lambda: httpx.get(f"http://127.0.0.1:{cluster.port + 10 + victim}/health").status_code == 200, 30, "replica restart")
+
+
+def test_create_retried_with_an_idempotency_key_makes_one_vm(cluster, hosts):
+    body = {"tenant": TENANT}
+    headers = {"Idempotency-Key": f"create-{time.time_ns()}"}
+    # Through the load balancer, so the retry lands on the other replica.
+    first = cluster.api.post("/vms", json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    vm_id = first.json()["vm"]["vm_id"]
+    try:
+        again = cluster.api.post("/vms", json=body, headers=headers)
+        assert again.status_code == 200 and again.headers.get("idempotent-replayed") == "true", again.text
+        assert again.json()["vm"]["vm_id"] == vm_id
+        mine = [v for v in cluster.api.get("/vms", params={"tenant": TENANT}).json()["vms"] if v["vm_id"] == vm_id]
+        assert len(mine) == 1
+        other = cluster.api.post("/vms", json={"tenant": TENANT, "template_id": "nope"}, headers=headers)
+        assert other.status_code == 422, other.text
+    finally:
+        cluster.api.delete(f"/vms/{vm_id}")
+
+
 def test_vmset_keeps_replicas_spread_and_promotes_a_standby_on_failure(cluster, hosts):
     r = cluster.api.post("/v1/vmsets", json={"name": "web", "tenant": TENANT,
                                              "spec": {"replicas": 2, "standby": 1, "spread": "zone"}})
