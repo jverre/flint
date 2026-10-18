@@ -1,6 +1,7 @@
 """Install host runtime dependencies and guest assets."""
 
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -400,6 +401,7 @@ def _extract_and_install(tarball: Path, tmpdir: Path, fc_version: str, arch: str
     jailer_bin = release_dir / f"jailer-{fc_version}-{arch}"
 
     install_path = Path(install_dir)
+    install_path.mkdir(parents=True, exist_ok=True)
     for src, name in [(fc_bin, "firecracker"), (jailer_bin, "jailer")]:
         dst = install_path / name
         shutil.copy2(src, dst)
@@ -436,6 +438,86 @@ def _install_kernel(kernel_release: str, arch: str, kernel_dir: str) -> None:
         shutil.copyfile(tmp, dest)
         dest.chmod(0o644)
     _info(f"vmlinux installed at {dest} ({kernel_release}); the daemon rebuilds its golden snapshot on next start")
+
+
+# ── Cloud Hypervisor ────────────────────────────────────────────────────────
+
+# Cloud Hypervisor publishes no checksum files. GitHub records a SHA256 digest
+# for release assets uploaded since mid-2025; older releases we install (CI
+# pins v46.0) have theirs kept here.
+_CH_SHA256 = {
+    ("v46.0", "cloud-hypervisor-static"): "00b5cf2976847d2f21d2b7266038c8fc40bd14f2a542115055e9e214867edc9e",
+    ("v46.0", "cloud-hypervisor-static-aarch64"): "a5a19c7e7326a5ca5dcf83a7b895a03e81cdac8c7d0690d4e94133cc89d38561",
+}
+
+
+def _ch_release(version: str) -> dict:
+    url = "https://api.github.com/repos/cloud-hypervisor/cloud-hypervisor/releases/"
+    url += "latest" if version == "latest" else f"tags/{version}"
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.load(resp)
+
+
+def _ch_expected_sha256(tag: str, asset: str, release: dict | None) -> str:
+    """SHA256 for a release asset: pinned here, else GitHub's recorded digest."""
+    if (tag, asset) in _CH_SHA256:
+        return _CH_SHA256[(tag, asset)]
+    for a in (release or {}).get("assets", []):
+        if a.get("name") == asset and (a.get("digest") or "").startswith("sha256:"):
+            return a["digest"].removeprefix("sha256:")
+    raise RuntimeError(
+        f"no checksum known for cloud-hypervisor {tag} ({asset}); "
+        f"pick a release GitHub has a digest for, or add its checksum to _CH_SHA256"
+    )
+
+
+def _current_ch_version(binary: str) -> str | None:
+    try:
+        out = subprocess.check_output([binary, "--version"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    # "cloud-hypervisor v46.0.0" or "cloud-hypervisor v46.0-dirty"
+    return out.strip().split()[-1]
+
+
+def install_cloud_hypervisor(version: str = "latest", install_dir: str = "/usr/local/bin") -> None:
+    """Install the static cloud-hypervisor binary, verified against its SHA256."""
+    arch = _detect_arch()
+    asset = "cloud-hypervisor-static" + ("" if arch == "x86_64" else "-aarch64")
+    release = None
+    if version == "latest":
+        release = _ch_release("latest")
+        tag = release["tag_name"]
+    else:
+        tag = version if version.startswith("v") else f"v{version}"
+        if (tag, asset) not in _CH_SHA256:
+            release = _ch_release(tag)
+    expected = _ch_expected_sha256(tag, asset, release)
+
+    target = Path(install_dir) / "cloud-hypervisor"
+    if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == expected:
+        _skip(f"cloud-hypervisor {tag} already installed - skipping download")
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{tag}/{asset}"
+    _info(f"Downloading cloud-hypervisor {tag} for {arch}...")
+    # Download next to the target so the final rename is atomic.
+    fd, tmp_str = tempfile.mkstemp(prefix=".cloud-hypervisor.", dir=target.parent)
+    os.close(fd)
+    tmp = Path(tmp_str)
+    try:
+        _download(url, tmp)
+        got = hashlib.sha256(tmp.read_bytes()).hexdigest()
+        if got != expected:
+            raise RuntimeError(f"Checksum mismatch for {asset} {tag}: expected {expected}, got {got}")
+        _info("Checksum verified")
+        tmp.chmod(0o755)
+        subprocess.run([str(tmp), "--version"], check=True, capture_output=True)
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    _info(f"cloud-hypervisor installed: {_current_ch_version(str(target)) or tag} at {target}")
 
 
 def _current_fc_version() -> str | None:

@@ -27,15 +27,14 @@ description: "Start a sandbox and run your first command."
   </Step>
 
   <Step title="Install a hypervisor (Linux only)">
-    Flint ships with two Linux backend plugins: **Firecracker** and **Cloud-Hypervisor**. Install either (or both) — you pick which one runs at daemon startup.
+    Flint ships with two Linux backend plugins: **Firecracker** and **Cloud-Hypervisor**. Install either (or both) — you pick which one runs at daemon startup. Downloads are checked against their SHA256; `--version` picks a release (default: latest).
 
     ```bash
-    # Firecracker — ships with the install-deps helper (also installs the vmlinux kernel)
+    # Firecracker + jailer + the guest kernel
     sudo flint install-deps
 
-    # Cloud-Hypervisor — download the release binary
-    curl -fsSL -o /tmp/ch https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v46.0/cloud-hypervisor-static
-    sudo install -m 755 /tmp/ch /usr/local/bin/cloud-hypervisor
+    # Cloud-Hypervisor + the guest kernel
+    sudo flint install-deps --backend cloud-hypervisor
     ```
 
     On macOS, skip this step — `flint setup-macos` below handles it.

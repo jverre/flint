@@ -30,7 +30,7 @@ Each row shows the backend's short `name` (what you pass to `flint start --backe
 | Name | Platform | Notes |
 |------|----------|-------|
 | `firecracker` | Linux (KVM) | Default on Linux. Requires `firecracker` + `jailer` + a vmlinux kernel. Install with `sudo flint install-deps`. |
-| `cloud-hypervisor` | Linux (KVM) | Fresh-boot backend. Requires the `cloud-hypervisor` binary; kernel can be shared with Firecracker. |
+| `cloud-hypervisor` | Linux (KVM) | Fresh-boot backend. Requires the `cloud-hypervisor` binary; kernel can be shared with Firecracker. Install with `sudo flint install-deps --backend cloud-hypervisor`. |
 | `macos-vz` | macOS Apple Silicon | Default on macOS. Requires the Python binary to carry the Virtualization entitlement (handled by `flint start` on first run). Run `flint setup-macos` to install kernel + rootfs. |
 
 ## Choosing a backend
