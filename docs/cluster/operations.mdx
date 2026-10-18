@@ -32,7 +32,7 @@ A host that comes back deletes the VMs the cluster moved away while it was gone.
 
 ## Events
 
-`GET /events` (WebSocket) streams the cluster's events, the same ones as a daemon's plus cluster ones: `host.joined`, `host.unreachable`, `host.isolated`, `host.down`, `host.ready`, `vm.lost`, `vm.recovered`, `vm.crashed`, `vm.moved`, `vm.checkpointed`, `vmset.*`. `GET /v1/events?since=<seq>&vm_id=&type=` returns them as history.
+`GET /events` (WebSocket) streams the cluster's events, the same ones as a daemon's plus cluster ones: `host.joined`, `host.unreachable`, `host.isolated`, `host.down`, `host.ready`, `vm.lost`, `vm.recovered`, `vm.crashed`, `vm.moved`, `vm.checkpointed`, `operation.recovered` (the leader finished or rolled back an operation whose replica died: `kind`, `step`, `outcome`), `vmset.*`. `GET /v1/events?since=<seq>&vm_id=&type=` returns them as history.
 
 ## Timing
 

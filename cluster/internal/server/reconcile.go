@@ -15,6 +15,7 @@ import (
 // detection, and none overlaps itself.
 func (s *Server) reconcileLoop(ctx context.Context) {
 	go every(ctx, time.Second, s.checkHosts)
+	go every(ctx, 2*time.Second, s.resumeInterruptedOps)
 	go every(ctx, 2*time.Second, s.retryRecoveries)
 	go every(ctx, 2*time.Second, s.reconcileVMSets)
 	go every(ctx, 2*time.Second, s.drainHosts)
@@ -180,7 +181,7 @@ func (s *Server) scheduleCheckpoints(ctx context.Context) {
 		sem <- struct{}{}
 		go func(v *VM) {
 			defer func() { <-sem }()
-			if err := s.checkpointVM(ctx, v); err != nil {
+			if err := s.checkpointVM(ctx, v, 0); err != nil {
 				log.Printf("checkpoint %s: %v", short(v.ID), err)
 			}
 		}(v)
@@ -227,6 +228,7 @@ func (s *Server) drainHosts(ctx context.Context) {
 
 // collectGarbage deletes snapshots nothing needs any more, then their chunks.
 func (s *Server) collectGarbage(ctx context.Context) {
+	s.pruneOps(ctx)
 	snaps, err := s.listSnapshots(ctx, "")
 	if err != nil {
 		return

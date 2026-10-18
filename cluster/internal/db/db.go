@@ -216,6 +216,29 @@ CREATE TABLE IF NOT EXISTS leases (
     holder     TEXT NOT NULL,
     expires_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operations (
+    id              TEXT PRIMARY KEY,
+    vm_id           TEXT NOT NULL,
+    tenant          TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    step            TEXT NOT NULL DEFAULT '',
+    params          TEXT NOT NULL DEFAULT '{}',
+    holder          TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operations_state ON operations (state);
+CREATE INDEX IF NOT EXISTS operations_vm ON operations (vm_id);
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key             TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    op_id           TEXT NOT NULL DEFAULT '',
+    response_status INTEGER NOT NULL DEFAULT 0,
+    response_body   TEXT NOT NULL DEFAULT '',
+    created_at      BIGINT NOT NULL
+);
 `
 
 func (d *DB) eventsTable() string {
@@ -321,6 +344,22 @@ func (d *DB) TryLease(ctx context.Context, name, holder string, now, expiresAt i
 		return false, err
 	}
 	return h == holder, nil
+}
+
+// RenewLease extends a lease holder still has. Returns false if it lost it.
+func (d *DB) RenewLease(ctx context.Context, name, holder string, expiresAt int64) (bool, error) {
+	res, err := d.Exec(ctx, `UPDATE leases SET expires_at = ? WHERE name = ? AND holder = ?`, expiresAt, name, holder)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// ReleaseLease gives a lease up if holder still has it.
+func (d *DB) ReleaseLease(ctx context.Context, name, holder string) error {
+	_, err := d.Exec(ctx, `DELETE FROM leases WHERE name = ? AND holder = ?`, name, holder)
+	return err
 }
 
 // SetMetaIfAbsent stores a value unless one exists; returns the stored value.

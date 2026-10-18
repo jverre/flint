@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import time
+import uuid
 from typing import Callable
 
 import httpx
@@ -63,6 +65,12 @@ def _raise_for_status(resp: httpx.Response) -> None:
     raise httpx.HTTPStatusError(f"{resp.status_code}: {detail}", request=resp.request, response=resp)
 
 
+# Answers worth retrying with the same Idempotency-Key: the control plane
+# couldn't tell (a replica died behind the load balancer) or the VM was busy.
+_RETRY_STATUS = {502, 503, 504}
+_RETRY_DETAIL = ("in progress",)
+
+
 class DaemonClient:
     def __init__(self, base_url: str = DEFAULT_URL, api_key: str = API_KEY, tenant: str = TENANT) -> None:
         self._base_url = base_url
@@ -71,6 +79,54 @@ class DaemonClient:
         self._tenant = tenant
         self._http = httpx.Client(base_url=base_url, timeout=120.0, headers=self._headers)
         self._terminals: dict[str, _TerminalConnection] = {}
+        self._keys_honoured: bool | None = None
+        self.retry_for = 60.0  # seconds a mutating call keeps retrying
+
+    def _honours_idempotency_keys(self) -> bool:
+        """A cluster control plane replays retries; a single daemon doesn't."""
+        if self._keys_honoured is None:
+            try:
+                self._keys_honoured = self._http.get("/health", timeout=5.0).json().get("role") == "control-plane"
+            except (httpx.HTTPError, ValueError):
+                return False
+        return self._keys_honoured
+
+    def _mutate(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Send a request that changes something, with an Idempotency-Key.
+
+        A request that never reached the server is always retried. Against a
+        cluster, one that may have (a dropped connection, a 502/503/504, the VM
+        busy with another operation) is retried too, with the same key, so it
+        takes effect once.
+        """
+        headers = {"Idempotency-Key": uuid.uuid4().hex, **kwargs.pop("headers", {})}
+        deadline = time.monotonic() + self.retry_for
+        delay = 0.25
+        while True:
+            try:
+                resp = self._http.request(method, path, headers=headers, **kwargs)
+            except httpx.TransportError as e:
+                sent = not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
+                if time.monotonic() >= deadline or (sent and not self._honours_idempotency_keys()):
+                    raise
+            else:
+                if not self._worth_retrying(resp) or time.monotonic() >= deadline:
+                    return resp
+            time.sleep(delay)
+            delay = min(delay * 2, 4.0)
+
+    def _worth_retrying(self, resp: httpx.Response) -> bool:
+        if resp.status_code not in _RETRY_STATUS and resp.status_code != 409:
+            return False
+        try:
+            detail = str(resp.json().get("detail", ""))
+        except ValueError:
+            detail = resp.text
+        if resp.status_code == 409 and not any(d in detail for d in _RETRY_DETAIL):
+            return False
+        if "capacity_exhausted" in detail:
+            return False  # retrying won't make room
+        return self._honours_idempotency_keys()
 
     def close(self) -> None:
         for conn in self._terminals.values():
@@ -87,13 +143,13 @@ class DaemonClient:
         params = {"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2}
         if tenant or self._tenant:
             params["tenant"] = tenant or self._tenant
-        resp = self._http.post("/vms", params=params, json=body or None)
+        resp = self._mutate("POST", "/vms", params=params, json=body or None)
         resp.raise_for_status()
         return resp.json()["vm"]
 
     def kill(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
-        resp = self._http.delete(f"/vms/{vm_id}")
+        resp = self._mutate("DELETE", f"/vms/{vm_id}")
         resp.raise_for_status()
 
     def list(self) -> list[dict]:
@@ -188,18 +244,18 @@ class DaemonClient:
 
     def pause(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
-        resp = self._http.post(f"/vms/{vm_id}/pause")
+        resp = self._mutate("POST", f"/vms/{vm_id}/pause")
         resp.raise_for_status()
 
     def fork(self, vm_id: str, count: int = 1) -> list[dict]:
         """Fork a running VM into ``count`` new VMs (cluster control plane only)."""
-        resp = self._http.post(f"/vms/{vm_id}/fork", json={"count": count}, timeout=300.0)
+        resp = self._mutate("POST", f"/vms/{vm_id}/fork", json={"count": count}, timeout=300.0)
         if resp.status_code >= 400:
             raise RuntimeError(f"Fork failed ({resp.status_code}): {resp.text}")
         return resp.json()["vms"]
 
     def resume(self, vm_id: str) -> dict:
-        resp = self._http.post(f"/vms/{vm_id}/resume")
+        resp = self._mutate("POST", f"/vms/{vm_id}/resume")
         if resp.status_code >= 400:
             detail = resp.text
             try:

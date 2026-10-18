@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,15 +23,15 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /health", s.handleHealth)
 
 	// VMs: the daemon's API, served for the whole cluster.
-	mux.HandleFunc("POST /vms", auth(s.handleCreateVM))
+	mux.HandleFunc("POST /vms", auth(s.idempotent(s.handleCreateVM)))
 	mux.HandleFunc("GET /vms", auth(s.handleListVMs))
 	mux.HandleFunc("GET /vms/{id}", auth(s.handleGetVM))
-	mux.HandleFunc("DELETE /vms/{id}", auth(s.handleDeleteVM))
-	mux.HandleFunc("POST /vms/{id}/pause", auth(s.handlePause))
-	mux.HandleFunc("POST /vms/{id}/resume", auth(s.handleResume))
-	mux.HandleFunc("POST /vms/{id}/fork", auth(s.handleFork))
-	mux.HandleFunc("POST /vms/{id}/checkpoint", auth(s.handleCheckpoint))
-	mux.HandleFunc("POST /vms/{id}/migrate", auth(s.handleMigrate))
+	mux.HandleFunc("DELETE /vms/{id}", auth(s.idempotent(s.handleDeleteVM)))
+	mux.HandleFunc("POST /vms/{id}/pause", auth(s.idempotent(s.handlePause)))
+	mux.HandleFunc("POST /vms/{id}/resume", auth(s.idempotent(s.handleResume)))
+	mux.HandleFunc("POST /vms/{id}/fork", auth(s.idempotent(s.handleFork)))
+	mux.HandleFunc("POST /vms/{id}/checkpoint", auth(s.idempotent(s.handleCheckpoint)))
+	mux.HandleFunc("POST /vms/{id}/migrate", auth(s.idempotent(s.handleMigrate)))
 	mux.HandleFunc("PATCH /vms/{id}", auth(s.handlePatchVM))
 	mux.HandleFunc("PUT /vms/{id}/network-policy", auth(s.handlePutNetworkPolicy))
 	mux.HandleFunc("/vms/{id}/mounts", auth(notInCluster("volume mounts")))
@@ -177,13 +176,8 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	if len(body.NetworkPolicy) == 0 || string(body.NetworkPolicy) == "null" {
 		v.Spec.NetworkPolicy = nil
 	}
-	if err := s.insertVM(r.Context(), v); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	_, info, err := s.placeAndCreate(r.Context(), v, placeReq{}, nil)
+	info, err := s.createVM(r.Context(), v, placeReq{})
 	if err != nil {
-		s.deleteVMRow(context.Background(), v.ID)
 		code, detail := statusFor(err)
 		writeErr(w, code, "VM creation failed: "+detail)
 		return
@@ -331,7 +325,7 @@ func (s *Server) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "VM is not running")
 		return
 	}
-	if err := s.checkpointVM(r.Context(), v); err != nil {
+	if err := s.checkpointVM(r.Context(), v, vmLockWait); err != nil {
 		code, detail := statusFor(err)
 		writeErr(w, code, "Checkpoint failed: "+detail)
 		return

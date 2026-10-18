@@ -206,13 +206,20 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host
 	}
 	s.syncTemplates(ctx, h, req.Templates)
 
+	// VMs an operation holds are its business; if we can't tell which, skip
+	// this round of reconciliation (the lease above is renewed regardless).
+	busy, err := s.busyVMs(ctx)
+	if err != nil {
+		log.Printf("heartbeat %s: %v", h.Name, err)
+		req.VMs = nil
+	}
 	evict := []string{}
 	reported := map[string]hostVM{}
 	for _, hv := range req.VMs {
 		reported[hv.ID] = hv
 		v, err := s.getVM(ctx, hv.ID)
-		if err == nil && v.State == VMMigrating {
-			continue // both hosts hold it until the move commits or rolls back
+		if err == nil && (v.State == VMMigrating || busy[v.ID]) {
+			continue // an operation owns it (both hosts may hold it until a move commits or rolls back)
 		}
 		if err != nil || v.HostID != h.ID {
 			// Deleted, or now owned by another host (it was recovered or moved
@@ -226,9 +233,12 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host
 	}
 	// VMs the catalog places here that the host no longer has were deleted
 	// locally (timeout policy, error cleanup).
-	mine, _ := s.listVMs(ctx, `host_id = ? AND state = ?`, h.ID, VMRunning)
+	var mine []*VM
+	if busy != nil {
+		mine, _ = s.listVMs(ctx, `host_id = ? AND state = ?`, h.ID, VMRunning)
+	}
 	for _, v := range mine {
-		if _, ok := reported[v.ID]; ok || now-v.UpdatedAt < 20000 {
+		if _, ok := reported[v.ID]; ok || now-v.UpdatedAt < 20000 || busy[v.ID] {
 			continue
 		}
 		if v.VMSetID != "" {

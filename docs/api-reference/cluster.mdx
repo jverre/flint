@@ -16,6 +16,27 @@ description: "What the control plane adds to the daemon's API."
 
 VM objects carry `host_id`, `tenant`, `availability`, `cluster_state` and, for durable VMs, `checkpoint_at`. `state` uses the daemon's names, plus `Migrating`, `Recovering` and `Lost`.
 
+One operation runs on a VM at a time, whichever replica receives it. A request for a VM that's busy waits up to 15 seconds, then gets `409` ("another operation on this VM is in progress"); retry it.
+
+### Retrying safely
+
+`POST /vms`, `DELETE /vms/{id}` and `POST /vms/{id}/pause|resume|fork|checkpoint|migrate` accept an `Idempotency-Key` header (up to 255 characters, scoped to your API token, kept for 24 hours). A retry with the same key returns the first answer, with `Idempotent-Replayed: true`, instead of doing the work again, whichever replica it reaches:
+
+```bash
+curl -X POST "$FLINT_URL/vms?tenant=acme" -H "Authorization: Bearer $FLINT_API_KEY" \
+  -H "Idempotency-Key: create-user-42-sandbox"
+```
+
+| Answer | Meaning |
+|--------|---------|
+| `409` "still in progress" | The first request is still running: retry later with the same key |
+| `422` | The key was already used for a different request |
+| `409` "interrupted" | The replica handling the first request died and its operation was rolled back: retry with a new key |
+
+A `5xx` or "VM is busy" answer isn't kept, so retrying with the same key runs the request.
+
+The Python SDK does this for you: `Sandbox(...)`, `kill`, `pause`, `resume` and `fork` send a fresh key per call and, against a cluster, retry for up to a minute with the same key after a dropped connection, a `502`/`503`/`504` or a busy VM. Against a single daemon, which doesn't support keys, it only retries requests that never reached it.
+
 ## VM sets
 
 | Method | Path | |
