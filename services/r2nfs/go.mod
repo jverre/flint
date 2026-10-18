@@ -27,3 +27,8 @@ require (
 	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 )
+
+// go-nfs v0.0.4 with readdir cookies that survive deletes, real COMMITs and
+// O(depth) handle lookups;
+// see third_party/go-nfs/FLINT.md.
+replace github.com/willscott/go-nfs => ./third_party/go-nfs

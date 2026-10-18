@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Negotiate runs the client side of the handshake for export and returns its
@@ -99,6 +101,17 @@ func Attach(conn FileConn, devPath, export string, timeout time.Duration) (*Devi
 		sock.Close()
 		return nil, err
 	}
+	// Claim the device for as long as it's attached (the lock goes with the
+	// file), so another process choosing a free device at the same moment
+	// can't configure it under us: it sees EBUSY and moves on.
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		sock.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			err = syscall.EBUSY
+		}
+		return nil, fmt.Errorf("%s: %w", devPath, err)
+	}
 	d := &Device{Path: devPath, file: file, sock: sock, done: make(chan error, 1)}
 	for _, op := range []struct {
 		req, arg uintptr
@@ -116,6 +129,12 @@ func Attach(conn FileConn, devPath, export string, timeout time.Duration) (*Devi
 		}
 	}
 	go func() {
+		// A signal interrupting NBD_DO_IT makes the kernel shut the device
+		// down, and Go delivers process signals (SIGCHLD from every command
+		// we run, like mkfs) to any thread. So this goroutine keeps its
+		// thread, with every signal blocked; the thread exits with it.
+		runtime.LockOSThread()
+		blockSignals()
 		err := d.ioctl(ioctlDoIt, 0) // serves requests until disconnected
 		d.ioctl(ioctlClearQue, 0)
 		d.ioctl(ioctlClearSock, 0)
@@ -161,6 +180,13 @@ func (d *Device) Disconnect() error {
 func (d *Device) close() {
 	d.file.Close()
 	d.sock.Close()
+}
+
+// blockSignals blocks every signal on the calling thread.
+func blockSignals() {
+	all := ^uint64(0)
+	const sigBlock = 0
+	syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigBlock, uintptr(unsafe.Pointer(&all)), 0, unsafe.Sizeof(all), 0, 0)
 }
 
 func (d *Device) ioctl(req, arg uintptr) error {

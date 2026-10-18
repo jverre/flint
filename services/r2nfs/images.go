@@ -89,9 +89,9 @@ func newImageManager(dir, volumesDir string, remote blockstore.Remote) (*ImageMa
 	return m, nil
 }
 
-// flushInterval bounds how much a crash of this process can lose: NFS COMMIT
-// doesn't reach the host filesystem (go-nfs answers it itself), so mounted
-// images are flushed on a timer instead.
+// flushInterval bounds how much a crash of this process can lose of what
+// clients haven't synced yet: an NFS COMMIT (a guest's fsync) flushes its
+// file through to the image right away, everything else within a second.
 const flushInterval = time.Second
 
 func (m *ImageManager) flushLoop() {
@@ -232,8 +232,7 @@ func (m *ImageManager) Mount(id string) error {
 	return nil
 }
 
-// Unmount unmounts and detaches image id. Lazily: the NFS server may still
-// hold handles of mounts it has just revoked.
+// Unmount unmounts and detaches image id.
 func (m *ImageManager) Unmount(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -243,10 +242,34 @@ func (m *ImageManager) Unmount(id string) {
 	}
 	path := m.mountPath(id)
 	syncFS(path)
-	syscall.Unmount(path, syscall.MNT_DETACH)
+	unmountAndWait(path, a.dev)
 	delete(m.attached, id)
 	m.detach(a)
 	log.Printf("Unmounted image %s", id)
+}
+
+// unmountAndWait unmounts the filesystem on dev at path, and makes sure it's
+// gone before the device is disconnected: a filesystem still alive then is
+// shut down mid-flight and pins the device in the kernel, whose next user
+// gets I/O errors. If something still holds it, the unmount is lazy and
+// waits a while for the filesystem to be released.
+func unmountAndWait(path, dev string) {
+	if err := syscall.Unmount(path, 0); err == nil || errors.Is(err, syscall.EINVAL) {
+		return // unmounted, or wasn't mounted
+	}
+	syscall.Unmount(path, syscall.MNT_DETACH)
+	alive := filepath.Join("/sys/fs/ext4", filepath.Base(dev))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(alive); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("filesystem on %s still in use 10s after unmounting %s; detaching anyway", dev, path)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Delete removes image id (unmounting it first). Its chunks stay in the

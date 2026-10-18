@@ -32,15 +32,19 @@ type VolumeMount struct {
 	ReadOnly bool
 	handle   *os.File
 	revoked  atomic.Bool
+	ops      sync.RWMutex // held shared by every operation on the mount
 }
 
-// handleGrace keeps a deregistered mount's directory handle open long enough
-// for in-flight operations to finish, so its fd number isn't reused under them.
-const handleGrace = time.Minute
-
+// revoke stops serving the mount. It waits for operations in flight, then
+// closes the directory handle right away: its fd number can't be reused
+// under an operation, and nothing keeps the volume's filesystem busy, so an
+// unmount right after this really detaches it.
 func (m *VolumeMount) revoke() {
-	m.revoked.Store(true)
-	time.AfterFunc(handleGrace, func() { m.handle.Close() })
+	m.ops.Lock()
+	defer m.ops.Unlock()
+	if !m.revoked.Swap(true) {
+		m.handle.Close()
+	}
 }
 
 // VolumeManager tracks volume mounts by ID.
@@ -145,14 +149,18 @@ func newVolumeFS(mount *VolumeMount) *volumeFS {
 
 var errRevoked = fmt.Errorf("volume unmounted: %w", os.ErrPermission)
 
-func (v *volumeFS) check(write bool) error {
+// enter starts an operation on the mount; call done when it's finished.
+func (v *volumeFS) enter(write bool) (done func(), err error) {
+	v.mount.ops.RLock()
 	if v.mount.revoked.Load() {
-		return errRevoked
+		v.mount.ops.RUnlock()
+		return nil, errRevoked
 	}
 	if write && v.mount.ReadOnly {
-		return os.ErrPermission
+		v.mount.ops.RUnlock()
+		return nil, os.ErrPermission
 	}
-	return nil
+	return v.mount.ops.RUnlock, nil
 }
 
 func (v *volumeFS) Capabilities() billy.Capability {
@@ -163,37 +171,47 @@ func (v *volumeFS) Capabilities() billy.Capability {
 }
 
 func (v *volumeFS) Create(name string) (billy.File, error) {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	return v.Filesystem.Create(name)
 }
 
 func (v *volumeFS) Open(name string) (billy.File, error) {
-	if err := v.check(false); err != nil {
+	done, err := v.enter(false)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	return v.Filesystem.Open(name)
 }
 
 func (v *volumeFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
-	if err := v.check(flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0); err != nil {
+	done, err := v.enter(flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	return v.Filesystem.OpenFile(name, flag, perm)
 }
 
 func (v *volumeFS) Stat(name string) (os.FileInfo, error) {
-	if err := v.check(false); err != nil {
+	done, err := v.enter(false)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	return v.Filesystem.Stat(name)
 }
 
 func (v *volumeFS) Lstat(name string) (os.FileInfo, error) {
-	if err := v.check(false); err != nil {
+	done, err := v.enter(false)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	// BoundOS can't place its own root when that's a /proc/self/fd link,
 	// and the root is never a symlink to the guest anyway.
 	if filepath.Clean("/"+name) == "/" {
@@ -203,51 +221,85 @@ func (v *volumeFS) Lstat(name string) (os.FileInfo, error) {
 }
 
 func (v *volumeFS) ReadDir(name string) ([]os.FileInfo, error) {
-	if err := v.check(false); err != nil {
+	done, err := v.enter(false)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	return v.Filesystem.ReadDir(name)
 }
 
+// ReadDirNames lists a directory without stat-ing its entries (go-nfs's
+// DirNamesReader): readdir then stats only the entries it replies with.
+func (v *volumeFS) ReadDirNames(name string) ([]string, error) {
+	done, err := v.enter(false)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	p, err := v.hostPath(name)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := os.OpenFile(p, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	return dir.Readdirnames(-1)
+}
+
 func (v *volumeFS) Readlink(name string) (string, error) {
-	if err := v.check(false); err != nil {
+	done, err := v.enter(false)
+	if err != nil {
 		return "", err
 	}
+	defer done()
 	return v.Filesystem.Readlink(name)
 }
 
 func (v *volumeFS) Rename(from, to string) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	return v.Filesystem.Rename(from, to)
 }
 
 func (v *volumeFS) Remove(name string) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	return v.Filesystem.Remove(name)
 }
 
 func (v *volumeFS) MkdirAll(name string, perm os.FileMode) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	return v.Filesystem.MkdirAll(name, perm)
 }
 
 func (v *volumeFS) Symlink(target, link string) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	return v.Filesystem.Symlink(target, link)
 }
 
 func (v *volumeFS) TempFile(dir, prefix string) (billy.File, error) {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return nil, err
 	}
+	defer done()
 	if dir == "" {
 		dir = "/" // BoundOS would use the host's temp dir.
 	}
@@ -266,9 +318,11 @@ func (v *volumeFS) hostPath(name string) (string, error) {
 }
 
 func (v *volumeFS) Chmod(name string, mode os.FileMode) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	p, err := v.hostPath(name)
 	if err != nil {
 		return err
@@ -277,9 +331,11 @@ func (v *volumeFS) Chmod(name string, mode os.FileMode) error {
 }
 
 func (v *volumeFS) Lchown(name string, uid, gid int) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	dir, err := v.hostPath(filepath.Dir(filepath.Clean("/" + name)))
 	if err != nil {
 		return err
@@ -288,9 +344,11 @@ func (v *volumeFS) Lchown(name string, uid, gid int) error {
 }
 
 func (v *volumeFS) Chown(name string, uid, gid int) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	p, err := v.hostPath(name)
 	if err != nil {
 		return err
@@ -299,9 +357,11 @@ func (v *volumeFS) Chown(name string, uid, gid int) error {
 }
 
 func (v *volumeFS) Chtimes(name string, atime, mtime time.Time) error {
-	if err := v.check(true); err != nil {
+	done, err := v.enter(true)
+	if err != nil {
 		return err
 	}
+	defer done()
 	p, err := v.hostPath(name)
 	if err != nil {
 		return err
