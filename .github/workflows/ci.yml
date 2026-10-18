@@ -200,6 +200,15 @@ jobs:
             uv run python -m pytest tests/cluster -v -m "not slow" 2>&1 | tee /tmp/pytest.log
           exit ${PIPESTATUS[0]}
         timeout-minutes: 25
+      - name: Print storage and kernel logs
+        if: failure()
+        run: |
+          for f in $(sudo find / -xdev -name r2nfs.log 2>/dev/null); do
+            echo "=== $f (last 150 lines) ==="
+            sudo tail -150 "$f"
+          done
+          echo "=== Kernel log: NBD, block and ext4 ==="
+          sudo dmesg -T | grep -iE "nbd|I/O error|EXT4|blk_update" | tail -120 || true
       - name: Post diagnostics comment on failure
         if: failure() && github.event_name == 'pull_request'
         env:
