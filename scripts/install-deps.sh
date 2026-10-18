@@ -14,7 +14,7 @@ FC_VERSION="${FC_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 KERNEL_DIR="${KERNEL_DIR:-/root/firecracker-vm}"
 SKIP_KERNEL="${SKIP_KERNEL:-0}"
-KERNEL_RELEASE="${KERNEL_RELEASE:-guest-kernel-6.1.141-flint2}"
+KERNEL_RELEASE="${KERNEL_RELEASE:-guest-kernel-6.1.190-flint2}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
