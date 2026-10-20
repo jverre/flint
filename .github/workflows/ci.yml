@@ -43,6 +43,21 @@ jobs:
         working-directory: guest/flintd
         run: go build -o flintd .
 
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Typecheck and build
+        run: scripts/build-ui.sh
+      - name: Control plane embeds the UI
+        working-directory: cluster
+        run: test -f internal/webui/dist/index.html && go build -o /dev/null ./cmd/flint-cluster
+
   go-cluster:
     runs-on: ubuntu-latest
     steps:

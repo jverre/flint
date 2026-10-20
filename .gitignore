@@ -27,3 +27,11 @@ cluster/flint-cluster
 .terraform/
 .terraform.lock.hcl
 *.tfstate*
+
+# Web UI (built by scripts/build-ui.sh)
+web/node_modules/
+web/dist/
+src/flint/daemon/ui/
+!cluster/internal/webui/dist/
+cluster/internal/webui/dist/*
+!cluster/internal/webui/dist/.gitkeep

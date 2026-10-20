@@ -64,6 +64,15 @@ def test_health_reports_backend(backend_kind):
     assert resp.json()["backend_kind"] == backend_kind
 
 
+def test_web_ui_served_for_deep_links():
+    """The admin UI shell loads at /ui and for client-side routes (or explains how to build it)."""
+    resp = api.get(f"{BASE_URL}/ui/vms/some-vm", timeout=5.0)
+    assert resp.headers["content-type"].startswith("text/html"), resp.text[:200]
+    if resp.status_code == 200:
+        assert '<div id="root">' in resp.text
+    else:
+        assert resp.status_code == 503 and "build-ui.sh" in resp.text, resp.text[:300]
+
 
 # ── Command execution ────────────────────────────────────────────────────────
 

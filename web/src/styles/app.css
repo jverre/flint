@@ -1,0 +1,19 @@
+/* App-only additions on top of the design kit. */
+.splash{height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--fg-2);font:14px var(--sans);background:var(--bg-app)}
+.login{display:flex;flex-direction:column;align-items:center;gap:12px;width:380px;text-align:center}
+.login h1{font-size:20px;color:var(--fg-1)}
+.login input{width:100%;height:36px;padding:0 12px;border:1px solid var(--border-default);border-radius:6px;background:var(--bg-sunken);color:var(--fg-1);font:13px var(--mono)}
+.login .btn{width:100%;justify-content:center;height:34px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:48px 24px;text-align:center;color:var(--fg-2);font:13px/1.5 var(--sans)}
+.empty-t{font:600 15px var(--sans);color:var(--fg-1)}
+.empty code{font:12px var(--mono);background:var(--bg-sunken);padding:2px 6px;border-radius:4px;color:var(--fg-1)}
+.sk{display:inline-block;height:9px;border-radius:3px;background:linear-gradient(90deg,var(--bg-hover),var(--bg-selected),var(--bg-hover));background-size:200% 100%;animation:sk 1.2s linear infinite}
+@keyframes sk{to{background-position:-200% 0}}
+.toast.kit.err{border-color:color-mix(in srgb,var(--err) 55%,transparent)}
+.toast.kit.err>span:first-child{color:var(--fg-1)}
+.page{overflow:hidden}
+.scroll{overflow:auto;min-height:0}
+.ico[width="0"]{display:none}
+.xterm{padding:8px 10px}
+.xterm .xterm-viewport{background:var(--term-bg)!important}
+.btn:disabled,.btn[aria-disabled="true"]{opacity:.45;cursor:not-allowed;pointer-events:none}

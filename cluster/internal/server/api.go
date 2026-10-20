@@ -1,6 +1,8 @@
 package server
 
 import (
+	"github.com/jverre/flint/cluster/internal/webui"
+
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,6 +75,11 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /v1/vmsets/{id}", auth(s.handleGetVMSet))
 	mux.HandleFunc("PUT /v1/vmsets/{id}", auth(s.handleUpdateVMSet))
 	mux.HandleFunc("DELETE /v1/vmsets/{id}", auth(s.handleDeleteVMSet))
+
+	// Admin web UI (static; the API calls it makes are authenticated as usual).
+	mux.Handle("GET /ui/", webui.Handler())
+	mux.Handle("GET /ui", http.RedirectHandler("/ui/", http.StatusMovedPermanently))
+	mux.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
 	return mux
 }
 
