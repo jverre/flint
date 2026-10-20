@@ -64,6 +64,7 @@ def test_health_reports_backend(backend_kind):
     assert resp.json()["backend_kind"] == backend_kind
 
 
+
 # ── Command execution ────────────────────────────────────────────────────────
 
 
@@ -183,6 +184,8 @@ def test_stderr_separate(sandbox):
 def test_pause_and_resume(sandbox):
     sandbox.commands.run("echo persisted > /tmp/persist.txt")
     sandbox.pause()
+    listed = {vm["vm_id"]: vm["state"] for vm in api.get(f"{BASE_URL}/vms", timeout=10.0).json()["vms"]}
+    assert listed.get(sandbox.id) == "Paused", f"paused VM missing from GET /vms: {listed}"
     sandbox.resume()
     result = sandbox.commands.run("cat /tmp/persist.txt")
     assert result.exit_code == 0
@@ -621,11 +624,15 @@ def test_create_sandbox_with_options(require_sandbox):
         sb.kill()
 
 
-def test_list_excludes_killed_sandbox(require_sandbox):
-    """After killing a sandbox, it should not appear as running in the list."""
-    sb = Sandbox()
-    sb_id = sb.id
-    sb.kill()
-    time.sleep(0.5)
-    running_ids = [s.id for s in Sandbox.list() if s.is_running()]
-    assert sb_id not in running_ids
+def test_list_excludes_killed_sandboxes(require_sandbox):
+    """Sandboxes killed at the same time (as the web UI's bulk kill does) all go away cleanly."""
+    import concurrent.futures
+
+    boxes = [Sandbox() for _ in range(8)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        # Raw concurrent DELETEs, like the web UI sends; the SDK serialises its own requests.
+        kills = list(pool.map(lambda sb: api.delete(f"{BASE_URL}/vms/{sb.id}", timeout=60.0), boxes))
+    errors = [f"{r.status_code} {r.text[:200]}" for r in kills if r.status_code != 200]
+    assert not errors, f"concurrent kills failed: {errors}"
+    listed = {s.id for s in Sandbox.list()}
+    assert not listed & {sb.id for sb in boxes}, f"killed sandboxes still listed: {listed}"

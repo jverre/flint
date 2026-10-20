@@ -63,6 +63,8 @@ curl -X POST "http://localhost:9100/vms?template_id=default"
 }
 ```
 
+Paused VMs are included. Their VMM isn't running, so `agent_healthy` is `false` and `ready_time_ms` is `null`.
+
 ---
 
 ## Get sandbox

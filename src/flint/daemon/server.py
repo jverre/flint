@@ -96,21 +96,30 @@ def _validate_network_policy(policy: object) -> None:
                                 raise HTTPException(status_code=400, detail=f"Header names and values must be strings (domain '{domain}')")
 
 
+_state_write_lock = threading.Lock()
+
+
 def _write_state(daemon: FlintDaemon) -> None:
-    """Atomically write daemon state to JSON file."""
-    state = {
-        "pid": os.getpid(),
-        "started_at": daemon.started_at,
-        "golden_snapshot_ready": daemon.golden_ready,
-        "vms": {},
-    }
-    if daemon.manager:
-        for d in daemon.manager.list_dicts():
-            state["vms"][d["vm_id"]] = d
-    tmp_path = DAEMON_STATE_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(state, f)
-    os.rename(tmp_path, DAEMON_STATE_PATH)
+    """Atomically write daemon state to JSON file.
+
+    Requests run in a thread pool, so concurrent creates/kills call this at the
+    same time. The lock keeps them from sharing the temp file, and because the
+    snapshot is taken inside it, the last write always holds the latest state.
+    """
+    with _state_write_lock:
+        state = {
+            "pid": os.getpid(),
+            "started_at": daemon.started_at,
+            "golden_snapshot_ready": daemon.golden_ready,
+            "vms": {},
+        }
+        if daemon.manager:
+            for d in daemon.manager.list_dicts():
+                state["vms"][d["vm_id"]] = d
+        tmp_path = DAEMON_STATE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, DAEMON_STATE_PATH)
 
 
 async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
