@@ -1,15 +1,14 @@
 """Per-VM metrics sampler.
 
-Polls /proc/<vmm_pid>/{stat,status} at 1 Hz for each known VM and keeps a
-bounded ring buffer per VM. Linux-only path for now (CPU ticks, RSS). On
-macOS the sampler still runs but produces zero samples — richer data can be
-added via host-provided VMM stats later.
+Asks the backend for each running VM's usage at 1 Hz and keeps a bounded
+ring buffer per VM. Linux backends report the VMM process (CPU time, RSS);
+macOS reports the guest (vCPU busy time, memory in use), since all its VMs
+run inside the daemon's process.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections import deque
 from typing import Callable
@@ -21,11 +20,13 @@ class MetricsSampler:
     def __init__(
         self,
         get_vms: Callable,
+        usage: Callable[[object], tuple[float, int] | None],
         *,
         interval: float = 1.0,
         window: int = 60,
     ) -> None:
         self._get_vms = get_vms
+        self._usage = usage
         self._interval = interval
         self._window = window
         self._buffers: dict[str, deque] = {}
@@ -44,7 +45,8 @@ class MetricsSampler:
     async def _run(self) -> None:
         while True:
             try:
-                self._sample_all()
+                # In a thread: a backend may ask the guest over the network.
+                await asyncio.to_thread(self._sample_all)
             except Exception:
                 log.exception("MetricsSampler tick failed")
             try:
@@ -68,43 +70,27 @@ class MetricsSampler:
                 self._prev.pop(vid, None)
 
     def _sample_one(self, entry) -> dict | None:
-        pid = getattr(entry, "pid", 0)
-        if not pid:
-            return None
         ts = time.time()
-        cpu_ticks = 0
-        rss_bytes = 0
         try:
-            with open(f"/proc/{pid}/stat") as f:
-                parts = f.read().split()
-            cpu_ticks = int(parts[13]) + int(parts[14])
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        rss_bytes = int(line.split()[1]) * 1024
-                        break
-        except (OSError, IndexError, ValueError):
-            # Non-Linux, or process gone — return a zero sample so the
-            # UI still has a data point.
-            pass
+            usage = self._usage(entry)
+        except Exception:
+            usage = None
+        # Unknown (process gone, guest busy): a zero sample, so the UI still has a point.
+        cpu_seconds, mem_bytes = usage or (None, 0)
 
         cpu_percent = 0.0
         prev = self._prev.get(entry.vm_id)
-        if prev:
+        if cpu_seconds is not None and prev and prev["cpu_seconds"] is not None:
             dt = ts - prev["ts"]
-            dticks = cpu_ticks - prev["cpu_ticks"]
-            try:
-                hz = os.sysconf("SC_CLK_TCK")
-            except (AttributeError, ValueError, OSError):
-                hz = 100
-            if dt > 0 and dticks >= 0:
-                cpu_percent = (dticks / hz / dt) * 100
-        self._prev[entry.vm_id] = {"ts": ts, "cpu_ticks": cpu_ticks}
+            used = cpu_seconds - prev["cpu_seconds"]
+            if dt > 0 and used >= 0:
+                cpu_percent = used / dt * 100
+        self._prev[entry.vm_id] = {"ts": ts, "cpu_seconds": cpu_seconds}
 
         return {
             "ts": ts,
             "cpu_percent": round(cpu_percent, 2),
-            "rss_bytes": rss_bytes,
+            "rss_bytes": mem_bytes,
         }
 
     def get(self, vm_id: str, window: int | None = None) -> list[dict]:

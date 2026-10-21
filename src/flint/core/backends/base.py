@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, Literal
@@ -171,6 +172,25 @@ class BackendPlugin(ABC):
     @abstractmethod
     def check_entry_alive(self, entry) -> tuple[bool, str | None]:
         pass
+
+    def usage(self, entry) -> tuple[float, int] | None:
+        """``(cpu_seconds, memory_bytes)`` the VM has used, or None if unknown.
+
+        CPU seconds only grow; the metrics sampler turns them into a percentage.
+        The default reads the VMM process on the host (Linux /proc).
+        """
+        pid = getattr(entry, "pid", 0)
+        if not pid:
+            return None
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                parts = f.read().split()
+            cpu_seconds = (int(parts[13]) + int(parts[14])) / os.sysconf("SC_CLK_TCK")
+            with open(f"/proc/{pid}/status") as f:
+                rss = next((int(line.split()[1]) * 1024 for line in f if line.startswith("VmRSS:")), 0)
+        except (OSError, IndexError, ValueError):
+            return None
+        return cpu_seconds, rss
 
     @abstractmethod
     def recover_row(self, row: dict):
