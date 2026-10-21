@@ -137,7 +137,8 @@ async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes |
 def health():
     print("GET /health")
     daemon = _get_daemon()
-    result = {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind}
+    result = {"status": "ok", "golden_snapshot_ready": daemon.golden_ready, "backend_kind": daemon.backend.kind,
+              "network_policy": daemon.backend.supports_network_policy}
     if daemon.storage:
         result["storage_backend"] = daemon.storage.kind
         result["storage_healthy"] = daemon.storage.is_running()
@@ -442,6 +443,8 @@ async def update_network_policy(vm_id: str, request: Request):
     except (json.JSONDecodeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
     _validate_network_policy(body)
+    if not _get_daemon().backend.supports_network_policy:
+        raise HTTPException(status_code=501, detail=f"Network policy isn't supported on the {_get_daemon().backend.name} backend")
     mgr.update_network_policy(vm_id, body)
     print(f"PUT /vms/{vm_id[:8]}/network-policy — updated")
     return {"ok": True}

@@ -32,7 +32,7 @@ export function NetworkView({ vm }: { vm: VM }) {
         {rules.map((r) => (
           <tr key={r.domain}>
             <td>{r.domain}</td>
-            <td>{r.headers.length ? r.headers.map((h) => <span key={h} className="vm-hdr">{h}<i> hidden</i></span>) : <span className="dim">no headers</span>}</td>
+            <td>{r.headers.length ? r.headers.map((h) => <span key={h} className="vm-hdr">{h}</span>) : <span className="dim">no headers</span>}</td>
           </tr>
         ))}
       </tbody>

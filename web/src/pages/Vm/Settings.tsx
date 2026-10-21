@@ -1,14 +1,18 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { invalidateVMs, vmActions } from "../../api/hooks";
+import { invalidateVMs, usePlatform, vmActions } from "../../api/hooks";
 import { useToast } from "../../components/ui";
 import { errMsg, fmtDuration, Head, NetworkView, type TabProps } from "./common";
+import NetworkEditor from "./NetworkEditor";
 
-export default function Settings({ vm }: TabProps) {
+export default function Settings({ vm, running }: TabProps) {
   const toast = useToast(), qc = useQueryClient();
   const [secs, setSecs] = useState(String(vm.timeoutSeconds ?? ""));
   const [policy, setPolicy] = useState<"kill" | "pause">(vm.timeoutPolicy ?? "kill");
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const policyOk = usePlatform().data?.health.network_policy !== false;
+  const canEdit = running && policyOk;
   useEffect(() => { setSecs(String(vm.timeoutSeconds ?? "")); setPolicy(vm.timeoutPolicy ?? "kill"); }, [vm.timeoutSeconds, vm.timeoutPolicy]);
   const n = Number(secs), valid = Number.isInteger(n) && n > 0;
   const save = async () => {
@@ -30,8 +34,8 @@ export default function Settings({ vm }: TabProps) {
         </form>
       </section>
       <section>
-        <Head title="Network policy" />
-        <NetworkView vm={vm} />
+        <Head title="Network policy" meta={canEdit && !editing ? <button className="btn sm" onClick={() => setEditing(true)}>Edit</button> : undefined} />
+        {editing && canEdit ? <NetworkEditor vm={vm} onDone={() => setEditing(false)} /> : <NetworkView vm={vm} />}
       </section>
       <section>
         <Head title="Raw VM" />

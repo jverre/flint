@@ -15,7 +15,7 @@ The daemon listens on localhost and has no sign-in, so the UI is only reachable 
 ## What's in it
 
 - **VMs**: every VM, paused ones included. Shows state, tenant and host (cluster only), live CPU and memory, uptime and start time. Select several with `space` to pause, resume or kill them together.
-- **A VM**: facts, a 60 s CPU and memory strip, processes, start-up phases, network rules (credential values are never shown), a shell, Flint's lifecycle log, a file browser and auto-stop settings.
+- **A VM**: facts, a 60 s CPU and memory strip, processes, start-up phases, network rules, a shell, Flint's lifecycle log, a file browser, auto-stop settings, and a network policy editor: the headers the proxy adds, per domain. Credential values are write-only: the UI never shows them, and leaving a value empty keeps the current one. The macOS backend can't apply a network policy, so its VMs have no editor.
 - **New VM** (`n`): pick a template, a tenant in a cluster, and how many to start. Each one reports its real per-phase start-up timings.
 - **Templates**: build from a Dockerfile, watch the status, start VMs from a template.
 - **Hosts** (cluster, admin): every host on an isometric floor, with cordon, move VMs off (drain) and put back in service.
