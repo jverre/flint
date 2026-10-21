@@ -409,6 +409,11 @@ def ch_create_golden_snapshot(template_dir: str) -> None:
     log.info("CH golden snapshot ready in %s (%.0f ms)", snapshot_dir, (time.monotonic() - t0) * 1000)
 
 
+def _machine() -> str:
+    """The VM shape baked into a CH snapshot; restores keep it, so changing it means a rebuild."""
+    return f"cpus={CH_CPU_COUNT} memory={CH_MEMORY_BYTES} cmdline={CH_BOOT_ARGS}"
+
+
 def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_ROOTFS) -> None:
     """Install the default CH template rootfs and its golden snapshot."""
     try:
@@ -417,13 +422,13 @@ def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_
         raise RuntimeError(f"source rootfs not found: {source_rootfs}") from exc
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "rootfs.ext4")
-    if not os.path.exists(dest) or not golden_inputs_current(dest_dir):
+    if not os.path.exists(dest) or not golden_inputs_current(dest_dir, _machine()):
         shutil.rmtree(_snapshot_dir(dest_dir), ignore_errors=True)
         sparse_copy(source_rootfs, dest)
         log.info("CH golden rootfs installed: %s (%d bytes)", dest, source_size)
     if not ch_snapshot_ready(dest_dir):
         ch_create_golden_snapshot(dest_dir)
-    record_golden_inputs(dest_dir)
+    record_golden_inputs(dest_dir, _machine())
 
 
 def ch_golden_ready(dest_dir: str = CH_GOLDEN_DIR) -> bool:
