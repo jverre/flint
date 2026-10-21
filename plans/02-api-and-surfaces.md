@@ -121,7 +121,9 @@ Two providers (Coder pattern), phase 3:
 
 - **TUI** (exists): keep as the local/operator view; add tenant filter.
 - **Web dashboard** (phase 3): fleet → tenant → VM → hosts → rollouts →
-  audit. VM page = timeline + logs + metrics + terminal.
+  audit. VM page = timeline + logs + metrics + terminal. *Exists at `/ui`
+  (#31) without rollouts, audit or a persisted per-VM timeline; tenants are
+  derived from VMs and tokens because there is no tenants endpoint.*
 - Parked idea: a live fleet visualisation (each VM a cell in a grid/cube,
   coloured by state, version drift or egress denials; click → VM timeline),
   inspired by Modal's million-sandbox demo. Requires the rollup stream above.
