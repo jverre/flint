@@ -160,7 +160,6 @@ export default function TemplatesPage() {
             {tpls.isError && <Empty title="Could not load templates" action={<button className="btn" onClick={() => tpls.refetch()}>Retry</button>}>{errMsg(tpls.error)}</Empty>}
             {tpls.data && !list.length && <Empty title="No templates" action={<button className="btn pri" onClick={() => setBuilding(true)}>Build a template</button>}>Build one from a Dockerfile, or run <code>flint build</code>.</Empty>}
           </div>
-          <p className="tp-note">A template is a root filesystem built from a Dockerfile. VMs start from its golden snapshot. A template that is building cannot start VMs yet.</p>
         </div>
 
         <aside className="side" aria-label="Template details and activity">
@@ -208,7 +207,7 @@ function BuildDialog({ cluster, onClose, onStarted }: { cluster: boolean; onClos
   const sz = Number(size);
   const ok = name.trim().length > 0 && dockerfile.trim().length > 0 && Number.isInteger(sz) && sz >= 50 && (!tenant.trim() || /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/.test(tenant.trim()));
   return (
-    <Dialog open onClose={onClose} title="Build a template" sub="Builds a root filesystem from a Dockerfile, then snapshots it. This takes a while; the row shows as building." width={640}
+    <Dialog open onClose={onClose} title="Build a template" width={640}
       actions={[{ label: "Cancel", kind: "ghost" }, { label: "Build template", kind: "pri", id: "tp-build", disabled: !ok, onClick: async () => {
         setErr("");
         try {

@@ -257,7 +257,6 @@ export default function NewVmDrawer({ onClose, template }: { onClose: () => void
             ) : (
               <>
                 <div className="nv-tick">Starting<span className="n">{Math.round(elapsed)}<i>ms</i></span></div>
-                <p className="nv-note">The server answers once the VM is ready, so there are no live phases. The real breakdown appears when it arrives.</p>
               </>
             )}
           </div>

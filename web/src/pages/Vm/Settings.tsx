@@ -30,7 +30,7 @@ export default function Settings({ vm }: TabProps) {
         </form>
       </section>
       <section>
-        <Head title="Network policy" meta={<span className="dim">read-only · header values are hidden</span>} />
+        <Head title="Network policy" />
         <NetworkView vm={vm} />
       </section>
       <section>
