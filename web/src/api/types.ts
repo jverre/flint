@@ -75,6 +75,7 @@ export interface Health {
   storage_backend?: string;
   storage_healthy?: boolean;
   cluster_host_id?: string;
+  network_policy?: boolean; // false: this daemon's backend can't apply one
 }
 
 export interface Platform {

@@ -369,12 +369,12 @@ class SandboxManager:
         if not entry:
             raise RuntimeError(f"Sandbox {sandbox_id} not found")
 
+        # Apply first: a policy that can't be applied isn't recorded.
+        self._apply_network_policy(entry, policy)
         entry.network_policy = policy
 
         if self._state_store:
             self._state_store.set_network_policy(sandbox_id, json.dumps(policy))
-
-        self._apply_network_policy(entry, policy)
 
     def get_network_policy(self, sandbox_id: str) -> dict | None:
         """Get the current network policy for a sandbox."""

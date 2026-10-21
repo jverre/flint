@@ -396,8 +396,10 @@ def test_sandbox_cannot_reach_host_services(sandbox):
         server.close()
 
 
-def test_network_policy_round_trip(sandbox):
-    """Set a network policy, read it back, verify it matches."""
+def test_network_policy_round_trip(sandbox, backend_health):
+    """Set a network policy, read it back, then replace it (as the admin UI does)."""
+    if backend_health.get("network_policy") is False:
+        pytest.skip(f"{backend_health['backend_kind']} can't apply a network policy")
     policy = {
         "allow": {
             "api.example.com": [
@@ -416,6 +418,22 @@ def test_network_policy_round_trip(sandbox):
     assert "*.internal.io" in got["allow"]
     rules = got["allow"]["api.example.com"]
     assert rules[0]["transform"][0]["headers"]["Authorization"] == "Bearer test-token"
+
+    # A save replaces the whole policy: a removed domain is gone, a changed value is new.
+    sandbox.update_network_policy({"allow": {"api.example.com": [{"transform": [{"headers": {"Authorization": "Bearer rotated"}}]}]}})
+    got = sandbox.get_network_policy()
+    assert list(got["allow"]) == ["api.example.com"], got
+    assert got["allow"]["api.example.com"][0]["transform"][0]["headers"]["Authorization"] == "Bearer rotated"
+
+
+def test_network_policy_refused_where_unsupported(sandbox, backend_health):
+    """A backend that can't apply a policy refuses it, and the VM keeps the one it had."""
+    if backend_health.get("network_policy") is not False:
+        pytest.skip(f"{backend_health['backend_kind']} applies network policies")
+    with pytest.raises(httpx.HTTPStatusError) as e:
+        sandbox.update_network_policy({"allow": {"api.example.com": [{"transform": [{"headers": {"X-Key": "k"}}]}]}})
+    assert e.value.response.status_code == 501, e.value.response.text
+    assert sandbox.get_network_policy() is None
 
 
 def test_network_policy_injects_credentials_over_https(require_sandbox):

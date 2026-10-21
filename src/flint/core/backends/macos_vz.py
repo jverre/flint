@@ -118,6 +118,7 @@ class MacOSVirtualizationBackend(HostBackend):
     kind = "macos-vz-arm64"
     display_name = "Virtualization.framework (macOS arm64)"
     supported_platforms = ("darwin-arm64",)
+    supports_network_policy = False
 
     def preflight(self) -> list[str]:
         problems = super().preflight()

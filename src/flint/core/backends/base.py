@@ -77,6 +77,8 @@ class BackendPlugin(ABC):
     kind: ClassVar[str]
     display_name: ClassVar[str] = ""
     supported_platforms: ClassVar[tuple[str, ...]] = ()
+    # The credential proxy needs the VM's own network namespace.
+    supports_network_policy: ClassVar[bool] = True
 
     def preflight(self) -> list[str]:
         """Check whether this backend is usable on the current host.
