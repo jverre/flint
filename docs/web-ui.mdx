@@ -1,0 +1,37 @@
+---
+title: "Web UI"
+description: "Watch, start and manage VMs from the browser."
+---
+
+Flint ships an admin web UI. The daemon and the cluster control plane both serve it at **`/ui`**, on the same address as the API.
+
+| You run | Open |
+|---|---|
+| `flint start` (one host) | `http://127.0.0.1:9100/ui/` |
+| `flint-cluster server` | `https://<control-plane>/ui/`, then sign in with an API token |
+
+The daemon listens on localhost and has no sign-in, so the UI is only reachable from the machine it runs on. To use it remotely, forward the port (`ssh -L 9100:127.0.0.1:9100 host`). In a cluster the UI uses the same Bearer tokens as the API. An admin token sees everything. A service token sees only its tenants, and the UI hides the pages it can't use.
+
+## What's in it
+
+- **VMs**: every VM, paused ones included. Shows state, tenant and host (cluster only), live CPU and memory, uptime and start time. Select several with `space` to pause, resume or kill them together.
+- **A VM**: facts, a 60 s CPU and memory strip, processes, start-up phases, network rules (credential values are never shown), a shell, Flint's lifecycle log, a file browser and auto-stop settings.
+- **New VM** (`n`): pick a template, a tenant in a cluster, and how many to start. Each one reports its real per-phase start-up timings.
+- **Templates**: build from a Dockerfile, watch the status, start VMs from a template.
+- **Hosts** (cluster, admin): every host on an isometric floor, with cordon, move VMs off (drain) and put back in service.
+- **Tenants** (cluster): VMs, quota and API tokens per tenant.
+- **Load test**: start N VMs at a chosen concurrency and watch them fill the hosts. Reports start-time percentiles, then cleans up.
+
+Press `?` on any page for keyboard shortcuts. Shortcuts only navigate. Actions that change a VM always need a click, and killing always asks first.
+
+## Building it
+
+The UI lives in `web/` (React + TypeScript + Vite). Release builds include it. From a source checkout:
+
+```bash
+scripts/build-ui.sh   # needs Node 20+
+```
+
+This writes the build to `src/flint/daemon/ui/` (served by the daemon, included in the wheel) and to `cluster/internal/webui/dist/` (embedded into `flint-cluster` at `go build`). Until then, `/ui` shows how to build it.
+
+For UI development, `cd web && npm run dev` serves it on `http://localhost:5173/ui/` and proxies the API to `FLINT_API` (default `http://127.0.0.1:9100`). Add `?mock` to the URL to use built-in demo data instead of a real daemon (`?mock=daemon` for a single host).

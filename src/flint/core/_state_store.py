@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sqlite3
+import threading
 import time
 
 from .config import log
@@ -48,8 +50,24 @@ CREATE TABLE IF NOT EXISTS state_log (
 """
 
 
+def _locked(method):
+    """Serialise access to the shared connection.
+
+    The daemon handles requests in a thread pool and all of them share this one
+    sqlite3 connection (check_same_thread=False). sqlite3 connections are not
+    safe for concurrent use: parallel kills/creates failed with
+    "bad parameter or other API misuse".
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class StateStore:
     def __init__(self, db_path: str) -> None:
+        self._lock = threading.RLock()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -125,6 +143,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def transition_state(self, vm_id: str, new_state: SandboxState, *, detail: str | None = None) -> None:
         row = self._conn.execute("SELECT state FROM sandboxes WHERE vm_id = ?", (vm_id,)).fetchone()
         if not row:
@@ -156,6 +175,7 @@ class StateStore:
         except Exception:
             pass
 
+    @_locked
     def update_health(self, vm_id: str, timestamp: float | None = None) -> None:
         now = timestamp or time.time()
         self._conn.execute(
@@ -164,6 +184,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def update_sandbox(self, vm_id: str, **kwargs) -> None:
         """Update arbitrary columns on a sandbox row."""
         if not kwargs:
@@ -178,6 +199,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def set_timeout(self, vm_id: str, timeout_at: float, policy: str = "kill") -> None:
         now = time.time()
         self._conn.execute(
@@ -186,6 +208,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def set_pause_snapshot(self, vm_id: str, snapshot_dir: str) -> None:
         now = time.time()
         self._conn.execute(
@@ -194,6 +217,7 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def set_network_policy(self, vm_id: str, policy_json: str) -> None:
         now = time.time()
         self._conn.execute(
@@ -202,16 +226,19 @@ class StateStore:
         )
         self._conn.commit()
 
+    @_locked
     def get_network_policy(self, vm_id: str) -> str | None:
         row = self._conn.execute(
             "SELECT network_policy_json FROM sandboxes WHERE vm_id = ?", (vm_id,)
         ).fetchone()
         return row["network_policy_json"] if row else None
 
+    @_locked
     def get_sandbox(self, vm_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM sandboxes WHERE vm_id = ?", (vm_id,)).fetchone()
         return dict(row) if row else None
 
+    @_locked
     def list_active(self) -> list[dict]:
         """Return sandboxes not in Dead state."""
         rows = self._conn.execute(
@@ -219,6 +246,7 @@ class StateStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_locked
     def list_expired(self, now: float | None = None) -> list[dict]:
         """Return sandboxes whose timeout has passed."""
         now = now or time.time()
@@ -228,15 +256,18 @@ class StateStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_locked
     def list_in_state(self, state: SandboxState) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM sandboxes WHERE state = ?", (state.value,)
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_locked
     def delete_sandbox(self, vm_id: str) -> None:
         self._conn.execute("DELETE FROM sandboxes WHERE vm_id = ?", (vm_id,))
         self._conn.commit()
 
+    @_locked
     def close(self) -> None:
         self._conn.close()

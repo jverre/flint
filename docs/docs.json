@@ -36,7 +36,11 @@
         "groups": [
           {
             "group": "Overview",
-            "pages": ["introduction", "quickstart"]
+            "pages": [
+              "introduction",
+              "quickstart",
+              "web-ui"
+            ]
           }
         ]
       },
@@ -98,7 +102,11 @@
         "groups": [
           {
             "group": "Cluster",
-            "pages": ["cluster/overview", "cluster/deploy", "cluster/operations"]
+            "pages": [
+              "cluster/overview",
+              "cluster/deploy",
+              "cluster/operations"
+            ]
           }
         ]
       },

@@ -1,0 +1,33 @@
+.hosts .tblwrap{flex:0 1 auto;max-height:42%}
+.hosts .tbl td,.hosts .tbl th{padding:7px 7px}
+.hosts .nm{display:flex;align-items:center;gap:8px}
+.hosts .nmbtn{all:unset;cursor:pointer;font:600 12.5px/1 var(--sans)}
+.hosts .nmbtn:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.hosts .nm small{color:var(--dim);font-size:11px}
+.hosts .mc{display:flex;align-items:center;gap:7px}
+.hosts .mc .meter{width:56px}
+.hosts .chip-row{display:inline-flex;gap:10px;align-items:center}
+.hosts .mapbox{flex:1;min-height:0;position:relative;border-top:1px solid var(--border-subtle);display:flex}
+.hosts .mapbox .floor{width:100%;height:100%;display:block}
+.hosts .mapbox .h{position:absolute;left:0;bottom:6px;color:var(--fg-3);font:11.5px var(--sans)}
+.hosts .mapbox .lg{position:absolute;right:0;bottom:6px;color:var(--fg-3);font:11px var(--sans);display:flex;gap:14px;align-items:center}
+.hosts .lg .hz{display:inline-block;width:14px;height:8px;border:1px dashed var(--warn);background:repeating-linear-gradient(45deg,color-mix(in srgb,var(--warn) 25%,transparent) 0 2px,transparent 2px 5px);vertical-align:-1px}
+.hosts .kv{display:grid;grid-template-columns:78px 1fr;gap:4px 10px;font-size:12px;margin:2px 0 10px}
+.hosts .kv dt{font:12px var(--sans);color:var(--fg-2)}
+.hosts .kv dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hosts .acts-col{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.hosts .acts-col .btn{justify-content:center}
+.hosts .acts-col .btn.pri{grid-column:1/-1}
+.hosts .note{font:12px/1.5 var(--sans);color:var(--fg-2);margin-top:6px}
+.hosts .hv{display:grid;grid-template-columns:14px 1fr auto;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--border-subtle);font-size:11.5px}
+.hosts .hv b{font:600 12px var(--sans)} .hosts .hv:hover b{text-decoration:underline}
+.hosts .grow-sec{flex:1;display:flex;flex-direction:column;min-height:0}
+.hosts .feedbox{flex:1;min-height:0;overflow:hidden}
+.hosts .drains{display:flex;flex-direction:column;gap:6px}
+.hosts .drain{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--border-default);background:var(--bg-sunken);font:13px var(--sans)}
+.hosts .drain b{font-weight:600}
+.hosts .drain .meter{width:140px}
+.fld{display:flex;flex-direction:column;gap:6px;font:13px var(--sans);color:var(--fg-2)}
+.fld input{height:32px;padding:0 10px;border:1px solid var(--border-default);border-radius:6px;background:var(--bg-sunken);color:var(--fg-1);font:13px var(--mono)}
+.fld input:focus-visible{outline:2px solid var(--blue)}
+.note.errc,.errc{color:var(--err)}

@@ -38,6 +38,8 @@ flint = "flint.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flint"]
+# The web UI is gitignored build output (scripts/build-ui.sh); ship it when present.
+artifacts = ["src/flint/daemon/ui/**"]
 
 [build-system]
 requires = ["hatchling"]

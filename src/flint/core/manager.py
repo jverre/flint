@@ -296,9 +296,19 @@ class SandboxManager:
             entry.timeout_policy = policy
 
     def list_dicts(self) -> list[dict]:
-        """Return JSON-serializable dicts for all VMs."""
+        """Return JSON-serializable dicts for all VMs, paused ones included.
+
+        Pausing drops a VM from ``_sandboxes`` (its VMM is gone), so paused VMs
+        come from the state store, the same way ``get_dict`` finds them.
+        """
         with self._lock:
-            return [entry.to_dict() for entry in self._sandboxes.values()]
+            dicts = [entry.to_dict() for entry in self._sandboxes.values()]
+            live = set(self._sandboxes)
+        if self._state_store:
+            for row in self._state_store.list_in_state(SandboxState.PAUSED):
+                if row["vm_id"] not in live:
+                    dicts.append(self._row_dict(row))
+        return dicts
 
     def get_dict(self, sandbox_id: str) -> dict | None:
         """Return JSON-serializable dict for a single VM, or None."""
@@ -310,32 +320,37 @@ class SandboxManager:
         if self._state_store:
             row = self._state_store.get_sandbox(sandbox_id)
             if row:
-                timings = {}
-                if row.get("timings_json"):
-                    try:
-                        timings = json.loads(row["timings_json"])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                return {
-                    "vm_id": row["vm_id"],
-                    "pid": row["pid"],
-                    "state": row["state"],
-                    "template_id": row.get("template_id", "default"),
-                    "backend_kind": row.get("backend_kind", "linux-firecracker"),
-                    "agent_healthy": False,
-                    "created_at": row["created_at"],
-                    "boot_time_ms": row.get("boot_time_ms"),
-                    "ready_time_ms": None,
-                    "timings": timings,
-                    "log_lines": [],
-                    "line_count": 0,
-                    "network_policy": None,
-                    "timeout_seconds": None,
-                    "timeout_policy": row.get("timeout_policy"),
-                    "tenant": row.get("tenant") or "",
-                    "availability": row.get("availability") or "",
-                }
+                return self._row_dict(row)
         return None
+
+    @staticmethod
+    def _row_dict(row: dict) -> dict:
+        """VM dict for a VM known only to the state store (e.g. paused)."""
+        timings = {}
+        if row.get("timings_json"):
+            try:
+                timings = json.loads(row["timings_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {
+            "vm_id": row["vm_id"],
+            "pid": row["pid"],
+            "state": row["state"],
+            "template_id": row.get("template_id", "default"),
+            "backend_kind": row.get("backend_kind", "linux-firecracker"),
+            "agent_healthy": False,
+            "created_at": row["created_at"],
+            "boot_time_ms": row.get("boot_time_ms"),
+            "ready_time_ms": None,
+            "timings": timings,
+            "log_lines": [],
+            "line_count": 0,
+            "network_policy": None,
+            "timeout_seconds": None,
+            "timeout_policy": row.get("timeout_policy"),
+            "tenant": row.get("tenant") or "",
+            "availability": row.get("availability") or "",
+        }
 
     def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
         """Return the raw entry for a VM. None if not found."""

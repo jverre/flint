@@ -1,0 +1,98 @@
+/* Flint colour theme — "Stone & Spark".
+   Three layers. Pages and components use ONLY layer 2 (semantic) or the layer-3 aliases.
+   1 · primitives  — the raw palette, never referenced by components
+   2 · semantic    — roles (surface, text, border, accent, status, data, tenant), per theme
+   3 · aliases     — short names the kit already used (--bg, --text, --spark …) → semantic
+
+   Rules
+   - One accent: spark. Used for: the primary action, live/running, ignition, the active nav
+     marker. Never as a large fill, never for text longer than a word or a number.
+   - Status colours always come with a word or shape (dot + "Failed"), never colour alone.
+   - Text: --fg-1 body/headings, --fg-2 secondary, --fg-3 metadata only (ids, timestamps,
+     units). All three pass WCAG AA (4.5:1) on --bg-app and --bg-raised in both themes.
+   - Data: heat ramp for "how much" (memory, load), --info for CPU/neutral series,
+     status colours for thresholds only. Tenants get a fixed categorical hue each.
+   - The terminal is dark in both themes (--term-*). */
+
+:root{
+  /* ---------- 1 · primitives ---------- */
+  --stone-0:#ffffff; --stone-25:#f7f5f1; --stone-50:#f4f2ee; --stone-100:#ebe8e2; --stone-150:#e3dfd8;
+  --stone-200:#d3cec5; --stone-300:#a9a397; --stone-400:#7d8596; --stone-450:#6f7889; --stone-500:#5a6477;
+  --stone-600:#3b4354; --stone-700:#2b3446; --stone-750:#242c3a; --stone-800:#1f2633; --stone-850:#1a1f2a;
+  --stone-900:#151922; --stone-925:#12161e; --stone-950:#0f131a;
+  --ink-100:#eef1f7; --ink-300:#9ea7ba; --ink-700:#4d5566; --ink-900:#1a1e27;
+  --spark-300:#fdba74; --spark-400:#fb923c; --spark-500:#F97316; --spark-600:#ea580c; --spark-700:#c2410c;
+  --sky-300:#8eb5d9; --sky-400:#7d96c3; --sky-700:#3b6fb6; --sky-800:#4a6694;
+  --moss-300:#8fbf8f; --moss-700:#3f8a4a;
+  --ochre-300:#d6b16f; --ochre-700:#9a6a12;
+  --rose-300:#d38a94; --rose-700:#b4475a;
+  --iris-300:#c3a3d9; --iris-700:#8a5cb3;
+  --heat-d1:#876d44; --heat-d2:#ab8854; --heat-d3:#cfa56a; --heat-d4:#dfb679;
+  --heat-l1:#d9c29a; --heat-l2:#c49a55; --heat-l3:#a8782f; --heat-l4:#8a5f1f;
+}
+
+/* ---------- 2 · semantic — dark (default) ---------- */
+:root,[data-theme="dark"]{
+  color-scheme:dark;
+  --bg-app:var(--stone-900);      /* page */
+  --bg-rail:var(--stone-925);     /* sidebar: one step deeper than the page */
+  --bg-sunken:var(--stone-950);   /* wells, terminal, inputs */
+  --bg-raised:var(--stone-850);   /* panels, cards */
+  --bg-overlay:var(--stone-900);  /* dialogs, popovers (with shadow) */
+  --bg-hover:var(--stone-800);
+  --bg-selected:var(--stone-750);
+  --bg-scrim:#0b0e14b3;
+  --fg-1:var(--ink-100); --fg-2:var(--ink-300); --fg-3:#8890a2; --fg-label:var(--sky-400);
+  --fg-on-accent:#140a02;
+  --border-subtle:#2a3140; --border-default:var(--stone-600); --border-strong:var(--stone-500);
+  --accent:var(--spark-500); --accent-hover:var(--spark-400); --accent-text:var(--spark-400);
+  --accent-subtle:color-mix(in srgb,var(--spark-500) 14%,transparent); --accent-live:var(--spark-500);
+  --focus:var(--sky-300);
+  --ok:var(--moss-300); --warn:var(--ochre-300); --err:var(--rose-300); --info:var(--sky-300);
+  --ok-subtle:color-mix(in srgb,var(--moss-300) 14%,transparent);
+  --warn-subtle:color-mix(in srgb,var(--ochre-300) 14%,transparent);
+  --err-subtle:color-mix(in srgb,var(--rose-300) 14%,transparent);
+  --info-subtle:color-mix(in srgb,var(--sky-300) 12%,transparent);
+  --heat-1:var(--heat-d1); --heat-2:var(--heat-d2); --heat-3:var(--heat-d3); --heat-4:var(--heat-d4);
+  --data-neutral:var(--sky-300);
+  --tenant-1:var(--sky-300); --tenant-2:var(--moss-300); --tenant-3:var(--iris-300); --tenant-4:var(--ink-300);
+  /* iso map + cube materials */
+  --slab-top:#232b39; --slab-side:#1b212c; --slab-side-2:#171c25; --slab-grid:#2c3443; --cube-idle:#4a5366; --cube-edge:var(--stone-900);
+  --term-bg:var(--stone-950); --term-fg:#dfe4ee; --term-prompt:var(--sky-300); --term-err:var(--rose-300); --term-warn:var(--ochre-300); --term-dim:#8890a2;
+  --shadow:0 24px 60px #000a; --shadow-sm:0 10px 30px #0008;
+}
+
+/* ---------- 2 · semantic — light ("stone paper") ---------- */
+[data-theme="light"]{
+  color-scheme:light;
+  --bg-app:var(--stone-50); --bg-rail:#efece6; --bg-sunken:var(--stone-100);
+  --bg-raised:var(--stone-0); --bg-overlay:var(--stone-0); --bg-hover:var(--stone-100); --bg-selected:#e6e2db;
+  --bg-scrim:#2b2a2766;
+  --fg-1:var(--ink-900); --fg-2:var(--ink-700); --fg-3:#59606e; --fg-label:#3d5884;
+  --fg-on-accent:#ffffff;
+  --border-subtle:var(--stone-150); --border-default:var(--stone-200); --border-strong:var(--stone-300);
+  --accent:var(--spark-700); --accent-hover:#a8380a; --accent-text:#a8380a;
+  --accent-subtle:color-mix(in srgb,var(--spark-600) 12%,transparent); --accent-live:var(--spark-600);
+  --focus:#2c5e9f;
+  --ok:#2d7238; --warn:#7f570b; --err:#9e3a4d; --info:#2c5e9f;
+  --ok-subtle:color-mix(in srgb,var(--moss-700) 12%,transparent);
+  --warn-subtle:color-mix(in srgb,var(--ochre-700) 12%,transparent);
+  --err-subtle:color-mix(in srgb,var(--rose-700) 12%,transparent);
+  --info-subtle:color-mix(in srgb,var(--sky-700) 10%,transparent);
+  --heat-1:var(--heat-l1); --heat-2:var(--heat-l2); --heat-3:var(--heat-l3); --heat-4:var(--heat-l4);
+  --data-neutral:var(--sky-700);
+  --tenant-1:var(--sky-700); --tenant-2:var(--moss-700); --tenant-3:var(--iris-700); --tenant-4:var(--ink-700);
+  --slab-top:#ffffff; --slab-side:#e3dfd8; --slab-side-2:#d3cec5; --slab-grid:#ebe8e2; --cube-idle:#b9b3a8; --cube-edge:#f4f2ee;
+  --shadow:0 24px 60px #2b2a2733; --shadow-sm:0 8px 24px #2b2a2722;
+}
+
+/* ---------- 3 · aliases (existing kit + page names) ---------- */
+:root,[data-theme]{
+  --bg:var(--bg-app); --bg2:var(--bg-sunken); --surface:var(--bg-hover); --panel:var(--bg-selected);
+  --line:var(--border-subtle); --border:var(--border-default); --border2:var(--border-strong);
+  --text:var(--fg-1); --muted:var(--fg-2); --dim:var(--fg-3);
+  --slate:var(--fg-label); --blue:var(--info);
+  --spark:var(--accent); --spark-dim:var(--accent-subtle);
+  --h0:var(--heat-1); --h1:var(--heat-2); --h2:var(--heat-3); --h3:var(--heat-4);
+  --t-acme:var(--tenant-1); --t-lumen:var(--tenant-2); --t-orbit:var(--tenant-3); --t-default:var(--tenant-4);
+}
