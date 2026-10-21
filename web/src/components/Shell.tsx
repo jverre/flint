@@ -92,24 +92,20 @@ function Sidebar() {
   const title = cluster ? "Cluster" : "This host";
   const sub = cluster ? `${plat?.health.hosts_ready ?? 0}/${plat?.health.hosts ?? 0} hosts ready` : (plat?.health.backend_kind ?? "daemon");
   const [menu, setMenu] = useState(false);
-  // The menu only holds actions: leave demo data, or sign out of a cluster.
+  // The card is only there for its menu's actions: leave demo data, or sign out of a cluster.
   const hasMenu = !!plat?.mock || !!getToken();
   const theme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
   return (
     <nav className="rail" aria-label="Main">
       <div className="rail-top">
         <Link className="brand" to="/vms" aria-label="Flint home"><Cube s={20} /><span className="lbx">FLINT</span></Link>
-        {(() => {
-          const body = <>
+        {hasMenu && (
+          <button className="ws" id="wsbtn" aria-haspopup="menu" aria-expanded={menu} data-tip={`${title} · ${sub}`} onClick={() => setMenu((m) => !m)}>
             <span className="ws-mark" style={{ ["--env" as string]: `var(${envCol})` }}>{cluster ? "cp" : "fl"}</span>
             <span className="lbx ws-txt"><b>{title}</b><small><i className="env" style={{ ["--env" as string]: `var(${envCol})` }}>{plat?.mock ? "demo" : cluster ? "cluster" : "local"}</i> {sub}</small></span>
-          </>;
-          return hasMenu
-            ? <button className="ws" id="wsbtn" aria-haspopup="menu" aria-expanded={menu} data-tip={`${title} · ${sub}`} onClick={() => setMenu((m) => !m)}>
-                {body}<span className="lbx ws-chev"><Icon k="updown" s={14} /></span>
-              </button>
-            : <div className="ws static" data-tip={`${title} · ${sub}`}>{body}</div>;
-        })()}
+            <span className="lbx ws-chev"><Icon k="updown" s={14} /></span>
+          </button>
+        )}
         {menu && hasMenu && <ConnMenu onClose={() => setMenu(false)} />}
       </div>
       <div className="rail-nav" ref={nav} onMouseLeave={() => place(null)}>
