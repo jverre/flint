@@ -144,24 +144,24 @@ class DaemonClient:
         if tenant or self._tenant:
             params["tenant"] = tenant or self._tenant
         resp = self._mutate("POST", "/vms", params=params, json=body or None)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def kill(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
         resp = self._mutate("DELETE", f"/vms/{vm_id}")
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def list(self) -> list[dict]:
         resp = self._http.get("/vms")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vms"]
 
     def get(self, vm_id: str) -> dict | None:
         resp = self._http.get(f"/vms/{vm_id}")
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def connect_terminal(self, vm_id: str, on_output: Callable[[bytes], None]) -> None:
@@ -194,7 +194,7 @@ class DaemonClient:
             json={"cmd": cmd, "timeout": int(timeout)},
             timeout=timeout + 10,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     def run_code(self, vm_id: str, code: str, runtime: str | None = None, timeout: float = 60) -> dict:
@@ -209,7 +209,7 @@ class DaemonClient:
     def read_file(self, vm_id: str, path: str) -> bytes:
         """Read a file from the VM."""
         resp = self._http.get(f"/vms/{vm_id}/files", params={"path": path})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.content
 
     def write_file(self, vm_id: str, path: str, content: bytes, mode: str = "0644") -> None:
@@ -219,12 +219,12 @@ class DaemonClient:
             params={"path": path, "mode": mode},
             content=content,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def list_files(self, vm_id: str, path: str) -> list[dict]:
         """List files in a directory on the VM."""
         resp = self._http.get(f"/vms/{vm_id}/files/list", params={"path": path})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["entries"]
 
     # ── Network policy ─────────────────────────────────────────────────
@@ -232,12 +232,12 @@ class DaemonClient:
     def update_network_policy(self, vm_id: str, policy: dict) -> None:
         """Update the network policy (credential injection rules) for a sandbox."""
         resp = self._http.put(f"/vms/{vm_id}/network-policy", json=policy)
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def get_network_policy(self, vm_id: str) -> dict | None:
         """Get the current network policy for a sandbox."""
         resp = self._http.get(f"/vms/{vm_id}/network-policy")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json().get("network_policy")
 
     # ── Sandbox lifecycle ────────────────────────────────────────────────
@@ -245,7 +245,7 @@ class DaemonClient:
     def pause(self, vm_id: str) -> None:
         self.disconnect_terminal(vm_id)
         resp = self._mutate("POST", f"/vms/{vm_id}/pause")
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     def fork(self, vm_id: str, count: int = 1) -> list[dict]:
         """Fork a running VM into ``count`` new VMs (cluster control plane only)."""
@@ -270,7 +270,7 @@ class DaemonClient:
             f"/vms/{vm_id}",
             json={"timeout_seconds": timeout_seconds, "timeout_policy": policy},
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     # ── Template methods ───────────────────────────────────────────────────
 
@@ -280,24 +280,24 @@ class DaemonClient:
             json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb},
             timeout=600.0,
         )
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     def list_templates(self) -> list[dict]:
         resp = self._http.get("/templates")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["templates"]
 
     def get_template(self, template_id: str) -> dict | None:
         resp = self._http.get(f"/templates/{template_id}")
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["template"]
 
     def delete_template(self, template_id: str) -> None:
         resp = self._http.delete(f"/templates/{template_id}")
-        resp.raise_for_status()
+        _raise_for_status(resp)
 
     # ── Volumes ───────────────────────────────────────────────────────────
 
@@ -351,19 +351,19 @@ class DaemonClient:
 
     def get_config(self) -> dict:
         resp = self._http.get("/config")
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     def patch_config(self, overrides: dict) -> dict:
         resp = self._http.patch("/config", json=overrides)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()
 
     # ── Metrics ───────────────────────────────────────────────────────────
 
     def get_metrics(self, vm_id: str, window: int = 60) -> list[dict]:
         resp = self._http.get(f"/vms/{vm_id}/metrics", params={"window": window})
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return resp.json()["samples"]
 
     @staticmethod

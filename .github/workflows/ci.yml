@@ -219,6 +219,9 @@ jobs:
           done
           echo "=== Kernel log: NBD, block and ext4 ==="
           sudo dmesg -T | grep -iE "nbd|I/O error|EXT4|blk_update" | tail -120 || true
+          # Errors anywhere in the daemon log: the PR comment only has its tail.
+          echo "=== Daemon errors ==="
+          sudo grep -n -A25 -E "Traceback|failed:|ERROR" /tmp/flint-test-daemon.log /tmp/flint-test-state/flint-debug.log 2>/dev/null | tail -400 || true
       - name: Post diagnostics comment on failure
         if: failure() && github.event_name == 'pull_request'
         env:
@@ -264,6 +267,11 @@ jobs:
             echo "#### Pytest tail (last 8000 chars)"
             echo '```'
             tail -c 8000 /tmp/pytest.log 2>/dev/null || echo '(no pytest log)'
+            echo '```'
+            echo
+            echo "#### Daemon errors (first 6000 chars)"
+            echo '```'
+            sudo grep -h -A25 -E "Traceback|failed:|ERROR" /tmp/flint-test-daemon.log /tmp/flint-test-state/flint-debug.log 2>/dev/null | head -c 6000 || echo '(none)'
             echo '```'
             echo
             echo "#### Daemon log tail (last 6000 chars)"

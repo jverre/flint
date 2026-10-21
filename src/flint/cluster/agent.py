@@ -114,6 +114,15 @@ class ClusterAgent:
         self._api_pausing: set[str] = set()
         self.last_lease_ok = 0.0
         self._lease_path = os.path.join(self.dir, "lease.json")
+        # When the current lease runs out (time.monotonic()); the fence in
+        # snapd always expires with it. Starts from the persisted lease, so a
+        # restarted agent can fence VMs it starts before its first heartbeat.
+        lease = self._load_json(self._lease_path)
+        expires = lease.get("renewed_at", 0.0) + lease.get("ttl_ms", 0) / 1000
+        self._lease_deadline = time.monotonic() + (expires - time.time())
+        # Serialises fence updates from heartbeats and from VM starts, so an
+        # older list of VMs never overwrites a newer one.
+        self._fence_lock = threading.Lock()
 
     # ── setup ────────────────────────────────────────────────────────────
 
@@ -206,7 +215,6 @@ class ClusterAgent:
                 log.exception("cluster housekeeping failed")
 
     def heartbeat_once(self) -> None:
-        mgr = self.daemon.manager
         sent = time.monotonic()
         try:
             cached = self.snapd.cache().get("complete", [])
@@ -224,16 +232,8 @@ class ClusterAgent:
         self.lease_ttl_ms = int(resp.get("lease_ttl_ms", self.lease_ttl_ms))
         # The lease runs from when we *sent* the heartbeat, so our deadline is
         # never later than the one the control plane counts from receipt.
-        remaining = int(self.lease_ttl_ms - (time.monotonic() - sent) * 1000)
-        leased = []
-        with mgr._lock:
-            for e in mgr._sandboxes.values():
-                if e.state == SandboxState.RUNNING and e.availability in LEASED and e.pid > 0:
-                    leased.append({"vm_id": e.vm_id, "pid": e.pid})
-        if leased and remaining > 0:
-            self.snapd.fence(remaining, leased)
-        elif not leased:
-            self.snapd.disarm()
+        self._lease_deadline = sent + self.lease_ttl_ms / 1000
+        self._arm_fence()
         self.last_lease_ok = time.time()
         # Persisted so a restarted agent knows whether its leases lapsed meanwhile;
         # backdated to the send time like the fence deadline.
@@ -246,6 +246,36 @@ class ClusterAgent:
                 log.exception("evict %s failed", vm_id[:8])
             with self._lock:
                 self._pauses.pop(vm_id, None)
+
+    def _arm_fence(self) -> bool:
+        """Point snapd's fence at the leased VMs running here now, expiring
+        with the current lease. False if the lease has run out: snapd keeps
+        its last deadline, which has passed or is about to."""
+        mgr = self.daemon.manager
+        with self._fence_lock:
+            with mgr._lock:
+                leased = [{"vm_id": e.vm_id, "pid": e.pid} for e in mgr._sandboxes.values()
+                          if e.state == SandboxState.RUNNING and e.availability in LEASED and e.pid > 0]
+            remaining = int((self._lease_deadline - time.monotonic()) * 1000)
+            if not leased:
+                self.snapd.disarm()
+            elif remaining > 0:
+                self.snapd.fence(remaining, leased)
+            else:
+                return False
+            return True
+
+    def fence_started(self, vm_id: str) -> None:
+        """Fence a leased VM that just started here (created, restored or
+        resumed) before the API answers. Waiting for the next heartbeat would
+        leave it unfenced for up to HEARTBEAT_INTERVAL: if this agent hung
+        then, the control plane would recover it elsewhere while this copy
+        kept running. Raises if it can't be fenced; the caller kills it."""
+        entry = self.daemon.manager.get_entry(vm_id)
+        if entry is None or entry.availability not in LEASED:
+            return
+        if not self._arm_fence():
+            raise RuntimeError("this host's lease has lapsed")
 
     def _vm_reports(self) -> list[dict]:
         mgr = self.daemon.manager
