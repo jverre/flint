@@ -45,6 +45,9 @@ subcommands. Differences from the plan below:
   exercised in tests: it would reset the test machine.
 - **Tenant quotas**: VM count only (`PUT /v1/tenants/{t}/quota`), checked on
   create, fork and VM-set members.
+- **VM operations are serialised across replicas** (#29): per-VM operation
+  locks, takeover of operations a crashed replica left half-done, and
+  idempotent retries via request keys.
 
 Not done yet:
 
@@ -55,6 +58,15 @@ Not done yet:
   enforcement (agents report their version; nothing checks it).
 - The AWS example validates against the provider schema but hasn't been
   applied.
+- Planned in M3/M4 but not built: template distribution policies
+  (`prefetch`, warm pool), fork `min_count`, the `cluster.capacity_low`
+  event and scale-up webhook, and drain honouring a VM set's
+  `max_unavailable`.
+- The gateway reads the database on every request; the cached VM→host map
+  that keeps it serving during a Postgres outage isn't built.
+- Peer chunk fetches are authorised by host certificate only: any host can
+  fetch any chunk whose hash it knows, not just chunks of snapshots
+  assigned to it (Verification 8).
 
 ## What HA means for a VM
 
