@@ -22,33 +22,36 @@ _SOURCE_FILE = "source"
 _INPUTS_FILE = "inputs"
 
 
-def _golden_inputs() -> str:
-    """Identity of the kernel and rootfs a default golden snapshot is built from."""
+def _golden_inputs(machine: str) -> str:
+    """Identity of the kernel, rootfs and VM shape a default golden snapshot is built from."""
     from . import config
 
     lines = []
     for path in (config.KERNEL_PATH, config.SOURCE_ROOTFS):
         st = os.stat(path)
         lines.append(f"{os.path.abspath(path)} {st.st_size} {st.st_mtime_ns}")
+    if machine:
+        lines.append(machine)
     return "\n".join(lines) + "\n"
 
 
-def golden_inputs_current(golden_dir: str) -> bool:
-    """False if the golden snapshot in ``golden_dir`` predates the current kernel or rootfs.
+def golden_inputs_current(golden_dir: str, machine: str = "") -> bool:
+    """False if the golden snapshot in ``golden_dir`` predates the current kernel, rootfs or ``machine``.
 
-    The kernel lives in the snapshot's memory and the rootfs in its disk, so
-    installing a new one only takes effect once the snapshot is rebuilt.
+    The kernel lives in the snapshot's memory, the rootfs in its disk and the
+    VM shape (vCPUs, RAM, cmdline) in its config, so changing any of them only
+    takes effect once the snapshot is rebuilt.
     """
     try:
         with open(os.path.join(golden_dir, _INPUTS_FILE)) as f:
-            return f.read() == _golden_inputs()
+            return f.read() == _golden_inputs(machine)
     except OSError:
         return False
 
 
-def record_golden_inputs(golden_dir: str) -> None:
+def record_golden_inputs(golden_dir: str, machine: str = "") -> None:
     with open(os.path.join(golden_dir, _INPUTS_FILE), "w") as f:
-        f.write(_golden_inputs())
+        f.write(_golden_inputs(machine))
 
 
 def sparse_copy(src: str, dst: str) -> None:
