@@ -57,7 +57,6 @@ export default function Logs({ vm, running, onResume, resuming }: TabProps) {
       <div className="vm-log" ref={el} role="log" aria-label="VM log lines">
         {shown.length ? shown.map((l) => <div key={l.n}><span className="ts">[{l.ts}]</span> <span>{l.msg}</span></div>) : <p className="vm-note">{lines.length ? "No lines match." : conn === "connecting" ? "Connecting…" : "No log lines yet."}</p>}
       </div>
-      <p className="vm-note dim">These are Flint lifecycle lines (create, pause, resume, volumes). Guest console output is not captured yet.</p>
     </div>
   );
 }

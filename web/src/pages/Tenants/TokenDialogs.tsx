@@ -46,7 +46,7 @@ export function RevokeDialog({ token, onClose }: { token: Token; onClose: () => 
   const qc = useQueryClient(), toast = useToast();
   return (
     <Dialog open onClose={onClose} title={`Revoke ${token.name || token.id}?`} width={460}
-      sub="Anything using this token stops working. It can take up to 10 seconds to take effect on every replica."
+      sub="Anything using this token stops working."
       actions={[{ label: "Cancel", kind: "ghost" }, { label: "Revoke", kind: "danger", onClick: async () => {
         try { await tenantActions.revokeToken(token.id); qc.invalidateQueries({ queryKey: ["tokens"] }); toast(`${token.name || token.id} revoked`); }
         catch (e) { toast(errMsg(e), { kind: "err" }); return false; }

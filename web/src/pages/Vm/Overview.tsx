@@ -190,7 +190,7 @@ export default function Overview({ vm, running }: TabProps) {
         <Processes vm={vm} running={running} />
         <Startup vm={vm} />
         <section>
-          <Head title="Network" meta={<span className="dim">values hidden</span>} />
+          <Head title="Network" />
           <NetworkView vm={vm} />
         </section>
       </div>

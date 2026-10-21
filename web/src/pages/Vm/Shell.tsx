@@ -60,12 +60,10 @@ function ShellTerm({ vm, visible }: { vm: VM; visible: boolean }) {
       <div className="vm-tline" role="status">
         <span className={`vm-conn ${conn}`}><span className="d" />{conn === "connected" ? "Connected" : conn === "connecting" ? "Connecting…" : "Disconnected"}</span>
         {conn === "disconnected" && <button className="btn sm" onClick={() => setNonce((n) => n + 1)}>Reconnect</button>}
-        <span className="dim">Every connection starts a new shell; there is no scrollback or reattach. Terminal size is fixed at {COLS}×{ROWS}.</span>
       </div>
       <div className="vm-term" ref={wrap} onMouseDown={() => setTimeout(() => term.current?.focus(), 0)}>
         <div className="vm-termbox" ref={box}><div className="vm-termhost" ref={host} /></div>
       </div>
-      <p className="vm-note dim">Credentials are added by the proxy outside the VM and are never visible inside it, so <code>env | grep TOKEN</code> is empty on purpose.</p>
     </div>
   );
 }
