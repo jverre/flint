@@ -152,6 +152,10 @@ def _running_count(mgr: SandboxManager) -> int:
         return sum(1 for e in mgr._sandboxes.values() if e.state != SandboxState.PAUSED)
 
 
+class _Unfenced(RuntimeError):
+    """A leased VM started but couldn't be fenced, so it was killed."""
+
+
 @app.post("/vms")
 async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, tenant: str = ""):
     """Create a VM. A cluster control plane also passes, in the body:
@@ -190,6 +194,16 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
             raise HTTPException(status_code=507, detail="host is full")
 
     def _create() -> str:
+        vm_id = _start()
+        if daemon.cluster:
+            try:
+                daemon.cluster.fence_started(vm_id)
+            except Exception as e:
+                daemon.kill_vm(vm_id)
+                raise _Unfenced(f"VM {vm_id[:8]} not fenced, killed it: {e}") from e
+        return vm_id
+
+    def _start() -> str:
         if snapshot:
             return daemon.cluster.restore_vm(
                 vm_id, snapshot, template_id=template_id, allow_internet_access=allow_internet_access,
@@ -212,6 +226,11 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
     loop = asyncio.get_event_loop()
     try:
         vm_id = await loop.run_in_executor(None, _create)
+    except _Unfenced as e:
+        log.exception("POST /vms — %s", e)
+        print(f"POST /vms — {e}")
+        # 503: the scheduler places the VM on another host.
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         log.exception("POST /vms — VM creation failed")
         print(f"POST /vms — VM creation failed: {e}")
@@ -348,6 +367,13 @@ def resume_vm(vm_id: str):
         print(f"POST /vms/{vm_id[:8]}/resume — failed: {e}")
         raise HTTPException(status_code=500, detail=f"Resume failed: {e}")
     if daemon.cluster:
+        try:
+            daemon.cluster.fence_started(vm_id)
+        except Exception as e:
+            # Running unfenced could leave two copies; paused, it's safe here.
+            log.exception("POST /vms/%s/resume — not fenced", vm_id[:8])
+            mgr.pause(vm_id)
+            raise HTTPException(status_code=503, detail=f"VM resumed but not fenced, paused it again: {e}")
         daemon.cluster.forget_pause(vm_id)
     result = mgr.get_dict(vm_id) or {"vm_id": vm_id}
     _write_state(daemon)

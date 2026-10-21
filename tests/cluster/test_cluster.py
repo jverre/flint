@@ -144,6 +144,10 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
     durable.write_file("/root/marker", "durable")
     wait_for(lambda: state(durable).get("checkpoint_at"), 30, "the durable VM's first checkpoint")
     pid = state(durable)["pid"]
+    # Started right before the hang, most likely between two heartbeats: it
+    # must be fenced from the moment it exists, not from the next heartbeat.
+    fresh = make_vm(on="b", availability="restartable")
+    fresh_pid = state(fresh)["pid"]
     hosts["b"].freeze()  # the agent hangs; snapd (the fence) keeps running
     t0 = time.time()
     killed_at = recovered_at = None
@@ -151,7 +155,7 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
     def watch_pid():  # its own thread: API calls below can be slow while b hangs
         nonlocal killed_at
         while killed_at is None and time.time() - t0 < 40:
-            if not running(pid):
+            if not running(pid) and not running(fresh_pid):
                 killed_at = time.time() - t0
             time.sleep(0.05)
 
@@ -163,7 +167,9 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
             recovered_at = time.time() - t0
         time.sleep(0.1)
     watcher.join(max(0.0, 40 - (time.time() - t0)))
-    assert killed_at is not None, f"the fence never killed the durable VM\n{cluster.diagnostics()}"
+    assert killed_at is not None, (
+        f"the fence never killed {'the restartable VM started just before the hang' if running(fresh_pid) else 'the durable VM'}"
+        f"\n{cluster.diagnostics()}")
     assert recovered_at is not None, f"durable VM not recovered\n{cluster.diagnostics()}"
     assert killed_at < recovered_at, f"recovered at {recovered_at:.1f}s before the old copy was fenced at {killed_at:.1f}s"
     assert durable.read_file("/root/marker") == b"durable"
