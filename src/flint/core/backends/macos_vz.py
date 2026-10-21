@@ -50,6 +50,10 @@ class _MacVMHandle:
     boot_config_path: str = ""
     state_path: str = ""
     process_id: int = field(default_factory=os.getpid)
+    # VZVirtualMachine doesn't expose its configuration; save/restore checks need it.
+    config: Any = None
+    # Set while a pause pauses, saves and stops the VM, so health checks leave it alone.
+    pausing: bool = False
     # Keep references to ObjC objects so PyObjC doesn't GC them (closing pipe fds).
     _objc_refs: list[Any] = field(default_factory=list)
 
@@ -201,6 +205,7 @@ class MacOSVirtualizationBackend(HostBackend):
         allow_internet_access: bool,
         use_pool: bool,
         use_pyroute2: bool,
+        vm_id: str | None = None,
     ) -> BackendBootResult:
         if template_id != DEFAULT_TEMPLATE_ID:
             raise NotImplementedError("Custom macOS templates are not implemented yet.")
@@ -216,7 +221,7 @@ class MacOSVirtualizationBackend(HostBackend):
             if not os.path.exists(artifact[key]):
                 raise RuntimeError(f"Configured macOS backend artifact is missing: {artifact[key]}")
 
-        vm_id = str(uuid.uuid4())
+        vm_id = vm_id or str(uuid.uuid4())
         runtime_dir = os.path.join(DATA_DIR, vm_id)
         os.makedirs(runtime_dir, exist_ok=True)
         disk_path = os.path.join(runtime_dir, "rootfs.img")
@@ -286,7 +291,17 @@ class MacOSVirtualizationBackend(HostBackend):
         if handle is None:
             raise RuntimeError("macOS VM handle not found")
 
-        self._runtime.call(lambda: self._save_vm_state(handle))
+        handle.pausing = True
+        try:
+            self._runtime.call(lambda: self._await(handle.vm.pauseWithCompletionHandler_, 10, "pause"))
+            try:
+                self._runtime.call(lambda: self._save_vm_state(handle))
+            except Exception:
+                self._runtime.call(lambda: self._await(handle.vm.resumeWithCompletionHandler_, 10, "resume"))
+                raise
+        except Exception:
+            handle.pausing = False
+            raise
         self._runtime.call(lambda: self._stop_vm(handle))
         handle.close()
         self._handles.pop(entry.vm_id, None)
@@ -331,6 +346,7 @@ class MacOSVirtualizationBackend(HostBackend):
                 console_log_path=console_log_path,
                 state_path=state_path,
                 resume_state_path=state_path,
+                guest_ip=meta.get("guest_ip", ""),
             )
         )
         self._handles[row["vm_id"]] = handle
@@ -448,6 +464,8 @@ class MacOSVirtualizationBackend(HostBackend):
         handle = self._coerce_handle(entry)
         if handle is None:
             return False, "VM handle not found"
+        if handle.pausing:
+            return True, None
         # Check the VZ VM state directly — HTTP health may be unreachable over NAT.
         try:
             state = handle.vm.state()
@@ -500,6 +518,7 @@ class MacOSVirtualizationBackend(HostBackend):
         console_log_path: str,
         state_path: str,
         resume_state_path: str | None,
+        guest_ip: str = "",
     ) -> _MacVMHandle:
         import Virtualization as VZ
         from Foundation import NSFileHandle, NSURL
@@ -538,6 +557,13 @@ class MacOSVirtualizationBackend(HostBackend):
         config.setStorageDevices_([block])
 
         net = VZ.VZVirtioNetworkDeviceConfiguration.new()
+        mac_path = os.path.join(runtime_dir, "mac.txt")
+        if os.path.exists(mac_path):
+            with open(mac_path) as f:
+                net.setMACAddress_(VZ.VZMACAddress.alloc().initWithString_(f.read().strip()))
+        else:
+            with open(mac_path, "w") as f:
+                f.write(net.MACAddress().string())
         net.setAttachment_(VZ.VZNATNetworkDeviceAttachment.new())
         config.setNetworkDevices_([net])
 
@@ -570,6 +596,7 @@ class MacOSVirtualizationBackend(HostBackend):
             machine_id_path=machine_id_path,
             boot_config_path=os.path.join(runtime_dir, "boot.json"),
             state_path=state_path,
+            config=config,
             # Prevent PyObjC from GC'ing these (which closes the pipe fds).
             _objc_refs=[config, in_handle, out_handle, serial_attachment, attachment],
         )
@@ -631,6 +658,14 @@ class MacOSVirtualizationBackend(HostBackend):
         if errors.get("start") is not None:
             raise RuntimeError(f"Failed to start macOS VM: {errors['start']}")
 
+        if resume_state_path:
+            # A restored VM is paused, and its guest printed READY before it was saved.
+            self._await(vm.resumeWithCompletionHandler_, max(deadline - time.monotonic(), 1), "resume")
+            handle.guest_ip = guest_ip
+            if guest_ip:
+                self._wait_for_http_agent(guest_ip, timeout=5)
+            return handle
+
         while time.monotonic() < deadline:
             NSRunLoop.currentRunLoop().runUntilDate_(
                 NSDate.dateWithTimeIntervalSinceNow_(0.1)
@@ -683,6 +718,28 @@ class MacOSVirtualizationBackend(HostBackend):
         if errors.get("stop") is not None:
             raise RuntimeError(f"Failed to stop macOS VM: {errors['stop']}")
 
+    @staticmethod
+    def _await(start: Callable[[Callable], None], timeout: float, what: str) -> None:
+        """Call a VZ method that takes a completion handler; pump the RunLoop until it completes."""
+        from Foundation import NSRunLoop, NSDate
+
+        event = threading.Event()
+        errors: list[Any] = []
+
+        def _done(error_obj=None) -> None:
+            if error_obj is not None:
+                errors.append(error_obj)
+            event.set()
+
+        start(_done)
+        deadline = time.monotonic() + timeout
+        while not event.is_set() and time.monotonic() < deadline:
+            NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+        if not event.is_set():
+            raise RuntimeError(f"Timed out waiting for macOS VM {what}")
+        if errors:
+            raise RuntimeError(f"Failed to {what} macOS VM: {errors[0]}")
+
     def _save_vm_state(self, handle: _MacVMHandle) -> None:
         from Foundation import NSRunLoop, NSDate, NSURL
 
@@ -694,10 +751,12 @@ class MacOSVirtualizationBackend(HostBackend):
                 errors["save"] = error_obj
             event.set()
 
-        config = handle.vm.configuration() if callable(getattr(handle.vm, "configuration", None)) else handle.vm.configuration()
-        valid, error = config.validateSaveRestoreSupportWithError_(None)
+        valid, error = handle.config.validateSaveRestoreSupportWithError_(None)
         if not valid:
             raise RuntimeError(f"macOS VM save/restore unsupported: {error}")
+        # VZ won't overwrite the state of an earlier pause.
+        if os.path.exists(handle.state_path):
+            os.remove(handle.state_path)
 
         handle.vm.saveMachineStateToURL_completionHandler_(NSURL.fileURLWithPath_(handle.state_path), _done)
         deadline = time.monotonic() + VZ_READY_TIMEOUT

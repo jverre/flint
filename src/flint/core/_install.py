@@ -74,6 +74,14 @@ def ensure_vz_entitlement() -> None:
         real = os.path.realpath(venv_python)
         os.remove(venv_python)
         shutil.copy2(real, venv_python)
+        # Standalone builds (uv's) load libpython from @executable_path/../lib,
+        # which doesn't exist next to the copy: point it at the original.
+        libs = subprocess.run(["otool", "-L", venv_python], capture_output=True, text=True, check=True).stdout
+        for line in libs.splitlines()[1:]:
+            ref = line.strip().split(" (", 1)[0]
+            if ref.startswith("@executable_path/"):
+                target = os.path.normpath(os.path.join(os.path.dirname(real), ref[len("@executable_path/"):]))
+                subprocess.run(["install_name_tool", "-change", ref, target, venv_python], check=True)
 
     # Write the entitlements plist once.
     plist_path = os.path.join(tempfile.gettempdir(), "flint-vz-entitlements.plist")
