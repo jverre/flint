@@ -977,7 +977,7 @@ class FlintDaemon:
         self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
         self.volumes = Volumes(self._state_store._conn, self.manager, self._state_store)
         self.manager.kill_hooks.append(self._release_mounts)
-        self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [])
+        self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [], self.backend.usage)
         _write_state(self)
 
     def _release_mounts(self, vm_id: str) -> None:

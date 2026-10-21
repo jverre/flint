@@ -475,6 +475,24 @@ class MacOSVirtualizationBackend(HostBackend):
         except Exception as exc:
             return False, str(exc)
 
+    def usage(self, entry) -> tuple[float, int] | None:
+        """The guest's own numbers: every VM runs inside the daemon's process, so
+        host process stats can't tell them apart."""
+        handle = self._coerce_handle(entry)
+        if handle is None or handle.pausing:
+            return None
+        files = {}
+        for name in ("stat", "meminfo"):
+            status, body = self.proxy_guest_request(entry, "GET", f"/files?path=/proc/{name}", timeout=1)
+            if status != 200:
+                return None
+            files[name] = body.decode(errors="replace")
+        # cpu  user nice system idle iowait irq softirq steal guest guest_nice, in USER_HZ (100)
+        ticks = [int(x) for x in files["stat"].split("\n", 1)[0].split()[1:9]]
+        busy = sum(ticks) - ticks[3] - ticks[4]
+        mem = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in files["meminfo"].splitlines() if ":" in line)}
+        return busy / 100, (mem["MemTotal"] - mem["MemAvailable"]) * 1024
+
     def recover_row(self, row: dict):
         pause_state_ref = row.get("pause_state_ref")
         if pause_state_ref and os.path.exists(pause_state_ref):
