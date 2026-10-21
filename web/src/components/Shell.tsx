@@ -1,15 +1,15 @@
-// App frame: full-height sidebar, centred search, page outlet, key-hint footer.
+// App frame: full-height sidebar, centred search, page outlet.
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { recentVMs, useEvents, useHosts, useIsAdmin, usePlatform, useTemplates, useVms } from "../api/hooks";
+import { recentVMs, useHosts, useIsAdmin, usePlatform, useTemplates, useVms } from "../api/hooks";
 import { getToken, setToken } from "../api/client";
 import { cubeSVG, token } from "../kit/svg";
 import { dispatchPageKey, isTyping, keyName, type KeyHint } from "../kit/keys";
 import { stateLabel } from "../kit/format";
-import { Dialog, StateChip, useTick } from "./ui";
+import { Dialog, StateChip } from "./ui";
 import NewVmDrawer from "../pages/NewVm";
 
-// ---------- page key hints (footer + "?" list) ----------
+// ---------- page key hints (the "?" list) ----------
 const HintCtx = createContext<(h: KeyHint[]) => void>(() => {});
 export function useKeyHints(hints: KeyHint[]) {
   const set = useContext(HintCtx);
@@ -69,10 +69,8 @@ function Sidebar() {
   const vms = useVms().data ?? [];
   const hosts = useHosts(admin).data ?? [];
   const tpls = useTemplates().data ?? [];
-  const { conn, lastAt } = useEvents();
   const [, force] = useState(0);
   useEffect(() => { const f = () => force((x) => x + 1); window.addEventListener("flint:recent", f); return () => window.removeEventListener("flint:recent", f); }, []);
-  useTick(1000);
   const nav = useRef<HTMLDivElement>(null), hov = useRef<HTMLSpanElement>(null);
   const place = (a: HTMLElement | null) => {
     const h = hov.current; if (!h) return;
@@ -90,22 +88,25 @@ function Sidebar() {
     { to: "/templates", k: "templates", label: "Templates", key: "g p", n: tpls.length, badge: null },
     { to: "/loadtest", k: "loadtest", label: "Load test", key: "g l", n: null as number | null, badge: null },
   ];
-  const since = lastAt ? Math.round((Date.now() - lastAt) / 1000) : null;
   const envCol = plat?.mock ? "--info" : cluster ? "--accent" : "--ok";
   const title = cluster ? "Cluster" : "This host";
   const sub = cluster ? `${plat?.health.hosts_ready ?? 0}/${plat?.health.hosts ?? 0} hosts ready` : (plat?.health.backend_kind ?? "daemon");
   const [menu, setMenu] = useState(false);
+  // The card is only there for its menu's actions: leave demo data, or sign out of a cluster.
+  const hasMenu = !!plat?.mock || !!getToken();
   const theme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
   return (
     <nav className="rail" aria-label="Main">
       <div className="rail-top">
         <Link className="brand" to="/vms" aria-label="Flint home"><Cube s={20} /><span className="lbx">FLINT</span></Link>
-        <button className="ws" id="wsbtn" aria-haspopup="menu" aria-expanded={menu} data-tip={`${title} · ${sub}`} onClick={() => setMenu((m) => !m)}>
-          <span className="ws-mark" style={{ ["--env" as string]: `var(${envCol})` }}>{cluster ? "cp" : "fl"}</span>
-          <span className="lbx ws-txt"><b>{title}</b><small><i className="env" style={{ ["--env" as string]: `var(${envCol})` }}>{plat?.mock ? "demo" : cluster ? "cluster" : "local"}</i> {sub}</small></span>
-          <span className="lbx ws-chev"><Icon k="updown" s={14} /></span>
-        </button>
-        {menu && <ConnMenu onClose={() => setMenu(false)} />}
+        {hasMenu && (
+          <button className="ws" id="wsbtn" aria-haspopup="menu" aria-expanded={menu} data-tip={`${title} · ${sub}`} onClick={() => setMenu((m) => !m)}>
+            <span className="ws-mark" style={{ ["--env" as string]: `var(${envCol})` }}>{cluster ? "cp" : "fl"}</span>
+            <span className="lbx ws-txt"><b>{title}</b><small><i className="env" style={{ ["--env" as string]: `var(${envCol})` }}>{plat?.mock ? "demo" : cluster ? "cluster" : "local"}</i> {sub}</small></span>
+            <span className="lbx ws-chev"><Icon k="updown" s={14} /></span>
+          </button>
+        )}
+        {menu && hasMenu && <ConnMenu onClose={() => setMenu(false)} />}
       </div>
       <div className="rail-nav" ref={nav} onMouseLeave={() => place(null)}>
         <span className="hov" ref={hov} aria-hidden="true" />
@@ -136,15 +137,7 @@ function Sidebar() {
         </>
       )}
       <div className="rail-foot">
-        <div className="me">
-          <span className="av" aria-hidden="true">{cluster ? (plat?.access === "admin" ? "AD" : "SV") : "FL"}</span>
-          <span className="lbx me-t"><b>{cluster ? (plat?.access === "admin" ? "Admin token" : "Service token") : "Local daemon"}</b><small>{plat?.mock ? "demo data" : location.host}</small></span>
-        </div>
         <div className="ctl">
-          <div className={`sync lbx${conn === "live" && since !== null && since < 1 ? " tick" : ""}`} data-tip="Live updates">
-            <span className="beat" style={conn === "live" ? undefined : { background: conn === "down" ? "var(--err)" : "var(--warn)" }} />
-            <span>{conn === "live" ? (since === null || since < 2 ? "Live" : `Live · ${since < 60 ? since + "s" : Math.floor(since / 60) + "m"}`) : conn === "down" ? "Reconnecting…" : "Connecting…"}</span>
-          </div>
           <span className="me-acts">
             <button className="ib" aria-label="Keyboard shortcuts (?)" data-tip="Shortcuts · ?" onClick={() => window.dispatchEvent(new Event("flint:help"))}><Icon k="keys" /></button>
             <button className="ib" aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`} data-tip={`${theme === "light" ? "Dark" : "Light"} theme`} onClick={() => setTheme(theme === "light" ? "dark" : "light")}><Icon k={theme === "light" ? "moon" : "sun"} /></button>
@@ -173,7 +166,6 @@ function ConnMenu({ onClose }: { onClose: () => void }) {
       <div className="msep" />
       {plat?.mock && <button className="mi" role="menuitem" onClick={() => { sessionStorage.removeItem("flint.mock"); location.href = location.pathname + "?live"; }}><Icon k="out" /><span className="grow">Leave demo data</span></button>}
       {getToken() && <button className="mi" role="menuitem" onClick={() => { setToken(""); location.reload(); }}><Icon k="out" /><span className="grow">Sign out<small>forget the API token in this browser</small></span></button>}
-      {!plat?.mock && !getToken() && <div className="mi" style={{ cursor: "default" }}><span className="grow"><small>The daemon has no sign-in; it listens on localhost.</small></span></div>}
     </div>
   );
 }
@@ -288,10 +280,6 @@ export default function Shell() {
           </Dialog>
           {params.get("new") && <NewVmDrawer onClose={closeNew} template={params.get("template") ?? undefined} />}
         </main>
-        <footer className="foot">
-          {hints.slice(0, 5).map((h) => <span key={h.k}><span className="kbd">{h.k}</span> {h.label}</span>)}
-          <span className="r"><span className="kbd">?</span> all shortcuts</span>
-        </footer>
       </div>
     </HintCtx.Provider>
   );
