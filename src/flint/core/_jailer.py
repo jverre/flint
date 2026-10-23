@@ -73,9 +73,10 @@ def build_jailer_command(spec: JailSpec) -> list[str]:
 
 
 def cleanup_jailer(chroot_base: str, vm_id: str) -> None:
-    """Remove chroot tree and cgroup entries."""
+    """Wipe and remove the chroot tree, and remove the cgroup entries."""
+    from ._wipe import wipe_tree
     if os.path.isdir(chroot_base):
-        shutil.rmtree(chroot_base, ignore_errors=True)
+        wipe_tree(chroot_base, vm_id)
     if JAILER_CGROUP_VER == 2:
         cgroup_path = f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{vm_id}"
         if os.path.isdir(cgroup_path):

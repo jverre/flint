@@ -294,7 +294,8 @@ class LinuxCloudHypervisorBackend(HostBackend):
             try:
                 _ch.vm_resume(jail.socket_path)
             finally:
-                shutil.rmtree(staging, ignore_errors=True)
+                from flint.core._wipe import wipe_tree
+                wipe_tree(staging, entry.vm_id)  # a copy of the VM's memory
 
     def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
         from flint.core._ch_jail import JAIL_ROOTFS
@@ -617,7 +618,8 @@ class LinuxCloudHypervisorBackend(HostBackend):
         ChJail(vm_id).cleanup()
         # Sandboxes created before CH was jailed kept their files in the data dir.
         if vm_dir and not vm_dir.startswith(CH_JAIL_DIR):
-            shutil.rmtree(vm_dir, ignore_errors=True)
+            from flint.core._wipe import wipe_tree
+            wipe_tree(vm_dir, vm_id)
 
 
 from .registry import register as _register

@@ -126,7 +126,8 @@ class ChJail:
             f.write(str(pid))
 
     def cleanup(self) -> None:
-        shutil.rmtree(self.base, ignore_errors=True)
+        from ._wipe import wipe_tree
+        wipe_tree(self.base, self.vm_id)
         try:
             os.rmdir(self.cgroup)
         except OSError:
