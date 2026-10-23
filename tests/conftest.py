@@ -152,9 +152,17 @@ def _sandbox_probe(_ensure_daemon):
 
 @pytest.fixture
 def require_sandbox(_sandbox_probe):
-    """Skip the test if sandbox creation is not available on this host."""
+    """Skip the test if sandbox creation is not available on this host.
+
+    In CI (GitHub Actions, on KVM hosts), or with FLINT_REQUIRE_VMS=1, that
+    is a failure instead: a run whose VM tests all skipped proves nothing.
+    """
     if _sandbox_creation_result is not True:
-        pytest.skip(f"Sandbox creation not available: {_sandbox_creation_result}")
+        why = f"Sandbox creation not available: {_sandbox_creation_result}"
+        default = "1" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
+        if os.environ.get("FLINT_REQUIRE_VMS", default) == "1":
+            pytest.fail(f"{why}\n--- daemon log tail ---\n{_read_daemon_log()[-4000:]}")
+        pytest.skip(why)
 
 
 @pytest.fixture
