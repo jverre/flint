@@ -239,7 +239,8 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
     try:
         a1 = a.create(network_policy=policy)["vm_id"]
         vms.append(a1)
-        vms.append(a.create()["vm_id"])
+        a2 = a.create()["vm_id"]
+        vms.append(a2)
         vm_b = b.create()["vm_id"]
         vms.append(vm_b)
 
@@ -252,12 +253,18 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         code, out = run(a, a1, f"for i in $(seq 2 254); do (ping -c1 -W1 {VETH_SUBNET}.$i >/dev/null 2>&1 "
                                f"&& echo {VETH_SUBNET}.$i) & done; wait")
         assert len(out.split()) == 1, f"bridge addresses answering a1: {out}"
+        # Raw TCP from a2: a1's ports 80 and 443 go to its credential proxy,
+        # which accepts any connection and only then dials out.
         for target in (f"{BRIDGE_IP} 22", f"{BRIDGE_IP} {PROXY_PORT}", "169.254.169.254 80",
                        "192.168.0.1 80", "172.17.0.1 80", "100.64.0.1 80"):
-            code, out = run(a, a1, f"nc -w3 {target} </dev/null")
-            assert code != 0, f"a1 reached {target}: {out}"
-        code, out = run(a, a1, "nc -w5 1.1.1.1 80 </dev/null")
-        assert code == 0, f"a1 can't reach the internet: {out}"
+            code, out = run(a, a2, f"nc -w3 {target} </dev/null")
+            assert code != 0, f"a2 reached {target}: {out}"
+        code, out = run(a, a2, "nc -w5 1.1.1.1 80 </dev/null")
+        assert code == 0, f"a2 can't reach the internet: {out}"
+        # Through a1's proxy, cloud metadata is still out of reach.
+        code, out = run(a, a1, "wget -q -T5 -O - --header 'Metadata: true' "
+                               "'http://169.254.169.254/metadata/instance?api-version=2021-02-01'")
+        assert code != 0, f"a1 got cloud metadata through its proxy: {out}"
 
         # Credentials: injected on a1's HTTPS, never inside a1, not readable, not b's.
         code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
