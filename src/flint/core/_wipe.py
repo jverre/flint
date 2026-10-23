@@ -83,22 +83,34 @@ def _overwrite(fd: int, length: int) -> None:
     os.fsync(fd)
 
 
+def _wipe_fd(fd: int) -> int:
+    """Discard the data of the open file ``fd`` if it is a private regular file.
+    Returns the bytes it held."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return 0
+    held = st.st_blocks * 512
+    if held == 0:
+        return 0
+    if not (_punch_hole(fd, st.st_size) and not _has_data(fd, st.st_size)):
+        _overwrite(fd, st.st_size)
+    return held
+
+
+def _open_file(name: str, dir_fd: int | None = None) -> int | None:
+    try:
+        return os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
+    except OSError:
+        return None  # a symlink, a socket, gone, ...
+
+
 def wipe_file(path: str) -> int:
     """Discard a private regular file's data in place. Returns the bytes it held."""
+    fd = _open_file(path)
+    if fd is None:
+        return 0
     try:
-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return 0  # a symlink, a socket, gone, ...
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            return 0
-        held = st.st_blocks * 512
-        if held == 0:
-            return 0
-        if not (_punch_hole(fd, st.st_size) and not _has_data(fd, st.st_size)):
-            _overwrite(fd, st.st_size)
-        return held
+        return _wipe_fd(fd)
     finally:
         os.close(fd)
 
@@ -106,19 +118,30 @@ def wipe_file(path: str) -> int:
 def wipe_tree(path: str, vm_id: str = "") -> None:
     """Wipe every private file under ``path``, then remove it.
 
-    What was wiped is added to ``vm_id``'s totals (see ``take``).
+    The VMM may still run, and owns files in here: it could swap a directory
+    for a symlink at any time. So the walk holds each directory open
+    (``os.fwalk`` checks it is the directory it listed) and opens files
+    relative to it, never through a path. What was wiped is added to
+    ``vm_id``'s totals (see ``take``).
     """
     if not path or not os.path.lexists(path):
         return
     files = wiped = 0
     try:
-        root_dev = os.lstat(path).st_dev
         if os.path.isdir(path) and not os.path.islink(path):
-            for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-                # Stay on this filesystem: never wipe inside a mount.
-                dirnames[:] = [d for d in dirnames if os.lstat(os.path.join(dirpath, d)).st_dev == root_dev]
+            root_dev = os.lstat(path).st_dev
+            for _dirpath, dirnames, filenames, dir_fd in os.fwalk(path, follow_symlinks=False):
+                if os.fstat(dir_fd).st_dev != root_dev:
+                    dirnames[:] = []  # never wipe inside a mount
+                    continue
                 for name in filenames:
-                    n = wipe_file(os.path.join(dirpath, name))
+                    fd = _open_file(name, dir_fd)
+                    if fd is None:
+                        continue
+                    try:
+                        n = _wipe_fd(fd)
+                    finally:
+                        os.close(fd)
                     if n:
                         files += 1
                         wiped += n
@@ -128,7 +151,7 @@ def wipe_tree(path: str, vm_id: str = "") -> None:
     except Exception:
         log.exception("wipe of %s failed; removing it anyway", path)
     if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path, ignore_errors=True)  # fd-based too: doesn't follow swapped symlinks
     else:
         try:
             os.unlink(path)
