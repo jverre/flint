@@ -167,8 +167,8 @@ def test_agent_template_caching(backend_kind):
 
 @pytest.mark.slow
 def test_agent_credential_injection(backend_kind):
-    """Deploy an agent, inject API credentials via set_credentials(),
-    and verify the network policy round-trips correctly."""
+    """Deploy an agent, inject API credentials via set_credentials(), and
+    verify the policy reads back with the credentials redacted."""
     _require_agent_infra(backend_kind)
 
     agent = Agent.deploy("hermes")
@@ -182,10 +182,10 @@ def test_agent_credential_injection(backend_kind):
         assert "allow" in policy
 
         openai_rules = policy["allow"]["api.openai.com"]
-        assert openai_rules[0]["transform"][0]["headers"]["Authorization"] == "Bearer sk-test-123"
+        assert openai_rules[0]["transform"][0]["headers"]["Authorization"] == "Bear***-123"
 
         anthropic_rules = policy["allow"]["api.anthropic.com"]
-        assert anthropic_rules[0]["transform"][0]["headers"]["x-api-key"] == "sk-ant-test-456"
+        assert anthropic_rules[0]["transform"][0]["headers"]["x-api-key"] == "sk-a***-456"
     finally:
         agent.stop()
 
