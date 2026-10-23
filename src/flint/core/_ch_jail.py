@@ -137,7 +137,9 @@ class ChJail:
             if subprocess.run(["mountpoint", "-q", target]).returncode == 0:
                 subprocess.run(["umount", target], check=True, capture_output=True, timeout=30)
             os.unlink(marker)
-        shutil.rmtree(self.base, ignore_errors=True)
+        # Wipe only once the shared disk is unmounted: it isn't this jail's to wipe.
+        from ._wipe import wipe_tree
+        wipe_tree(self.base, self.vm_id)
         try:
             os.rmdir(self.cgroup)
         except OSError:
