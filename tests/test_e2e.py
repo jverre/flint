@@ -13,7 +13,7 @@ import time
 import httpx
 import pytest
 
-from .conftest import AUTH, BASE_URL, WS_BASE, api
+from .conftest import AUTH, BASE_URL, TEST_STATE_DIR, WS_BASE, api
 from flint import Sandbox, Template
 
 
@@ -396,14 +396,27 @@ def test_sandbox_cannot_reach_host_services(sandbox):
         server.close()
 
 
-def test_network_policy_round_trip(sandbox, backend_health):
-    """Set a network policy, read it back, then replace it (as the admin UI does)."""
+def _state_files_text() -> str:
+    """Everything the test daemon keeps on disk in its database, as text."""
+    out = []
+    for name in ("flint.db", "flint.db-wal", "state.json"):
+        try:
+            with open(os.path.join(TEST_STATE_DIR, name), "rb") as f:
+                out.append(f.read().decode("latin-1"))
+        except OSError:
+            pass
+    return "\n".join(out)
+
+
+def test_network_policy_round_trip(sandbox, backend_health, daemon_only):
+    """Credentials are write-only: read back redacted, kept when sent back
+    redacted (as the admin UI does), and never stored in plaintext."""
     if backend_health.get("network_policy") is False:
         pytest.skip(f"{backend_health['backend_kind']} can't apply a network policy")
     policy = {
         "allow": {
             "api.example.com": [
-                {"transform": [{"headers": {"Authorization": "Bearer test-token"}}]}
+                {"transform": [{"headers": {"Authorization": "Bearer test-token-0451"}}]}
             ],
             "*.internal.io": [
                 {"transform": [{"headers": {"X-Api-Key": "key-123"}}]}
@@ -412,18 +425,18 @@ def test_network_policy_round_trip(sandbox, backend_health):
     }
     sandbox.update_network_policy(policy)
     got = sandbox.get_network_policy()
-    assert got is not None
-    assert "allow" in got
-    assert "api.example.com" in got["allow"]
-    assert "*.internal.io" in got["allow"]
-    rules = got["allow"]["api.example.com"]
-    assert rules[0]["transform"][0]["headers"]["Authorization"] == "Bearer test-token"
+    assert set(got["allow"]) == {"api.example.com", "*.internal.io"}, got
+    assert got["allow"]["api.example.com"][0]["transform"][0]["headers"]["Authorization"] == "Bear***0451"
+    assert got["allow"]["*.internal.io"][0]["transform"][0]["headers"]["X-Api-Key"] == "***"
+    for where, text in (("GET /vms/{id}", json.dumps(sandbox._fetch())), ("GET /vms", json.dumps(api.get(f"{BASE_URL}/vms").json())),
+                        ("the daemon's state files", _state_files_text())):
+        assert "test-token-0451" not in text and "key-123" not in text, f"credential visible in {where}"
 
     # A save replaces the whole policy: a removed domain is gone, a changed value is new.
-    sandbox.update_network_policy({"allow": {"api.example.com": [{"transform": [{"headers": {"Authorization": "Bearer rotated"}}]}]}})
+    sandbox.update_network_policy({"allow": {"api.example.com": [{"transform": [{"headers": {"Authorization": "Bearer rotated-0452"}}]}]}})
     got = sandbox.get_network_policy()
     assert list(got["allow"]) == ["api.example.com"], got
-    assert got["allow"]["api.example.com"][0]["transform"][0]["headers"]["Authorization"] == "Bearer rotated"
+    assert got["allow"]["api.example.com"][0]["transform"][0]["headers"]["Authorization"] == "Bear***0452"
 
 
 def test_network_policy_refused_where_unsupported(sandbox, backend_health):
@@ -454,6 +467,18 @@ def test_network_policy_injects_credentials_over_https(require_sandbox):
         assert result.exit_code == 0, f"HTTPS through the proxy failed: {result.stdout}{result.stderr}"
         headers = {k.lower(): v for k, v in json.loads(result.stdout)["headers"].items()}
         assert headers.get("x-flint-auth") == "secret-12345", headers
+
+        # Read the policy (redacted), add a header and write it back: the
+        # credential the client never saw is still the one injected.
+        policy = sb.get_network_policy()
+        assert "secret-12345" not in json.dumps(policy), policy
+        policy["allow"]["postman-echo.com"][0]["transform"][0]["headers"]["X-Flint-Extra"] = "extra"
+        sb.update_network_policy(policy)
+        result = sb.commands.run("wget -q -O - https://postman-echo.com/headers", timeout=30)
+        assert result.exit_code == 0, f"HTTPS through the proxy failed: {result.stdout}{result.stderr}"
+        headers = {k.lower(): v for k, v in json.loads(result.stdout)["headers"].items()}
+        assert headers.get("x-flint-auth") == "secret-12345", headers
+        assert headers.get("x-flint-extra") == "extra", headers
     finally:
         sb.kill()
 

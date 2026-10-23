@@ -160,3 +160,24 @@ Set an auto-cleanup timeout on a sandbox.
 ```json
 {"ok": true}
 ```
+
+---
+
+## Network policy
+
+`PUT /vms/{vm_id}/network-policy` replaces the sandbox's network policy: per domain, the headers the credential proxy adds to the sandbox's HTTPS requests. The sandbox never sees them.
+
+```json
+{
+  "allow": {
+    "api.openai.com": [{"transform": [{"headers": {"Authorization": "Bearer sk-..."}}]}]
+  }
+}
+```
+
+`GET /vms/{vm_id}/network-policy` returns the policy with every header value redacted to its first and last four characters (`"Bear***x9f2"`, or `"***"` for short values). Values are write-only:
+
+- A `PUT` that sends a value back exactly as `GET` returned it keeps the current value of that header on that domain, so you can read a policy, change part of it and write it back.
+- Any other value replaces the current one.
+
+The daemon stores policies encrypted, with a key in its state directory (`secret.key`, or `FLINT_SECRET_KEY`), and forgets a sandbox's policy when it is deleted.

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import enum
-import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+from ._secrets import redact_policy
 
 
 class SandboxState(enum.Enum):
@@ -87,43 +88,9 @@ class _SandboxEntry:
             "timings": dict(self.timings),
             "log_lines": list(self.log_lines),
             "line_count": self.line_count,
-            "network_policy": _redact_policy(self.network_policy),
+            "network_policy": redact_policy(self.network_policy),
             "timeout_seconds": self.timeout_seconds,
             "timeout_policy": self.timeout_policy,
             "tenant": self.tenant,
             "availability": self.availability,
         }
-
-
-_REDACT_RE = re.compile(r"^(.{4}).+(.{4})$")
-
-
-def _redact_policy(policy: dict | None) -> dict | None:
-    """Return a copy of the network policy with credential values redacted."""
-    if policy is None:
-        return None
-    allow = policy.get("allow")
-    if not isinstance(allow, dict):
-        return policy
-    redacted_allow: dict = {}
-    for domain, rules in allow.items():
-        redacted_rules = []
-        for rule in rules:
-            transforms = rule.get("transform")
-            if not transforms:
-                redacted_rules.append(rule)
-                continue
-            redacted_transforms = []
-            for t in transforms:
-                headers = t.get("headers")
-                if not headers:
-                    redacted_transforms.append(t)
-                    continue
-                redacted_headers = {}
-                for k, v in headers.items():
-                    m = _REDACT_RE.match(v)
-                    redacted_headers[k] = f"{m.group(1)}***{m.group(2)}" if m else "***"
-                redacted_transforms.append({**t, "headers": redacted_headers})
-            redacted_rules.append({**rule, "transform": redacted_transforms})
-        redacted_allow[domain] = redacted_rules
-    return {**policy, "allow": redacted_allow}

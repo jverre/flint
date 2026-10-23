@@ -6,6 +6,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable
 
+from . import _secrets
 from .backends.base import HostBackend
 from .config import log, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
@@ -363,11 +364,16 @@ class SandboxManager:
             return list(self._sandboxes.keys())
 
     def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
-        """Update the network policy (credential injection rules) for a sandbox."""
+        """Replace the network policy (credential injection rules) of a sandbox.
+
+        A header value sent back in the redacted form the API returns keeps
+        the current credential, so a client can edit a policy it can't read.
+        """
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
         if not entry:
             raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        policy = _secrets.keep_unchanged(policy, entry.network_policy)
 
         # Apply first: a policy that can't be applied isn't recorded.
         self._apply_network_policy(entry, policy)
@@ -377,12 +383,12 @@ class SandboxManager:
             self._state_store.set_network_policy(sandbox_id, json.dumps(policy))
 
     def get_network_policy(self, sandbox_id: str) -> dict | None:
-        """Get the current network policy for a sandbox."""
+        """The sandbox's network policy, with credential values redacted."""
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
         if not entry:
             raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        return entry.network_policy
+        return _secrets.redact_policy(entry.network_policy)
 
     def _apply_network_policy(self, entry: _SandboxEntry, policy: dict) -> None:
         """Start, update, or stop the credential proxy based on the policy."""

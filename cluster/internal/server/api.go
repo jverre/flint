@@ -418,7 +418,7 @@ func (s *Server) handlePutNetworkPolicy(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, code, detail)
 		return
 	}
-	v.Spec.NetworkPolicy = raw
+	v.Spec.NetworkPolicy = keepUnchanged(raw, v.Spec.NetworkPolicy)
 	s.updateVM(r.Context(), v.ID, vmUpdate{Spec: &v.Spec})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

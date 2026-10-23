@@ -452,7 +452,7 @@ async def update_network_policy(vm_id: str, request: Request):
 
 @app.get("/vms/{vm_id}/network-policy")
 def get_network_policy(vm_id: str):
-    """Get the current network policy for a sandbox."""
+    """The sandbox's network policy. Credential values are write-only: redacted here."""
     mgr = _require_manager()
     _require_entry(vm_id)
     return {"network_policy": mgr.get_network_policy(vm_id)}
