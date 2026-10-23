@@ -207,6 +207,39 @@ def token_revoke(token_id):
     click.echo(f"{token_id} revoked")
 
 
+@cli.group()
+def quota():
+    """Per-tenant limits: VMs, vCPUs, memory and volume space."""
+
+
+def _show_quota(q: dict) -> None:
+    for label, used, cap, unit in (("VMs", q["vms"], q["max_vms"], ""), ("vCPUs", q["vcpus"], q["max_vcpus"], ""),
+                                   ("Memory", q["memory_mib"], q["max_memory_mib"], " MiB"),
+                                   ("Volumes", q["volume_gib"], q["max_volume_gib"], " GiB")):
+        click.echo(f"  {label:8s} {used}{unit} of {f'{cap}{unit}' if cap else 'no limit'}")
+
+
+@quota.command("show")
+@click.argument("tenant")
+def quota_show(tenant):
+    """Show a tenant's limits and use."""
+    _show_quota(_cp("GET", f"/v1/tenants/{tenant}/quota"))
+
+
+@quota.command("set")
+@click.argument("tenant")
+@click.option("--max-vms", type=int)
+@click.option("--max-vcpus", type=int)
+@click.option("--max-memory-mib", type=int)
+@click.option("--max-volume-gib", type=int)
+def quota_set(tenant, **limits):
+    """Set some of a tenant's limits (0 = no limit; the others stay)."""
+    changes = {k: v for k, v in limits.items() if v is not None}
+    if not changes:
+        raise click.UsageError("give at least one limit")
+    _show_quota(_cp("PUT", f"/v1/tenants/{tenant}/quota", json=changes))
+
+
 @cli.command()
 @click.option("--open/--no-open", "open_browser", default=True, help="Open the URL in a browser")
 def ui(open_browser):

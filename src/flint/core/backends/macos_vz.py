@@ -278,6 +278,9 @@ class MacOSVirtualizationBackend(HostBackend):
             },
         )
 
+    def vm_resources(self) -> tuple[int, int]:
+        return VZ_CPU_COUNT, VZ_MEMORY_BYTES >> 20
+
     def kill(self, entry) -> None:
         handle = self._coerce_handle(entry)
         if handle is None:
