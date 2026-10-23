@@ -153,6 +153,10 @@ class BackendPlugin(ABC):
     def resume(self, row: dict) -> BackendBootResult:
         pass
 
+    def vm_resources(self) -> tuple[int, int]:
+        """(vCPUs, memory in MiB) of one VM, for tenant quotas. Firecracker's defaults."""
+        return 1, 128
+
     def discard_paused(self, row: dict) -> None:
         """Delete what a paused sandbox left behind: its snapshot, jail and network."""
 
