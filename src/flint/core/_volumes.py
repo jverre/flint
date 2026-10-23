@@ -39,7 +39,6 @@ import json
 import os
 import posixpath
 import re
-import shutil
 import sqlite3
 import threading
 import time
@@ -343,8 +342,10 @@ class Volumes:
                 _nfs_server.delete_image(vol.id)  # unmounts it first
             except _nfs_server.NfsServerError as e:
                 log.warning("Failed to delete image %s: %s", vol.id, e)
-        # rmtree doesn't follow the symlinks sandboxes may have left in it.
-        shutil.rmtree(os.path.join(VOLUMES_DIR, vol.id), ignore_errors=True)
+        # Wiped like a sandbox's files; never follows the symlinks sandboxes
+        # may have left in it. (The storage server wipes image volumes.)
+        from ._wipe import wipe_tree
+        wipe_tree(os.path.join(VOLUMES_DIR, vol.id))
 
     # ── Mounts ───────────────────────────────────────────────────────────
 
