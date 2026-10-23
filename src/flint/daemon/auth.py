@@ -191,6 +191,8 @@ def _bearer(scope) -> str:
             value = v.decode("latin-1").strip()
             if value[:7].lower() == "bearer ":
                 return value[7:].strip()
+    if scope["type"] != "websocket":
+        return ""  # ?token= is for browsers' WebSockets, which can't set headers; keep tokens out of other URLs
     from urllib.parse import parse_qs
     return (parse_qs((scope.get("query_string") or b"").decode()).get("token") or [""])[0]
 
