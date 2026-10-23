@@ -10,11 +10,11 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-import websockets.sync.client as ws_sync
 from websockets.exceptions import WebSocketException
 
 from flint.core.config import DAEMON_URL, log
 from flint._client.client import auth_headers
+from flint._client.transport import ws_connect
 
 
 class LogStream:
@@ -26,7 +26,8 @@ class LogStream:
         base_url: str = DAEMON_URL,
     ) -> None:
         self._on_line = on_line
-        self._ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + f"/vms/{vm_id}/logs"
+        self._base_url = base_url
+        self._path = f"/vms/{vm_id}/logs"
         self._stop = threading.Event()
         self._ws = None
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name=f"flint-logs-{vm_id[:8]}")
@@ -44,7 +45,7 @@ class LogStream:
 
     def _run_loop(self) -> None:
         try:
-            self._ws = ws_sync.connect(self._ws_url, open_timeout=5, additional_headers=auth_headers() or None)
+            self._ws = ws_connect(self._base_url, self._path, auth_headers(), open_timeout=5)
         except Exception as e:
             log.debug("LogStream connect failed: %s", e)
             return

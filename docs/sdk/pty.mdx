@@ -41,7 +41,7 @@ For simple command execution, `sandbox.commands.run()` is easier. PTY is for whe
     `POST /vms/{vm_id}/processes`
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/processes \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/processes \
       -H "Content-Type: application/json" \
       -d '{"cmd": ["/bin/sh"], "pty": true, "cols": 120, "rows": 40}'
     ```
@@ -93,7 +93,7 @@ session.send_input("\x04")      # Ctrl-D (EOF)
     `POST /vms/{vm_id}/processes/{pid}/input`
 
     ```bash
-    printf "ls -la\n" | curl -X POST \
+    printf "ls -la\n" | curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST \
       http://localhost:9100/vms/{vm_id}/processes/42/input \
       -H "Content-Type: application/octet-stream" \
       --data-binary @-
@@ -115,7 +115,7 @@ Close the PTY session and terminate the underlying process.
     `POST /vms/{vm_id}/processes/{pid}/signal`
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/processes/42/signal \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/processes/42/signal \
       -H "Content-Type: application/json" \
       -d '{"signal": 9}'
     ```

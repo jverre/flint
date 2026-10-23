@@ -6,9 +6,9 @@ import uuid
 from typing import Callable
 
 import httpx
-import websockets.sync.client as ws_sync
 
 from flint.core.config import API_KEY, DAEMON_URL, TENANT
+from flint._client.transport import http_client, ws_connect
 
 DEFAULT_URL = DAEMON_URL
 
@@ -20,8 +20,8 @@ def auth_headers(api_key: str = API_KEY) -> dict[str, str]:
 class _TerminalConnection:
     """Manages a WebSocket connection to a VM terminal."""
 
-    def __init__(self, ws_url: str, on_output: Callable[[bytes], None], headers: dict[str, str] | None = None) -> None:
-        self._ws = ws_sync.connect(ws_url, additional_headers=headers or None)
+    def __init__(self, base_url: str, path: str, on_output: Callable[[bytes], None], headers: dict[str, str] | None = None) -> None:
+        self._ws = ws_connect(base_url, path, headers)
         self._on_output = on_output
         self._closed = False
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -74,10 +74,9 @@ _RETRY_DETAIL = ("in progress",)
 class DaemonClient:
     def __init__(self, base_url: str = DEFAULT_URL, api_key: str = API_KEY, tenant: str = TENANT) -> None:
         self._base_url = base_url
-        self._ws_base_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
         self._headers = auth_headers(api_key)
         self._tenant = tenant
-        self._http = httpx.Client(base_url=base_url, timeout=120.0, headers=self._headers)
+        self._http = http_client(base_url, timeout=120.0, headers=self._headers)
         self._terminals: dict[str, _TerminalConnection] = {}
         self._keys_honoured: bool | None = None
         self.retry_for = 60.0  # seconds a mutating call keeps retrying
@@ -168,8 +167,7 @@ class DaemonClient:
         """Open WebSocket to VM terminal. Calls on_output with binary data from VM."""
         if vm_id in self._terminals:
             self.disconnect_terminal(vm_id)
-        ws_url = f"{self._ws_base_url}/vms/{vm_id}/terminal"
-        self._terminals[vm_id] = _TerminalConnection(ws_url, on_output, self._headers)
+        self._terminals[vm_id] = _TerminalConnection(self._base_url, f"/vms/{vm_id}/terminal", on_output, self._headers)
 
     def send_input(self, vm_id: str, data: bytes) -> None:
         conn = self._terminals.get(vm_id)
@@ -369,7 +367,7 @@ class DaemonClient:
     @staticmethod
     def is_daemon_running(base_url: str = DEFAULT_URL) -> bool:
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=1.0, headers=auth_headers())
-            return resp.status_code == 200
+            with http_client(base_url, timeout=1.0) as c:
+                return c.get("/health").status_code == 200
         except Exception:
             return False
