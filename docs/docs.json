@@ -120,6 +120,7 @@
               "architecture/backends",
               "architecture/golden-snapshots",
               "architecture/networking",
+              "architecture/security",
               "architecture/guest-agent"
             ]
           }
