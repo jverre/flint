@@ -20,13 +20,13 @@ def test_a_create_fits_until_a_limit_is_reached():
 def test_creates_in_flight_count_against_the_quota(tmp_path):
     quotas = Quotas(os.path.join(tmp_path, "flint.db"))
     quotas.set("acme", {"max_vms": 2})
-    with quotas.reserve("acme", Usage(1), Usage(1)):
+    with quotas.reserve("acme", lambda: Usage(1), Usage(1)):
         with pytest.raises(QuotaExceeded, match="acme"):
-            with quotas.reserve("acme", Usage(1), Usage(1)):
+            with quotas.reserve("acme", lambda: Usage(1), Usage(1)):
                 pass
-        with quotas.reserve("globex", Usage(1), Usage(1)):  # another tenant isn't affected
+        with quotas.reserve("globex", lambda: Usage(1), Usage(1)):  # another tenant isn't affected
             pass
-    with quotas.reserve("acme", Usage(1), Usage(1)):  # released once the first create ended
+    with quotas.reserve("acme", lambda: Usage(1), Usage(1)):  # released once the first create ended
         pass
 
 

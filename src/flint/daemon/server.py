@@ -285,7 +285,7 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
     # Run in executor to avoid blocking the event loop (create can take 10s+ on failure)
     loop = asyncio.get_event_loop()
     # The control plane enforces a cluster's quotas.
-    reservation = daemon.quotas.reserve(tenant, _usage(tenant), _one_vm()) if not daemon.cluster else contextlib.nullcontext()
+    reservation = daemon.quotas.reserve(tenant, lambda: _usage(tenant), _one_vm()) if not daemon.cluster else contextlib.nullcontext()
     try:
         with reservation:
             vm_id = await loop.run_in_executor(None, _create)
@@ -843,7 +843,7 @@ def create_volume(body: dict, request: Request):
     size = body.get("size_gib") if isinstance(body.get("size_gib"), int) else 0
     if _nfs_server.images_available():
         size = size or DEFAULT_SIZE_GIB
-    with _get_daemon().quotas.reserve(tenant, _usage(tenant), Usage(volume_gib=size)):
+    with _get_daemon().quotas.reserve(tenant, lambda: _usage(tenant), Usage(volume_gib=size)):
         vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"), tenant)
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes — created {vol.id} ({vol.name})")
@@ -854,7 +854,7 @@ def _copy_volume(copy, volume: str, body: dict, request: Request):
     """Snapshot or fork: a copy counts its full size against the tenant's quota."""
     scope = _scope(principal_of(request))
     src = _volume_call(_require_volumes()._require, volume, scope)
-    with _get_daemon().quotas.reserve(src.tenant, _usage(src.tenant), Usage(volume_gib=src.size_gib or 0)):
+    with _get_daemon().quotas.reserve(src.tenant, lambda: _usage(src.tenant), Usage(volume_gib=src.size_gib or 0)):
         return _volume_call(copy, volume, body.get("name"), scope)
 
 
