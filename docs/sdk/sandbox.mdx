@@ -39,7 +39,7 @@ description: "The main interface for creating and managing microVMs."
     `POST /vms`
 
     ```bash
-    curl -X POST "http://localhost:9100/vms?template_id=default"
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST "http://localhost:9100/vms?template_id=default"
     ```
 
     <ParamField query="template_id" type="string" default='"default"'>
@@ -117,7 +117,7 @@ print(sandbox.timings)
     `DELETE /vms/{vm_id}`
 
     ```bash
-    curl -X DELETE http://localhost:9100/vms/{vm_id}
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X DELETE http://localhost:9100/vms/{vm_id}
     ```
 
     **Response** `200`
@@ -145,7 +145,7 @@ Snapshot the VM state to disk. The hypervisor process is stopped but all memory 
     `POST /vms/{vm_id}/pause`
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/pause
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/pause
     ```
 
     **Response** `200`
@@ -169,7 +169,7 @@ Restore a paused sandbox from its snapshot.
     `POST /vms/{vm_id}/resume`
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/resume
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/resume
     ```
 
     **Response** `200`
@@ -202,7 +202,7 @@ Set an auto-cleanup timeout. Useful for making sure sandboxes don't run indefini
     `PATCH /vms/{vm_id}`
 
     ```bash
-    curl -X PATCH http://localhost:9100/vms/{vm_id} \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X PATCH http://localhost:9100/vms/{vm_id} \
       -H "Content-Type: application/json" \
       -d '{"timeout_seconds": 300, "timeout_policy": "kill"}'
     ```
@@ -235,13 +235,13 @@ Set an auto-cleanup timeout. Useful for making sure sandboxes don't run indefini
     **List all sandboxes** - `GET /vms`
 
     ```bash
-    curl http://localhost:9100/vms
+    curl -H "Authorization: Bearer $FLINT_API_KEY" http://localhost:9100/vms
     ```
 
     **Get a specific sandbox** - `GET /vms/{vm_id}`
 
     ```bash
-    curl http://localhost:9100/vms/{vm_id}
+    curl -H "Authorization: Bearer $FLINT_API_KEY" http://localhost:9100/vms/{vm_id}
     ```
 
     **Daemon health** - `GET /health`
@@ -274,15 +274,15 @@ Set an auto-cleanup timeout. Useful for making sure sandboxes don't run indefini
 
     ```bash
     # Read
-    curl "http://localhost:9100/vms/{vm_id}/files?path=/etc/hostname"
+    curl -H "Authorization: Bearer $FLINT_API_KEY" "http://localhost:9100/vms/{vm_id}/files?path=/etc/hostname"
 
     # Write
-    echo "hello world" | curl -X POST \
+    echo "hello world" | curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST \
       "http://localhost:9100/vms/{vm_id}/files?path=/tmp/data.txt" \
       --data-binary @-
 
     # List
-    curl "http://localhost:9100/vms/{vm_id}/files/list?path=/tmp"
+    curl -H "Authorization: Bearer $FLINT_API_KEY" "http://localhost:9100/vms/{vm_id}/files/list?path=/tmp"
     ```
   </Tab>
 </Tabs>
@@ -331,7 +331,7 @@ A convenience method for executing code strings directly.
     Use the exec endpoint and pass the runtime as the first arg:
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/exec \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/exec \
       -H "Content-Type: application/json" \
       -d '{"cmd": ["python3", "-c", "print(\"hello\")"]}'
     ```

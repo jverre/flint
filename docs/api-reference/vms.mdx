@@ -43,7 +43,7 @@ Boots a new microVM from the specified template.
 **Example**
 
 ```bash
-curl -X POST "http://localhost:9100/vms?template_id=default"
+curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST "http://localhost:9100/vms?template_id=default"
 ```
 
 ---

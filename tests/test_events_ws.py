@@ -6,10 +6,9 @@ import json
 import threading
 import time
 
-import websockets.sync.client as ws_sync
 import httpx
 
-from .conftest import AUTH, BASE_URL, TEST_PORT, WS_BASE, api
+from .conftest import AUTH, BASE_URL, TEST_PORT, api, ws_connect
 
 
 BASE = BASE_URL
@@ -25,7 +24,7 @@ def _collect(events: list, ws) -> None:
 
 
 def test_volume_events_broadcast(_ensure_daemon, daemon_only):
-    ws = ws_sync.connect(f"{WS_BASE}/events", open_timeout=5, additional_headers=AUTH or None)
+    ws = ws_connect("/events", open_timeout=5)
     events: list = []
     t = threading.Thread(target=_collect, args=(events, ws), daemon=True)
     t.start()

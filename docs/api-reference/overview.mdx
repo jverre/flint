@@ -3,13 +3,46 @@ title: "REST API overview"
 description: "HTTP API for the Flint daemon."
 ---
 
-The Flint daemon exposes a REST API on `http://localhost:9100`. The Python SDK is a thin wrapper over this API, so anything you can do with the SDK you can do directly with HTTP.
+The Flint daemon exposes a REST API. The Python SDK is a thin wrapper over this API, so anything you can do with the SDK you can do directly with HTTP.
 
-## Base URL
+## Connecting
 
+The daemon listens in two places:
+
+| Where | Who can use it |
+|-------|----------------|
+| Its Unix socket, `flint.sock` in the state directory (`/var/lib/flint/state` on Linux) | Its own user, and the `flint` group if it exists. No token: whoever can open the socket is an admin. The SDK, CLI and TUI use it by default. |
+| `http://127.0.0.1:9100` | Anyone with an API token, sent as `Authorization: Bearer <token>` (or `?token=` on a WebSocket). |
+
+```bash
+# Over the socket
+sudo curl --unix-socket /var/lib/flint/state/flint.sock http://flint/vms
+
+# Over TCP, with the admin token the daemon writes at its first start
+export FLINT_API_KEY=$(sudo cat /var/lib/flint/state/admin.token)
+curl -H "Authorization: Bearer $FLINT_API_KEY" http://localhost:9100/vms
 ```
-http://localhost:9100
+
+To point the SDK and CLI at TCP, set `FLINT_URL=http://127.0.0.1:9100` and `FLINT_API_KEY`. `GET /health` and the web UI's files need no token.
+
+## Tokens and tenants
+
+Every VM, volume and template build belongs to a **tenant**: an isolation group, such as one of your customers. Pass `tenant` when you create one; without it, it goes to the `default` tenant.
+
+There are two kinds of tokens:
+
+- `admin`: everything, including `/config` and tokens.
+- `service`: for your backend. VMs, volumes and templates, but not `/config` or tokens. Pin it to tenants with `tenants`, and it only sees theirs: another tenant's VMs and volumes answer `404`, and its events never reach the token's `/events` stream. A token pinned to one tenant creates everything in that tenant.
+
+```bash
+flint token create --kind service --tenant acme --name acme-backend   # prints the token once
+flint token list
+flint token revoke <id>
 ```
+
+The same API: `POST /v1/tokens` (`{"kind", "name", "tenants"}`, answers with the `token`), `GET /v1/tokens`, `DELETE /v1/tokens/{id}`. Admin only. The daemon stores only a hash of each token.
+
+A volume can only be mounted into a VM of its own tenant, and a VM can only boot a shared template (built without a tenant, like `default`) or one of its own tenant's.
 
 ## Endpoints
 
@@ -41,6 +74,11 @@ http://localhost:9100
 | `GET /templates` | List templates |
 | `GET /templates/{template_id}` | Get template info |
 | `DELETE /templates/{template_id}` | Delete a template |
+| `PUT /vms/{vm_id}/network-policy` | Set credentials the proxy injects |
+| `GET /vms/{vm_id}/network-policy` | Read them back, redacted |
+| `POST /v1/tokens` | Create an API token (admin) |
+| `GET /v1/tokens` | List API tokens (admin) |
+| `DELETE /v1/tokens/{id}` | Revoke an API token (admin) |
 
 ## Error responses
 
@@ -57,5 +95,7 @@ Common status codes:
 | `200` | Success |
 | `201` | Created |
 | `400` | Bad request (e.g. trying to delete the default template) |
-| `404` | Sandbox or template not found |
+| `401` | No API token, or not a valid one |
+| `403` | The token can't do this (an admin-only endpoint, or another tenant) |
+| `404` | Sandbox or template not found (or another tenant's) |
 | `503` | Guest agent unreachable |

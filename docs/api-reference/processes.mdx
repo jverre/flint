@@ -88,7 +88,7 @@ Send raw binary data to the process stdin (or PTY input if `pty: true`).
 **Example** (sending a keypress)
 
 ```bash
-printf "ls\n" | curl -X POST \
+printf "ls\n" | curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST \
   http://localhost:9100/vms/.../processes/42/input \
   -H "Content-Type: application/octet-stream" \
   --data-binary @-
@@ -161,10 +161,11 @@ The `data` field is base64-encoded. Decode it to get the raw bytes.
 **Example**
 
 ```python
-import websocket, base64, json
+import websocket, base64, json, os
 
 ws = websocket.WebSocket()
-ws.connect("ws://localhost:9100/vms/.../processes/42/output")
+ws.connect("ws://localhost:9100/vms/.../processes/42/output",
+           header={"Authorization": f"Bearer {os.environ['FLINT_API_KEY']}"})
 
 while True:
     msg = json.loads(ws.recv())

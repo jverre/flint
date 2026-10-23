@@ -107,6 +107,19 @@ def register_template_artifact(
     log.info("Registered template artifact %s (%s) for %s", template_id, name, backend_kind)
 
 
+def claim_template(template_id: str, name: str, tenant: str) -> None:
+    """Record who owns a template before it is built: ``tenant``, or "" for a
+    template every tenant can use. Builds keep the owner when they register."""
+    registry = _load_registry()
+    entry = _normalize_entry(registry.get(template_id, {"name": name, "status": "building", "created_at": time.time()}))
+    if tenant:
+        entry["tenant"] = tenant
+    else:
+        entry.pop("tenant", None)
+    registry[template_id] = entry
+    _save_registry(registry)
+
+
 def update_template_status(template_id: str, status: str) -> None:
     registry = _load_registry()
     if template_id in registry:

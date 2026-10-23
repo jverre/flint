@@ -42,7 +42,7 @@ For long-running processes or interactive sessions, use the [processes API](/api
 **Example**
 
 ```bash
-curl -X POST http://localhost:9100/vms/3f2a1b4c-.../exec \
+curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/3f2a1b4c-.../exec \
   -H "Content-Type: application/json" \
   -d '{"cmd": ["/bin/sh", "-c", "echo hello"], "timeout": 30}'
 ```

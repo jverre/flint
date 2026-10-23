@@ -3,7 +3,7 @@ title: "flint start"
 description: "Start the Flint daemon."
 ---
 
-`flint start` launches the daemon process. The daemon manages all VM lifecycle — creating, killing, pausing, and resuming sandboxes — and exposes a REST API on `localhost:9100`.
+`flint start` launches the daemon process. The daemon manages all VM lifecycle — creating, killing, pausing, and resuming sandboxes — and exposes a REST API on its Unix socket (`flint.sock` in the state directory) and, for clients with an API token, on `localhost:9100`. At its first start it writes an admin token to `admin.token` in the state directory; `flint ui` uses it to sign in to the web UI. See [Connecting](/api-reference/overview#connecting).
 
 You need the daemon running before you can use the Python SDK or any other `flint` commands.
 
