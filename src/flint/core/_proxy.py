@@ -19,8 +19,21 @@ import sys
 import tempfile
 import time
 
-from .config import log, HOST_IP, PROXY_PORT, PROXY_CA_DIR
+from .config import log, HOST_IP, PROXY_PORT, PROXY_CA_DIR, STATE_DIR, _DATA_KEY
 from ._netns import _popen_in_ns
+
+# The proxy's rules hold credentials in plaintext, so they stay in memory
+# (/run is a tmpfs) and readable by root only.
+_RULES_DIR = f"/run/flint/proxy-{_DATA_KEY}" if os.path.isdir("/run") else os.path.join(STATE_DIR, "proxy-rules")
+
+
+def _write_rules(path: str, rules: dict) -> None:
+    """Write rules atomically, never readable by anyone but the daemon's user."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(rules, f)
+    os.replace(tmp, path)
 
 
 def _mitmdump() -> str:
@@ -54,10 +67,11 @@ class CredentialProxy:
         """Start the mitmdump proxy subprocess in the sandbox's network namespace."""
         confdir = _ensure_confdir()
 
-        # Write rules to a temp file
-        fd, rules_path = tempfile.mkstemp(prefix="flint-proxy-rules-", suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            json.dump(rules, f)
+        os.makedirs(_RULES_DIR, mode=0o700, exist_ok=True)
+        os.chmod(_RULES_DIR, 0o700)
+        fd, rules_path = tempfile.mkstemp(prefix=f"{self.ns_name}-", suffix=".json", dir=_RULES_DIR)
+        os.close(fd)
+        _write_rules(rules_path, rules)
         self._rules_file = rules_path
 
         # Launch mitmdump in transparent mode inside the netns
@@ -135,8 +149,5 @@ class CredentialProxy:
         The addon watches the file mtime for changes on each request.
         """
         if self._rules_file:
-            tmp = self._rules_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(rules, f)
-            os.rename(tmp, self._rules_file)
+            _write_rules(self._rules_file, rules)
             log.info("[%s] Credential proxy rules updated", self.ns_name)

@@ -235,7 +235,7 @@ class DaemonClient:
         _raise_for_status(resp)
 
     def get_network_policy(self, vm_id: str) -> dict | None:
-        """Get the current network policy for a sandbox."""
+        """The sandbox's network policy, with credential values redacted."""
         resp = self._http.get(f"/vms/{vm_id}/network-policy")
         _raise_for_status(resp)
         return resp.json().get("network_policy")
