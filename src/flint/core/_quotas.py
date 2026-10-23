@@ -88,15 +88,16 @@ class Quotas:
         return limits
 
     @contextmanager
-    def reserve(self, tenant: str, used: Usage, want: Usage):
+    def reserve(self, tenant: str, used, want: Usage):
         """Hold ``want`` for ``tenant`` while it's created, or raise QuotaExceeded.
 
-        ``used`` is what the tenant has now; creates still in flight count too.
+        ``used()`` is what the tenant has now; it is read under the lock, so
+        a create that just finished counts. Creates in flight count too.
         """
         limits = self.get(tenant)
         with self._lock:
             pending = self._pending.get(tenant, Usage())
-            why = over(limits, used + pending, want)
+            why = over(limits, used() + pending, want)
             if why:
                 raise QuotaExceeded(f"Tenant '{tenant}' is at its quota: it {why}")
             self._pending[tenant] = pending + want
