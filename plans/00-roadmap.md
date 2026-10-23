@@ -45,9 +45,9 @@ provider and built-in tenant-aware observability in open source.
 |---|-----------|--------|
 | 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (the daemon; `flint agent` runs it as a cluster host) |
 | 2 | **Guest agent** (`flintd`): exec, PTY, files, processes | Exists |
-| 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Partial, see [01](01-tenant-isolation.md) |
-| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, admin/service tokens and `tenant` exist ([03](03-cluster.md)). No checked-in OpenAPI spec; resources are flat, not `metadata/spec/status` (only VM sets are declarative). The single daemon has no auth and an optional `tenant` on VMs only |
-| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: the cluster persists tenant-tagged events (`/v1/events`), without `actor` and not as an audit log. The single daemon's events are in-memory and untagged. No exec events, no export |
+| 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Single host done except IO/network rate limits and same-tenant opt-in, see [01](01-tenant-isolation.md) |
+| 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, admin/service tokens and `tenant` exist ([03](03-cluster.md)). No checked-in OpenAPI spec; resources are flat, not `metadata/spec/status` (only VM sets are declarative). The single daemon has a trusted Unix socket, admin/service tokens on TCP, and a `tenant` on every VM, volume and template |
+| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: the cluster persists tenant-tagged events (`/v1/events`), without `actor` and not as an audit log. The single daemon's events are tenant-tagged and scoped, but in memory only. No exec events, no export |
 | 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist; Terraform deploys clusters. Web UI at `/ui` on the daemon and the control plane (#31). No TypeScript SDK, MCP server or workload/admin Terraform provider |
 | 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Cordon, drain, migration (snapshot-based) and VM-set rolling updates exist ([03](03-cluster.md)); no health gates, backups or live migration |
 
@@ -56,22 +56,30 @@ provider and built-in tenant-aware observability in open source.
 ### Phase 1: isolated single host
 
 Make one host safe to run many tenants' untrusted code. Details in
-[01-tenant-isolation.md](01-tenant-isolation.md).
+[01-tenant-isolation.md](01-tenant-isolation.md); the published threat
+model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
 
-- Service credential on the daemon; Unix socket by default. *Not started
-  on the single daemon; the cluster has admin/service tokens.*
-- `tenant` on every VM, volume and template build. *Partial: required
-  in the cluster; optional on single-daemon VMs, absent on volumes.*
+- Service credential on the daemon; Unix socket by default. *Done (#41):
+  trusted socket, admin/service tokens (hashed) on TCP, `flint token`,
+  `flint ui`.*
+- `tenant` on every VM, volume and template build. *Done (#41), with
+  tenant-scoped tokens, events and lookups.*
 - No VM↔VM traffic across tenants; VMs can't reach host services or the
   control plane. *Done: every VM is isolated from every other, tested.*
-- Secrets encrypted at rest, write-only, redacted on read. *Not started.*
-- Disks, snapshots and volumes wiped on delete. *Not started.*
+- Secrets encrypted at rest, write-only, redacted on read. *Done (#40).*
+- Disks, snapshots and volumes wiped on delete. *Done (#42), with
+  `vm.wiped`.*
 - Cloud Hypervisor backend jailed to the same standard as Firecracker.
   *Done.*
-- Written threat model. *Not started.*
+- Per-tenant quotas. *Done on the single daemon (#43).*
+- Written threat model. *Done (#44).*
+- Still open: per-VM disk IO and network rate limits; letting a tenant's
+  own VMs talk to each other; moving the firewall from iptables to
+  nftables; encrypting policies in the cluster's database.
 
 **Done when** an end-to-end test with two tenants proves every boundary in the
-threat model, on both Linux backends.
+threat model, on both Linux backends. *Done: `test_two_tenants_are_isolated`
+(#44).*
 
 ### Phase 2: one API, many surfaces
 
@@ -119,17 +127,9 @@ Details in [03-cluster.md](03-cluster.md).
 
 ## Where to start
 
-Phase 1, in this order:
-
-1. ~~Network isolation between tenants~~ (mostly done: VM↔VM and
-   VM↔host isolation are tested; nftables migration and same-tenant opt-in
-   remain).
-2. Secrets at rest and redaction (smallest change, most embarrassing gap).
-   `GET /vms/{id}/network-policy` still returns credentials verbatim.
-3. Service credential + `tenant` field (done in the cluster; not on the
-   single daemon).
-4. Wipe on delete (not started); ~~CH jailing~~ (done).
-5. Two-tenant e2e test covering every boundary (not started).
+Phase 1 is done apart from the open items listed under it; rate limits are
+the next isolation gap. Phase 2 starts with the OpenAPI spec and the
+persisted audit log.
 
 ## Non-goals for now
 
