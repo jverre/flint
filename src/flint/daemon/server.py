@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -25,7 +26,8 @@ from flint.core.types import SandboxState
 from flint.core._template_registry import (
     list_templates, get_template, delete_template as _delete_template,
 )
-from flint.core._volumes import Volumes, VolumeError
+from flint.core._volumes import DEFAULT_SIZE_GIB, Volumes, VolumeError
+from flint.core._quotas import QuotaExceeded, Quotas, Usage
 from flint.core import _nfs_server
 from flint.core._metrics import MetricsSampler
 from flint.core import _logs
@@ -55,6 +57,12 @@ async def _auth_error(_request: Request, e: AuthError):
     return JSONResponse({"detail": e.detail}, status_code=e.status)
 
 
+@app.exception_handler(QuotaExceeded)
+async def _quota_exceeded(_request: Request, e: QuotaExceeded):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": str(e)}, status_code=429)
+
+
 @app.on_event("startup")
 async def _startup_event_bus():
     loop = asyncio.get_running_loop()
@@ -79,6 +87,20 @@ def _require_manager() -> SandboxManager:
     if daemon.manager is None:
         raise HTTPException(status_code=503, detail="Manager not initialized")
     return daemon.manager
+
+
+def _usage(tenant: str) -> Usage:
+    """What a tenant holds on this host: its VMs (paused too) and volumes."""
+    daemon = _get_daemon()
+    vms = sum(1 for d in daemon.manager.list_dicts() if d.get("tenant") == tenant) if daemon.manager else 0
+    vcpus, mem = daemon.backend.vm_resources()
+    gib = sum(v.size_gib or 0 for v in daemon.volumes.list((tenant,))) if daemon.volumes else 0
+    return Usage(vms, vms * vcpus, vms * mem, gib)
+
+
+def _one_vm() -> Usage:
+    vcpus, mem = _get_daemon().backend.vm_resources()
+    return Usage(1, vcpus, mem, 0)
 
 
 def _template_for(principal: Principal, template_id: str) -> dict | None:
@@ -262,8 +284,13 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
 
     # Run in executor to avoid blocking the event loop (create can take 10s+ on failure)
     loop = asyncio.get_event_loop()
+    # The control plane enforces a cluster's quotas.
+    reservation = daemon.quotas.reserve(tenant, lambda: _usage(tenant), _one_vm()) if not daemon.cluster else contextlib.nullcontext()
     try:
-        vm_id = await loop.run_in_executor(None, _create)
+        with reservation:
+            vm_id = await loop.run_in_executor(None, _create)
+    except QuotaExceeded:
+        raise
     except _Unfenced as e:
         log.exception("POST /vms — %s", e)
         print(f"POST /vms — {e}")
@@ -812,16 +839,29 @@ def list_volumes(request: Request, tenant: str = ""):
 @app.post("/volumes")
 def create_volume(body: dict, request: Request):
     tenant = principal_of(request).resolve_tenant(body.get("tenant"))
-    vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"), tenant)
+    from flint.core import _nfs_server
+    size = body.get("size_gib") if isinstance(body.get("size_gib"), int) else 0
+    if _nfs_server.images_available():
+        size = size or DEFAULT_SIZE_GIB
+    with _get_daemon().quotas.reserve(tenant, lambda: _usage(tenant), Usage(volume_gib=size)):
+        vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"), tenant)
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes — created {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 
+def _copy_volume(copy, volume: str, body: dict, request: Request):
+    """Snapshot or fork: a copy counts its full size against the tenant's quota."""
+    scope = _scope(principal_of(request))
+    src = _volume_call(_require_volumes()._require, volume, scope)
+    with _get_daemon().quotas.reserve(src.tenant, lambda: _usage(src.tenant), Usage(volume_gib=src.size_gib or 0)):
+        return _volume_call(copy, volume, body.get("name"), scope)
+
+
 @app.post("/volumes/{volume}/snapshot")
 def snapshot_volume(volume: str, body: dict, request: Request):
     """A read-only copy of the volume as it is now."""
-    vol = _volume_call(_require_volumes().snapshot, volume, body.get("name"), _scope(principal_of(request)))
+    vol = _copy_volume(_require_volumes().snapshot, volume, body, request)
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes/{volume}/snapshot — {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
@@ -830,7 +870,7 @@ def snapshot_volume(volume: str, body: dict, request: Request):
 @app.post("/volumes/{volume}/fork")
 def fork_volume(volume: str, body: dict, request: Request):
     """A writable copy of the volume as it is now."""
-    vol = _volume_call(_require_volumes().fork, volume, body.get("name"), _scope(principal_of(request)))
+    vol = _copy_volume(_require_volumes().fork, volume, body, request)
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes/{volume}/fork — {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
@@ -905,6 +945,30 @@ def revoke_token(token_id: str):
         raise HTTPException(status_code=404, detail="Token not found")
     print(f"DELETE /v1/tokens/{token_id} — revoked")
     return {"ok": True}
+
+
+# ── Tenant quotas ─────────────────────────────────────────────────────────
+# The same API as the cluster control plane's, with more limits.
+
+@app.put("/v1/tenants/{tenant}/quota")
+def put_quota(tenant: str, body: dict, request: Request):
+    """Set some of a tenant's limits (admin only): max_vms, max_vcpus,
+    max_memory_mib, max_volume_gib. 0 = no limit; the others stay."""
+    if not principal_of(request).is_admin:
+        raise HTTPException(status_code=403, detail="Admin token required")
+    try:
+        _get_daemon().quotas.set(tenant, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _get_daemon().quotas.view(tenant, _usage(tenant))
+
+
+@app.get("/v1/tenants/{tenant}/quota")
+def get_quota(tenant: str, request: Request):
+    """A tenant's limits and what it uses now."""
+    if not principal_of(request).can_tenant(tenant):
+        raise HTTPException(status_code=403, detail="Not allowed for this tenant")
+    return _get_daemon().quotas.view(tenant, _usage(tenant))
 
 
 # ── Config / limits endpoints ─────────────────────────────────────────────
@@ -1051,6 +1115,7 @@ class FlintDaemon:
         self.metrics: MetricsSampler | None = None
         self.cluster = None  # ClusterAgent when running as a cluster host agent
         self.tokens: TokenStore | None = None
+        self.quotas: Quotas | None = None
 
     def kill_vm(self, vm_id: str) -> None:
         """Delete a sandbox (running or paused) and everything it holds."""
@@ -1134,6 +1199,7 @@ class FlintDaemon:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
         self.tokens = TokenStore(DAEMON_DB_PATH)
+        self.quotas = Quotas(DAEMON_DB_PATH)
         from flint.core import config as _cfg
         if not _cfg.CLUSTER_MODE:  # a host agent's only caller is the control plane, over mTLS
             self.tokens.ensure_admin_token_file()
