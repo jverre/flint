@@ -57,7 +57,7 @@ description: "Start a sandbox and run your first command."
   </Step>
 
   <Step title="Start the daemon">
-    The daemon manages all VM lifecycle in the background. It listens on `localhost:9100` by default and auto-selects a backend based on your host:
+    The daemon manages all VM lifecycle in the background. It listens on a Unix socket in its state directory (the SDK and CLI use it) and on `localhost:9100` for clients with an API token, and auto-selects a backend based on your host:
 
     ```bash
     sudo flint start

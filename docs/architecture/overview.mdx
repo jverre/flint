@@ -7,8 +7,8 @@ Flint has five main pieces: the daemon, the **backend plugin** that drives the h
 
 ```mermaid
 graph TD
-    SDK["Python SDK / CLI / TUI"] -->|HTTP + WebSocket| Daemon
-    Daemon["Flint Daemon\nlocalhost:9100"] -->|backend plugin API| Backend["Backend\n(firecracker / cloud-hypervisor / macos-vz)"]
+    SDK["Python SDK / CLI / TUI"] -->|HTTP + WebSocket over its socket| Daemon
+    Daemon["Flint Daemon\nflint.sock, localhost:9100"] -->|backend plugin API| Backend["Backend\n(firecracker / cloud-hypervisor / macos-vz)"]
     Backend -->|hypervisor control socket| VM["Guest VM\n(one per sandbox)"]
     Daemon -->|HTTP via netns or internal net| flintd["flintd\nguest agent :5000"]
     flintd --> VM
@@ -18,7 +18,7 @@ graph TD
 
 ## The daemon
 
-The daemon is a FastAPI process that owns all VM lifecycle. It runs on `localhost:9100` and:
+The daemon is a FastAPI process that owns all VM lifecycle. It listens on its Unix socket and on `localhost:9100` (API token required) and:
 
 - Manages the rootfs pool — keeps pre-copied rootfs images ready to go
 - Delegates VM boot, pause, resume, and recovery to the configured backend plugin

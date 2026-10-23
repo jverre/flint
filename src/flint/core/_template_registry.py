@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
+import threading
 import time
 
 from .config import log, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, GOLDEN_DIR
@@ -11,6 +13,18 @@ from .config import log, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, GOLDEN_DIR
 
 def _registry_path() -> str:
     return f"{TEMPLATES_DIR}/registry.json"
+
+
+# Every change is a read-modify-write of registry.json; builds run in threads.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _load_registry() -> dict:
@@ -60,6 +74,7 @@ def _normalize_entry(entry: dict) -> dict:
     return entry
 
 
+@_locked
 def register_template(
     template_id: str,
     name: str,
@@ -80,6 +95,7 @@ def register_template(
     log.info("Registered template %s (%s)", template_id, name)
 
 
+@_locked
 def register_template_artifact(
     template_id: str,
     name: str,
@@ -107,6 +123,21 @@ def register_template_artifact(
     log.info("Registered template artifact %s (%s) for %s", template_id, name, backend_kind)
 
 
+@_locked
+def claim_template(template_id: str, name: str, tenant: str) -> None:
+    """Record who owns a template before it is built: ``tenant``, or "" for a
+    template every tenant can use. Builds keep the owner when they register."""
+    registry = _load_registry()
+    entry = _normalize_entry(registry.get(template_id, {"name": name, "status": "building", "created_at": time.time()}))
+    if tenant:
+        entry["tenant"] = tenant
+    else:
+        entry.pop("tenant", None)
+    registry[template_id] = entry
+    _save_registry(registry)
+
+
+@_locked
 def update_template_status(template_id: str, status: str) -> None:
     registry = _load_registry()
     if template_id in registry:
@@ -121,6 +152,7 @@ def update_template_status(template_id: str, status: str) -> None:
         _save_registry(registry)
 
 
+@_locked
 def update_template_artifact_status(template_id: str, backend_kind: str, status: str) -> None:
     registry = _load_registry()
     if template_id not in registry:
@@ -140,6 +172,7 @@ def update_template_artifact_status(template_id: str, backend_kind: str, status:
     _save_registry(registry)
 
 
+@_locked
 def delete_template(template_id: str) -> None:
     if template_id == DEFAULT_TEMPLATE_ID:
         raise ValueError("Cannot delete the default template")
@@ -149,6 +182,7 @@ def delete_template(template_id: str) -> None:
     log.info("Deleted template %s", template_id)
 
 
+@_locked
 def delete_template_artifact(template_id: str, backend_kind: str) -> None:
     registry = _load_registry()
     entry = registry.get(template_id)

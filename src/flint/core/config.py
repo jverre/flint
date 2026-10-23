@@ -68,9 +68,16 @@ TERM_ROWS = 40
 
 # ── Daemon ────────────────────────────────────────────────────────────────
 DAEMON_HOST = os.environ.get("FLINT_HOST", "127.0.0.1")
-# Where clients (SDK, CLI, TUI) send requests: a local daemon, or a cluster's
-# control plane (FLINT_URL=https://flint.example.com, FLINT_API_KEY=...).
-DAEMON_URL = os.environ.get("FLINT_URL", f"http://127.0.0.1:{DAEMON_PORT}").rstrip("/")
+# The daemon's Unix socket. Whoever can open it is an admin, so it is only
+# accessible to the daemon's user (and the `flint` group, if there is one).
+# TCP needs an API token.
+DAEMON_SOCKET = os.environ.get("FLINT_SOCKET", f"{STATE_DIR}/flint.sock")
+# Where clients (SDK, CLI, TUI) send requests: the local daemon's socket by
+# default, a daemon over TCP (FLINT_URL=http://127.0.0.1:9100 with
+# FLINT_API_KEY), or a cluster's control plane (FLINT_URL=https://...).
+DAEMON_URL = os.environ.get("FLINT_URL", f"unix://{DAEMON_SOCKET}").rstrip("/")
+# Written at the daemon's first start: an admin token for TCP clients (the web UI).
+ADMIN_TOKEN_PATH = f"{STATE_DIR}/admin.token"
 API_KEY = os.environ.get("FLINT_API_KEY", "")
 TENANT = os.environ.get("FLINT_TENANT", "")
 DAEMON_DIR = STATE_DIR

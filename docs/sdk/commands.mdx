@@ -52,7 +52,7 @@ description: "Run shell commands inside a sandbox."
     `POST /vms/{vm_id}/exec`
 
     ```bash
-    curl -X POST http://localhost:9100/vms/{vm_id}/exec \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/vms/{vm_id}/exec \
       -H "Content-Type: application/json" \
       -d '{"cmd": ["/bin/sh", "-c", "echo hello"], "timeout": 60}'
     ```

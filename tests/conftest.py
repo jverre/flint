@@ -5,7 +5,6 @@ import subprocess
 import tempfile
 import time
 
-import httpx
 
 # Set test isolation env vars BEFORE importing flint. FLINT_TEST_* override
 # them, so two checkouts can run their suites on one machine side by side.
@@ -17,12 +16,23 @@ os.environ["FLINT_PORT"] = TEST_PORT
 os.environ["FLINT_DATA_DIR"] = TEST_DATA_DIR
 os.environ["FLINT_STATE_DIR"] = TEST_STATE_DIR
 
-# FLINT_URL points the whole suite at an already running endpoint instead of
-# a daemon started here, e.g. a cluster control plane (with FLINT_API_KEY).
-BASE_URL = os.environ.setdefault("FLINT_URL", f"http://127.0.0.1:{TEST_PORT}").rstrip("/")
-WS_BASE = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+# By default the suite talks to the daemon it starts the way a local user
+# does, over its Unix socket. FLINT_URL points it at an already running
+# endpoint instead, e.g. a cluster control plane (with FLINT_API_KEY).
+FLINT_URL = os.environ.setdefault("FLINT_URL", f"unix://{TEST_STATE_DIR}/flint.sock").rstrip("/")
+# The test daemon's TCP listener, which needs an API token.
+TCP_URL = f"http://127.0.0.1:{TEST_PORT}"
 AUTH = {"Authorization": f"Bearer {os.environ['FLINT_API_KEY']}"} if os.environ.get("FLINT_API_KEY") else {}
-api = httpx.Client(headers=AUTH, timeout=30.0)
+
+from flint._client import transport as _transport  # noqa: E402  (after the env above)
+
+BASE_URL = _transport.http_base(FLINT_URL)
+api = _transport.http_client(FLINT_URL, headers=AUTH, timeout=30.0)
+
+
+def ws_connect(path: str, **kwargs):
+    """A WebSocket to ``path`` on the endpoint under test."""
+    return _transport.ws_connect(FLINT_URL, path, AUTH, **kwargs)
 
 # On macOS, point VZ asset paths to the real install location so the test
 # daemon can find the kernel + rootfs even though FLINT_DATA_DIR is overridden.

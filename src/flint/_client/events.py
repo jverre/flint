@@ -16,11 +16,11 @@ import threading
 import time
 from typing import Callable
 
-import websockets.sync.client as ws_sync
 from websockets.exceptions import WebSocketException
 
 from flint.core.config import DAEMON_URL, log
 from flint._client.client import auth_headers
+from flint._client.transport import ws_connect
 
 
 class EventStream:
@@ -37,7 +37,8 @@ class EventStream:
         self._on_resync = on_resync
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
-        self._ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + "/events"
+        self._base_url = base_url
+        self._path = "/events"
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="flint-events")
 
@@ -52,7 +53,7 @@ class EventStream:
         first = True
         while not self._stop.is_set():
             try:
-                ws = ws_sync.connect(self._ws_url, open_timeout=5, additional_headers=auth_headers() or None)
+                ws = ws_connect(self._base_url, self._path, auth_headers(), open_timeout=5)
             except Exception as e:
                 log.debug("EventStream connect failed: %s", e)
                 if self._stop.wait(backoff):
