@@ -38,6 +38,7 @@ This is what holds on a single host, with the Firecracker and Cloud Hypervisor b
 
 - **Hypervisor and kernel exploits** beyond what jailing and seccomp contain, and **side channels** between VMs that share CPU cores. Run tenants that must never share hardware on separate hosts.
 - **A malicious host operator**, or anyone with root on the host.
+- **Template builds.** A template's Dockerfile runs in Docker on the host, in a container rather than a VM, with the host's network (cloud metadata included) and a build cache shared by all tenants. Only build Dockerfiles you trust, or vet what your users submit. Template IDs are one namespace across tenants: a tenant can see that a name is taken.
 - **Disk and network throughput.** Nothing caps a VM's disk IO or network bandwidth yet, so one VM can slow its neighbours.
 - **Domain allowlists.** Egress to the internet is all or nothing; there is no per-domain allowlist except for injected credentials.
 - **Traffic between a tenant's own VMs.** It is always blocked; there is no way to allow it yet.

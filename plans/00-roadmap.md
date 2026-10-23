@@ -73,7 +73,8 @@ model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
   *Done.*
 - Per-tenant quotas. *Done on the single daemon (#43).*
 - Written threat model. *Done (#44).*
-- Still open: per-VM disk IO and network rate limits; letting a tenant's
+- Still open: template builds run on the host's Docker, not in a VM (the
+  biggest gap); per-VM disk IO and network rate limits; letting a tenant's
   own VMs talk to each other; moving the firewall from iptables to
   nftables; encrypting policies in the cluster's database.
 
@@ -127,8 +128,8 @@ Details in [03-cluster.md](03-cluster.md).
 
 ## Where to start
 
-Phase 1 is done apart from the open items listed under it; rate limits are
-the next isolation gap. Phase 2 starts with the OpenAPI spec and the
+Phase 1 is done apart from the open items listed under it. Template builds
+in a VM are the next isolation gap, then rate limits. Phase 2 starts with the OpenAPI spec and the
 persisted audit log.
 
 ## Non-goals for now
