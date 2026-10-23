@@ -86,9 +86,7 @@ class Pty:
         on_data: Callable[[bytes], None] | None = None,
     ) -> PtySession:
         callback = on_data or (lambda _data: None)
-        ws_base = _settings["url"].replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_base}/vms/{self._vm_id}/terminal"
-        conn = _TerminalConnection(ws_url, callback, auth_headers(_settings["api_key"]))
+        conn = _TerminalConnection(_settings["url"], f"/vms/{self._vm_id}/terminal", callback, auth_headers(_settings["api_key"]))
         return PtySession(self._vm_id, conn)
 
 

@@ -75,6 +75,10 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        # It holds token hashes and sealed credentials: the daemon's user only.
+        for path in (db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
         # Migrate existing databases
         try:
             self._conn.execute("ALTER TABLE sandboxes ADD COLUMN chroot_base TEXT")
@@ -104,6 +108,9 @@ class StateStore:
                 self._conn.commit()
             except Exception:
                 pass
+        # VMs from before every VM had a tenant belong to the default one.
+        self._conn.execute("UPDATE sandboxes SET tenant = 'default' WHERE tenant = ''")
+        self._conn.commit()
         self._seal_policies()
 
     def _seal_policies(self) -> None:

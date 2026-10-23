@@ -145,10 +145,13 @@ def agent(token, advertise, listen, port, snapd_port, name, zone, labels, data_d
 # ── Cluster administration (talks to the control plane: FLINT_URL, FLINT_API_KEY) ──
 
 def _cp(method: str, path: str, **kwargs):
-    import httpx
+    """Call the daemon or control plane at FLINT_URL; exit with its error."""
     from flint._client.client import auth_headers
+    from flint._client.transport import http_client
     from flint.core.config import DAEMON_URL
-    resp = httpx.request(method, f"{DAEMON_URL}{path}", headers=auth_headers(), timeout=60.0, **kwargs)
+    _require_daemon()
+    with http_client(DAEMON_URL, headers=auth_headers(), timeout=60.0) as c:
+        resp = c.request(method, path, **kwargs)
     if resp.status_code >= 400:
         try:
             detail = resp.json().get("detail", resp.text)
@@ -156,6 +159,71 @@ def _cp(method: str, path: str, **kwargs):
             detail = resp.text
         raise click.ClickException(f"{resp.status_code}: {detail}")
     return resp.json()
+
+
+def _require_daemon() -> None:
+    """Exit with a useful message when the daemon can't be reached."""
+    from flint._client.client import DaemonClient
+    from flint._client.transport import socket_path
+    from flint.core.config import DAEMON_URL
+    if DaemonClient.is_daemon_running():
+        return
+    path = socket_path(DAEMON_URL)
+    if path and os.path.exists(path) and not os.access(path, os.R_OK | os.W_OK):
+        raise click.ClickException(
+            f"can't open the daemon's socket {path}: permission denied. Run as the daemon's user (e.g. with "
+            "sudo), join the `flint` group, or use TCP: FLINT_URL=http://127.0.0.1:9100 FLINT_API_KEY=<token>")
+    raise click.ClickException(f"Flint daemon is not running at {DAEMON_URL}. Run 'flint start' first.")
+
+
+# ── API tokens and the web UI ──────────────────────────────────────────────
+
+@cli.group()
+def token():
+    """Manage API tokens (TCP clients need one; the daemon's socket doesn't)."""
+
+
+@token.command("create")
+@click.option("--kind", type=click.Choice(["service", "admin"]), default="service")
+@click.option("--name", default="")
+@click.option("--tenant", "tenants", multiple=True, help="Pin a service token to these tenants (repeatable)")
+def token_create(kind, name, tenants):
+    """Create a token. It is printed once and can't be shown again."""
+    click.echo(_cp("POST", "/v1/tokens", json={"kind": kind, "name": name, "tenants": list(tenants)})["token"])
+
+
+@token.command("list")
+def token_list():
+    """List tokens (never their secrets)."""
+    for t in _cp("GET", "/v1/tokens")["tokens"]:
+        click.echo(f"{t['id']:14s} {t['kind']:8s} {t['name'][:24]:24s} {','.join(t['tenants']) or '(any tenant)'}")
+
+
+@token.command("revoke")
+@click.argument("token_id")
+def token_revoke(token_id):
+    """Revoke a token by its ID."""
+    _cp("DELETE", f"/v1/tokens/{token_id}")
+    click.echo(f"{token_id} revoked")
+
+
+@cli.command()
+@click.option("--open/--no-open", "open_browser", default=True, help="Open the URL in a browser")
+def ui(open_browser):
+    """Sign in to the local daemon's web UI with its admin token."""
+    from flint.core.config import ADMIN_TOKEN_PATH, DAEMON_PORT
+    try:
+        with open(ADMIN_TOKEN_PATH) as f:
+            tok = f.read().strip()
+    except PermissionError:
+        raise click.ClickException(f"can't read {ADMIN_TOKEN_PATH}: run as the daemon's user (e.g. with sudo)")
+    except FileNotFoundError:
+        raise click.ClickException(f"no admin token at {ADMIN_TOKEN_PATH}: start the daemon first ('flint start')")
+    url = f"http://127.0.0.1:{DAEMON_PORT}/ui/#token={tok}"
+    click.echo(url)
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
 
 
 @cli.group()
@@ -262,10 +330,7 @@ def backends_list():
 @cli.command()
 def app():
     """Start the Flint TUI (requires running daemon)."""
-    from flint.sandbox import Sandbox
-    if not Sandbox.is_daemon_running():
-        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
-        raise SystemExit(1)
+    _require_daemon()
     from flint.tui import FlintApp
     FlintApp().run()
 
@@ -350,27 +415,21 @@ def setup_macos(vz_dir, alpine_version, kernel_version, kernel_patch, rootfs_siz
 @cli.command(name="list")
 def list_vms():
     """List all VMs."""
-    from flint.sandbox import Sandbox
-    if not Sandbox.is_daemon_running():
-        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
-        raise SystemExit(1)
-    sandboxes = Sandbox.list()
-    if not sandboxes:
+    vms = _daemon_client().list()
+    if not vms:
         click.echo("No VMs found.")
         return
-    for sb in sandboxes:
-        age = time.time() - sb.created_at
+    for vm in vms:
+        age = time.time() - vm.get("created_at", time.time())
         age_str = f"{int(age)}s" if age < 60 else f"{int(age / 60)}m"
-        click.echo(f"  {sb.id[:8]}  pid={sb.pid}  state={sb.state}  age={age_str}")
+        click.echo(f"  {vm['vm_id'][:8]}  tenant={vm.get('tenant') or '-'}  state={vm.get('state')}  age={age_str}")
 
 
 # ── Volume commands ────────────────────────────────────────────────────────
 
 def _daemon_client():
     from flint._client.client import DaemonClient
-    if not DaemonClient.is_daemon_running():
-        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
-        raise SystemExit(1)
+    _require_daemon()
     return DaemonClient()
 
 
@@ -397,7 +456,7 @@ def volumes_list():
     for v in vols:
         size = f"{v['size_gib']} GiB" if v.get("size_gib") else "-"
         flags = " read-only" if v.get("readonly") else ""
-        click.echo(f"  {v['id']}  {v['name']:<24} {v.get('kind', 'dir'):<5} {size:>9}{flags}")
+        click.echo(f"  {v['id']}  {v.get('tenant', ''):<16} {v['name']:<24} {v.get('kind', 'dir'):<5} {size:>9}{flags}")
 
 
 @volumes.command("create")
@@ -517,10 +576,7 @@ def build(name, build_all, force, rootfs_size):
     catalog. Subsequent deploys will boot from the cached snapshot in
     milliseconds instead of rebuilding the image from scratch.
     """
-    from flint.sandbox import Sandbox
-    if not Sandbox.is_daemon_running():
-        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
-        raise SystemExit(1)
+    _require_daemon()
 
     if not build_all and name is None:
         click.echo("Error: Provide an agent name or use --all.", err=True)
@@ -556,10 +612,7 @@ def build(name, build_all, force, rootfs_size):
 @click.option("--force-build", is_flag=True, default=False, help="Force template rebuild even if cached")
 def deploy(name, env, rootfs_size, no_internet, force_build):
     """Build (if needed) and deploy an agent in a Flint microVM."""
-    from flint.sandbox import Sandbox
-    if not Sandbox.is_daemon_running():
-        click.echo("Error: Flint daemon is not running. Run 'flint start' first.", err=True)
-        raise SystemExit(1)
+    _require_daemon()
 
     from flint.agents.catalog import get_agent
     defn = get_agent(name)

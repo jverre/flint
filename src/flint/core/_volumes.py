@@ -52,17 +52,21 @@ from ._nfs_server import VOLUMES_DIR
 from .types import SandboxState
 
 
-_SCHEMA = """
+_VOLUMES_TABLE = """
 CREATE TABLE IF NOT EXISTS volumes (
     id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
     created_at REAL NOT NULL,
     kind       TEXT NOT NULL DEFAULT 'dir',
     size_gib   INTEGER,
     readonly   INTEGER NOT NULL DEFAULT 0,
     source     TEXT,
-    guest_written INTEGER NOT NULL DEFAULT 0
+    guest_written INTEGER NOT NULL DEFAULT 0,
+    tenant     TEXT NOT NULL DEFAULT 'default'
 );
+"""
+_SCHEMA = _VOLUMES_TABLE + """
+CREATE UNIQUE INDEX IF NOT EXISTS volumes_tenant_name ON volumes (tenant, name);
 CREATE TABLE IF NOT EXISTS volume_mounts (
     id         TEXT PRIMARY KEY,
     volume_id  TEXT NOT NULL,
@@ -82,7 +86,7 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 DEFAULT_SIZE_GIB = 10  # sparse: an image only uses what is written to it
 _MAX_SIZE_GIB = 16384
-_VOLUME_COLUMNS = "id, name, created_at, kind, size_gib, readonly, source, guest_written"
+_VOLUME_COLUMNS = "id, name, created_at, kind, size_gib, readonly, source, guest_written, tenant"
 _MOUNT_COLUMNS = "id, volume_id, vm_id, path, subpath, readonly, client_ip, created_at, transport, device"
 
 # Readers revalidate attributes every second so they see other sandboxes'
@@ -112,13 +116,14 @@ class Volume:
     readonly: bool = False
     source: str | None = None  # volume this is a snapshot or fork of
     guest_written: bool = False  # a sandbox has had it as a raw disk
+    tenant: str = "default"  # only this tenant's sandboxes can mount it
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 def _volume(row) -> Volume:
-    return Volume(row[0], row[1], row[2], row[3], row[4], bool(row[5]), row[6], bool(row[7]))
+    return Volume(row[0], row[1], row[2], row[3], row[4], bool(row[5]), row[6], bool(row[7]), row[8])
 
 
 @dataclass
@@ -190,9 +195,11 @@ class Volumes:
             elif cols:
                 for col, decl in (("kind", "TEXT NOT NULL DEFAULT 'dir'"), ("size_gib", "INTEGER"),
                                   ("readonly", "INTEGER NOT NULL DEFAULT 0"), ("source", "TEXT"),
-                                  ("guest_written", "INTEGER NOT NULL DEFAULT 0")):
+                                  ("guest_written", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("tenant", "TEXT NOT NULL DEFAULT 'default'")):
                     if col not in cols:
                         self._conn.execute(f"ALTER TABLE volumes ADD COLUMN {col} {decl}")
+                self._drop_global_name_uniqueness()
             mount_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(volume_mounts)")}
             if mount_cols:
                 for col, decl in (("transport", "TEXT NOT NULL DEFAULT 'nfs'"), ("device", "TEXT")):
@@ -202,51 +209,82 @@ class Volumes:
             self._conn.commit()
         os.makedirs(VOLUMES_DIR, exist_ok=True)
 
-    # ── Volumes ──────────────────────────────────────────────────────────
+    def _drop_global_name_uniqueness(self) -> None:
+        """Names used to be unique across the host; now they are per tenant.
+        SQLite can't drop a column constraint, so rebuild the table."""
+        for idx in self._conn.execute("PRAGMA index_list(volumes)").fetchall():
+            if idx[3] != "u":  # origin: only the inline UNIQUE constraint
+                continue
+            cols = [c[2] for c in self._conn.execute(f"PRAGMA index_info('{idx[1]}')")]
+            if cols == ["name"]:
+                self._conn.execute("ALTER TABLE volumes RENAME TO volumes_before_tenants")
+                self._conn.executescript(_VOLUMES_TABLE)
+                self._conn.execute(f"INSERT INTO volumes ({_VOLUME_COLUMNS}) "
+                                   f"SELECT {_VOLUME_COLUMNS} FROM volumes_before_tenants")
+                self._conn.execute("DROP TABLE volumes_before_tenants")
+                return
 
-    def list(self) -> list[Volume]:
-        rows = self._conn.execute(f"SELECT {_VOLUME_COLUMNS} FROM volumes ORDER BY created_at DESC").fetchall()
+    # ── Volumes ──────────────────────────────────────────────────────────
+    # ``tenants`` scopes a lookup to the volumes of those tenants (None: all).
+
+    @staticmethod
+    def _scope(tenants: tuple[str, ...] | None) -> tuple[str, list]:
+        if tenants is None:
+            return "", []
+        return f" AND tenant IN ({', '.join('?' * len(tenants))})", list(tenants)
+
+    def list(self, tenants: tuple[str, ...] | None = None) -> list[Volume]:
+        where, args = self._scope(tenants)
+        rows = self._conn.execute(
+            f"SELECT {_VOLUME_COLUMNS} FROM volumes WHERE 1{where} ORDER BY created_at DESC", args,
+        ).fetchall()
         return [_volume(r) for r in rows]
 
-    def get(self, ref: str) -> Volume | None:
+    def get(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume | None:
         """Look a volume up by ID or name."""
-        row = self._conn.execute(
-            f"SELECT {_VOLUME_COLUMNS} FROM volumes WHERE id = ? OR name = ?", (ref, ref),
-        ).fetchone()
-        return _volume(row) if row else None
+        where, args = self._scope(tenants)
+        rows = self._conn.execute(
+            f"SELECT {_VOLUME_COLUMNS} FROM volumes WHERE (id = ? OR name = ?){where}", [ref, ref, *args],
+        ).fetchall()
+        if len(rows) > 1:
+            byid = [r for r in rows if r[0] == ref]
+            if not byid:
+                raise VolumeError(409, f"Several tenants have a volume named '{ref}'; use its ID")
+            rows = byid
+        return _volume(rows[0]) if rows else None
 
-    def _require(self, ref: str) -> Volume:
-        vol = self.get(ref)
+    def _require(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume:
+        vol = self.get(ref, tenants)
         if vol is None:
             raise VolumeError(404, f"Volume '{ref}' not found")
         return vol
 
-    def create(self, name: object, size_gib: object = None) -> Volume:
+    def create(self, name: object, size_gib: object = None, tenant: str = "default") -> Volume:
         """Create an empty volume: an image of ``size_gib`` if the host supports images, else a directory."""
         if size_gib is not None and (not isinstance(size_gib, int) or isinstance(size_gib, bool)
                                      or not 1 <= size_gib <= _MAX_SIZE_GIB):
             raise VolumeError(400, f"'size_gib' must be an integer from 1 to {_MAX_SIZE_GIB}")
         if _nfs_server.images_available():
-            return self._add(name, kind="image", size_gib=size_gib or DEFAULT_SIZE_GIB)
+            return self._add(name, kind="image", size_gib=size_gib or DEFAULT_SIZE_GIB, tenant=tenant)
         if size_gib is not None:
             raise VolumeError(503, "Sized volumes need block images, which this host can't serve (no NBD)")
-        return self._add(name, kind="dir")
+        return self._add(name, kind="dir", tenant=tenant)
 
-    def snapshot(self, ref: str, name: object) -> Volume:
+    def snapshot(self, ref: str, name: object, tenants: tuple[str, ...] | None = None) -> Volume:
         """A read-only copy of the volume as it is now. Cheap: it shares every block."""
-        return self._copy(ref, name, readonly=True)
+        return self._copy(ref, name, readonly=True, tenants=tenants)
 
-    def fork(self, ref: str, name: object) -> Volume:
+    def fork(self, ref: str, name: object, tenants: tuple[str, ...] | None = None) -> Volume:
         """A writable copy of the volume as it is now, independent from then on."""
-        return self._copy(ref, name, readonly=False)
+        return self._copy(ref, name, readonly=False, tenants=tenants)
 
-    def _copy(self, ref: str, name: object, readonly: bool) -> Volume:
-        src = self._require(ref)
+    def _copy(self, ref: str, name: object, readonly: bool, tenants: tuple[str, ...] | None) -> Volume:
+        src = self._require(ref, tenants)
         if src.kind != "image":
             raise VolumeError(400, f"Volume '{src.name}' is a plain directory; only image volumes can be copied")
         owner = next((m for m in self._mounts_where("volume_id = ?", src.id) if m.exclusive), None)
         if owner is None:
-            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src)
+            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src, tenant=src.tenant)
         # A sandbox owns the filesystem: have it flush and hold writes while
         # the copy is taken, so the copy is consistent.
         if self._manager.get_entry(owner.vm_id) is None:
@@ -254,19 +292,19 @@ class Volumes:
                                    f"{owner.vm_id}; resume it to copy the volume")
         self._agent_json(owner.vm_id, "/fs/freeze", {"path": owner.guest_dir})
         try:
-            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src)
+            return self._add(name, kind="image", size_gib=src.size_gib, readonly=readonly, source=src, tenant=src.tenant)
         finally:
             self._agent_json(owner.vm_id, "/fs/thaw", {"path": owner.guest_dir})
 
     def _add(self, name: object, *, kind: str, size_gib: int | None = None,
-             readonly: bool = False, source: Volume | None = None) -> Volume:
+             readonly: bool = False, source: Volume | None = None, tenant: str = "default") -> Volume:
         if not isinstance(name, str) or not _NAME_RE.match(name):
             raise VolumeError(400, "'name' must be 1-63 letters, digits, '.', '_' or '-'")
         vol = Volume(id="vol-" + uuid.uuid4().hex[:12], name=name, created_at=time.time(), kind=kind,
                      size_gib=size_gib, readonly=readonly, source=source.id if source else None,
-                     guest_written=bool(source and source.guest_written))
+                     guest_written=bool(source and source.guest_written), tenant=tenant)
         with self._lock:
-            if self.get(name) is not None:
+            if self.get(name, (tenant,)) is not None:
                 raise VolumeError(409, f"Volume '{name}' already exists")
             try:
                 if kind == "image":
@@ -279,17 +317,17 @@ class Volumes:
                 self._discard(vol)
                 raise VolumeError(500, f"Creating volume '{name}' failed: {e}") from e
             self._conn.execute(
-                f"INSERT INTO volumes ({_VOLUME_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO volumes ({_VOLUME_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (vol.id, vol.name, vol.created_at, vol.kind, vol.size_gib, int(vol.readonly), vol.source,
-                 int(vol.guest_written)),
+                 int(vol.guest_written), vol.tenant),
             )
             self._conn.commit()
         log.info("Created %s volume %s (%s)%s", kind, vol.id, name, f" from {source.id}" if source else "")
         return vol
 
-    def delete(self, ref: str) -> Volume:
+    def delete(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume:
         with self._lock:
-            vol = self._require(ref)
+            vol = self._require(ref, tenants)
             if self._mounts_where("volume_id = ?", vol.id):
                 raise VolumeError(409, f"Volume '{vol.name}' is mounted; unmount it first")
             self._conn.execute("DELETE FROM volumes WHERE id = ?", (vol.id,))
@@ -332,13 +370,16 @@ class Volumes:
         entry = self._manager.get_entry(vm_id)
         if entry is None:
             raise VolumeError(409, f"Sandbox {vm_id} is not running")
+        # Only the sandbox's own tenant's volumes: another tenant's don't exist for it.
+        tenant = (entry.tenant or "default",)
+        self._require(volume, tenant)
         client_ip = (entry.backend_metadata or {}).get("veth_ip", "")
         if not client_ip:
             raise VolumeError(409, "Sandbox has no network path to the host's volume server "
                                    "(sandboxes created with allow_internet_access=False can't mount volumes)")
 
         with self._lock:
-            vol = self._require(volume)
+            vol = self._require(volume, tenant)
             if vol.readonly and not readonly:
                 raise VolumeError(400, f"Volume '{vol.name}' is a read-only snapshot; mount it with readonly=True")
             if self._mounts_where("vm_id = ? AND path = ?", vm_id, path):
