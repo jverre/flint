@@ -707,6 +707,7 @@ def build_template_endpoint(body: dict, request: Request):
     if template_id == DEFAULT_TEMPLATE_ID:
         raise HTTPException(status_code=400, detail="The default template can't be rebuilt this way")
     daemon = _get_daemon()
+    tenant = ""
     if not daemon.cluster:
         principal = principal_of(request)
         pinned = principal.tenants and not principal.is_admin
@@ -725,6 +726,9 @@ def build_template_endpoint(body: dict, request: Request):
     def _run_build():
         try:
             daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+            if not daemon.cluster:
+                # Builds re-create a template's entry if it went meanwhile: keep the owner.
+                claim_template(template_id, name, tenant)
             print(f"Template {template_id} built successfully")
         except Exception as e:
             print(f"Template {template_id} build failed: {e}")
