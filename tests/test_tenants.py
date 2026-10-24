@@ -211,3 +211,96 @@ def test_a_tenant_over_its_quota_is_refused(tenants, require_sandbox):
     finally:
         for vm in vms:
             api.delete(f"{BASE_URL}/vms/{vm}")
+
+
+def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
+    """Phase 1's exit test: every boundary between two tenants, on one host.
+
+    Tenant a has two VMs (one holding a credential), tenant b one. None can
+    reach another, the host or private ranges; the internet works; a's
+    credential is injected on a's egress only, and is never inside a VM nor
+    readable through the API; deleting a's VM wipes it, and only a hears so.
+    """
+    if not backend_health.get("network_policy"):
+        pytest.skip(f"{backend_health['backend_kind']} has no bridge network or credential proxy")
+    from flint.core.config import BRIDGE_IP, PROXY_PORT, VETH_SUBNET
+
+    (ta, tok_a), (tb, tok_b) = tenants["a"], tenants["b"]
+    a, b = DaemonClient(TCP_URL, api_key=tok_a), DaemonClient(TCP_URL, api_key=tok_b)
+    secret = f"secret-{uuid.uuid4().hex}"
+    policy = {"allow": {"postman-echo.com": [{"transform": [{"headers": {"X-Flint-Auth": secret}}]}]}}
+    events_a: list = []
+    events_b: list = []
+    ws_a = ws_connect(TCP_URL, "/events", {"Authorization": f"Bearer {tok_a}"}, open_timeout=5)
+    ws_b = ws_connect(TCP_URL, "/events", {"Authorization": f"Bearer {tok_b}"}, open_timeout=5)
+    for events, ws in ((events_a, ws_a), (events_b, ws_b)):
+        threading.Thread(target=_collect, args=(events, ws), daemon=True).start()
+    vms: list[str] = []
+    try:
+        a1 = a.create(network_policy=policy)["vm_id"]
+        vms.append(a1)
+        a2 = a.create()["vm_id"]
+        vms.append(a2)
+        vm_b = b.create()["vm_id"]
+        vms.append(vm_b)
+
+        def run(client, vm, cmd, timeout=60):
+            r = client.exec_command(vm, cmd, timeout=timeout)
+            return r["exit_code"], r["stdout"] + r["stderr"]
+
+        # Network: on the bridge only a1 itself answers, so neither a's other
+        # VM nor b's can be reached, nor anything of theirs (their proxies included).
+        code, out = run(a, a1, f"for i in $(seq 2 254); do (ping -c1 -W1 {VETH_SUBNET}.$i >/dev/null 2>&1 "
+                               f"&& echo {VETH_SUBNET}.$i) & done; wait")
+        assert len(out.split()) == 1, f"bridge addresses answering a1: {out}"
+        # Raw TCP from a2: a1's ports 80 and 443 go to its credential proxy,
+        # which accepts any connection and only then dials out.
+        for target in (f"{BRIDGE_IP} 22", f"{BRIDGE_IP} {PROXY_PORT}", "169.254.169.254 80",
+                       "192.168.0.1 80", "172.17.0.1 80", "100.64.0.1 80"):
+            code, out = run(a, a2, f"nc -w3 {target} </dev/null")
+            assert code != 0, f"a2 reached {target}: {out}"
+        code, out = run(a, a2, "nc -w5 1.1.1.1 80 </dev/null")
+        assert code == 0, f"a2 can't reach the internet: {out}"
+        # Through a1's proxy, cloud metadata is still out of reach.
+        code, out = run(a, a1, "wget -q -T5 -O - --header 'Metadata: true' "
+                               "'http://169.254.169.254/metadata/instance?api-version=2021-02-01'")
+        assert code != 0, f"a1 got cloud metadata through its proxy: {out}"
+
+        # Credentials: injected on a1's HTTPS, never inside a1, not readable, not b's.
+        code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
+        assert code == 0, out
+        assert json.loads(out)["headers"].get("x-flint-auth") == secret, out
+        # The pattern is put together in the shell, so the probe itself never
+        # brings the whole secret into the VM.
+        half = len(secret) // 2
+        code, out = run(a, a1, f'p1={secret[:half]}; p2={secret[half:]}; env | grep -c "$p1$p2"; '
+                               'find / -xdev -type f -size -20M 2>/dev/null | xargs grep -l "$p1$p2" 2>/dev/null', timeout=120)
+        assert out.split() == ["0"], f"the secret is inside a1 (env match count, then files): {out}"
+        assert secret not in json.dumps(a.get_network_policy(a1))
+        assert secret not in json.dumps(api.get(f"{BASE_URL}/vms").json())
+        code, out = run(b, vm_b, "wget -q -O - https://postman-echo.com/headers", timeout=30)
+        assert code == 0, out
+        assert "x-flint-auth" not in json.loads(out)["headers"], out
+        assert b.get(a1) is None
+
+        # Deleting a1 wipes it, and only a's event stream hears of it.
+        a.kill(vms.pop(0))
+        _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
+        b_mark = b.create()["vm_id"]  # once b hears of its own VM, it would have heard of a1 before
+        vms.append(b_mark)
+        _wait_for(events_b, lambda e: e.get("type") == "vm.created" and e["vm"]["vm_id"] == b_mark, "b's own event")
+        assert not [e for e in events_b if a1 in json.dumps(e)], events_b
+
+        # Quota: a tenant at its limit gets no more VMs; the other tenant still does.
+        held = api.get(f"{BASE_URL}/v1/tenants/{ta}/quota").json()["vms"]
+        api.put(f"{BASE_URL}/v1/tenants/{ta}/quota", json={"max_vms": held}).raise_for_status()
+        with pytest.raises(httpx.HTTPStatusError) as e:
+            a.create()
+        assert e.value.response.status_code == 429, e.value.response.text
+        vms.append(b.create()["vm_id"])
+        assert api.get(f"{BASE_URL}/v1/tenants/{tb}/quota").json()["vms"] == 3
+    finally:
+        ws_a.close()
+        ws_b.close()
+        for vm in vms:
+            api.delete(f"{BASE_URL}/vms/{vm}")

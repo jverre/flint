@@ -39,7 +39,7 @@ from ._netns import (
 )
 from ._netns_pool import acquire_netns
 from ._wipe import wipe_tree
-from ._pool import _claim_pool_entry
+from ._pool import _claim_pool_entry, report_lost
 from .config import (
     CH_CPU_COUNT,
     CH_MEMORY_BYTES,
@@ -205,10 +205,13 @@ def ch_boot(
             elif use_pool and restore:
                 pool_entry_dir = _claim_pool_entry(template_id)
             if pool_entry_dir:
-                link_into(f"{pool_entry_dir}/rootfs.ext4", jail.host_path(JAIL_ROOTFS))
+                try:
+                    link_into(f"{pool_entry_dir}/rootfs.ext4", jail.host_path(JAIL_ROOTFS))
+                except FileNotFoundError:
+                    report_lost(pool_entry_dir, ["rootfs.ext4"])
                 shutil.rmtree(pool_entry_dir, ignore_errors=True)
                 pool_entry_dir = None
-            elif not pool:
+            if not pool and not os.path.exists(jail.host_path(JAIL_ROOTFS)):
                 sparse_copy(rootfs_src, jail.host_path(JAIL_ROOTFS))
             jail.give(JAIL_ROOTFS)
 

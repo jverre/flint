@@ -12,7 +12,7 @@ from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID, JAILER_UID
 from ._netns import _delete_netns
 from ._netns_pool import acquire_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _wait_for_agent
-from ._pool import _claim_pool_entry
+from ._pool import _claim_pool_entry, report_lost
 from ._template_registry import get_template_dir
 from ._jailer import JailSpec, make_private, stage_private_file, stage_shared_file, build_jailer_command, cleanup_jailer
 from ._artifacts import sparse_copy
@@ -106,12 +106,21 @@ def _boot_from_snapshot(
             if use_pool:
                 pool_entry_dir = _claim_pool_entry(template_id)
             if pool_entry_dir:
-                stage_private_file(f"{pool_entry_dir}/rootfs.ext4", "rootfs.ext4", spec)
-                # Pre-synced base for the first diff snapshot on pause.
-                stage_private_file(f"{pool_entry_dir}/{PAUSE_MEM}", PAUSE_MEM, spec)
+                try:
+                    stage_private_file(f"{pool_entry_dir}/rootfs.ext4", "rootfs.ext4", spec)
+                    # Pre-synced base for the first diff snapshot on pause.
+                    stage_private_file(f"{pool_entry_dir}/{PAUSE_MEM}", PAUSE_MEM, spec)
+                except FileNotFoundError as e:
+                    report_lost(pool_entry_dir, [os.path.basename(e.filename or "")])
+                    for name in ("rootfs.ext4", PAUSE_MEM):
+                        if os.path.lexists(f"{spec.chroot_root}/{name}"):
+                            os.unlink(f"{spec.chroot_root}/{name}")
+                    shutil.rmtree(pool_entry_dir, ignore_errors=True)
+                    pool_entry_dir = None
+            if pool_entry_dir:
                 shutil.rmtree(pool_entry_dir, ignore_errors=True)
                 pool_entry_dir = None
-            else:
+            elif not os.path.exists(f"{spec.chroot_root}/rootfs.ext4"):
                 rootfs_dest = f"{spec.chroot_root}/rootfs.ext4"
                 sparse_copy(f"{snapshot_dir}/rootfs.ext4", rootfs_dest)
                 make_private(rootfs_dest)
