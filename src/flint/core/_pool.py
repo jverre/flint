@@ -26,6 +26,7 @@ _pool_stop_event = threading.Event()
 _pool_threads: list[threading.Thread] = []
 _pool_dir: str = config.POOL_DIR
 _pool_sources: PoolSources | None = None
+_pool_dir_ino: int = 0  # the pool dir's inode at start, to tell whether it was replaced
 
 
 TEMPLATE_POOL_SIZE = 2  # pool size for non-default templates
@@ -115,8 +116,34 @@ def _claim_pool_entry(template_id: str) -> str | None:
     if not match:
         log.debug("pool: miss for %s (ready=%d, copying=%d)", template_id, remaining, copying_count)
         return None
+    missing = [n for n in (sources or {}) if not os.path.exists(f"{match['dir_path']}/{n}")]
+    if missing:
+        report_lost(match["dir_path"], missing)
+        shutil.rmtree(match["dir_path"], ignore_errors=True)
+        return None
     log.debug("pool: claimed %s (%d remaining)", match["id"][:8], remaining)
     return match["dir_path"]
+
+
+def report_lost(entry_dir: str, missing: list[str]) -> None:
+    """A pool entry lost files it had. Callers fall back to copying from the
+    template; this logs what the pool directory looks like, to find out why."""
+    try:
+        st = os.stat(_pool_dir)
+        where = f"pool dir {'replaced' if st.st_ino != _pool_dir_ino else 'same'} (inode {_pool_dir_ino} -> {st.st_ino}), " \
+                f"{len(os.listdir(_pool_dir))} entries on disk"
+    except OSError as e:
+        where = f"pool dir unreadable: {e}"
+    with _pool_lock:
+        tracked = len(_pool_entries)
+    try:
+        with open("/proc/self/mountinfo") as f:
+            parent = os.path.dirname(_pool_dir)
+            mounts = [line.split()[4] for line in f if line.split()[4].startswith(parent)]
+    except OSError:
+        mounts = []
+    log.error("pool: entry %s lost %s; %s, %d tracked; mounts under %s: %s",
+              os.path.basename(entry_dir)[:8], missing, where, tracked, os.path.dirname(_pool_dir), mounts or "none")
 
 
 def start_pool(pool_dir: str, sources: PoolSources) -> None:
@@ -132,6 +159,8 @@ def start_pool(pool_dir: str, sources: PoolSources) -> None:
     # Entries from a previous daemon aren't tracked; start clean.
     shutil.rmtree(_pool_dir, ignore_errors=True)
     os.makedirs(_pool_dir, exist_ok=True)
+    global _pool_dir_ino
+    _pool_dir_ino = os.stat(_pool_dir).st_ino
     _pool_threads = []
     for i in range(config.POOL_WORKERS):
         t = threading.Thread(target=_pool_refill_loop, daemon=True, name=f"rootfs-pool-{i}")
