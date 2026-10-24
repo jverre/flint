@@ -33,8 +33,10 @@ from flint.core._metrics import MetricsSampler
 from flint.core import _logs
 from flint.daemon import events as _events
 from flint.daemon.auth import AuthError, AuthMiddleware, Principal, TokenStore, principal_of
+from flint.daemon import sso as _sso
 
 app = FastAPI()
+app.include_router(_sso.router)
 
 
 def _vm_tenant(vm_id: str) -> str | None:
@@ -1142,6 +1144,7 @@ class FlintDaemon:
         self._init_storage()
         self._start_pool()
         self._init_state_store()
+        self._init_sso()
         self._init_manager()
         self._recover_sandboxes()
         self.volumes.replay()
@@ -1194,6 +1197,25 @@ class FlintDaemon:
     def _start_pool(self) -> None:
         self.backend.start_pool()
         print("Backend pool started.")
+
+    def _init_sso(self) -> None:
+        """Sign-in with identity providers, if ``sso.json`` configures any."""
+        from flint.core import config as _cfg
+        if _cfg.CLUSTER_MODE:
+            return  # the control plane signs people in
+        try:
+            sso = _sso.load()
+        except ValueError as e:
+            raise SystemExit(f"SSO config: {e}")
+        if sso is None:
+            return
+        from starlette.middleware.sessions import SessionMiddleware
+        from flint.core._secrets import derived_key
+        app.add_middleware(SessionMiddleware, secret_key=derived_key("sso-login"), session_cookie=_sso.LOGIN_COOKIE,
+                           max_age=600, same_site="lax", https_only=sso.secure_cookies)
+        app.state.sso = sso
+        for p in sso.config.providers.values():
+            print(f"SSO: {p.label} ({p.id}); its redirect URI is {sso.redirect_uri(p.id)}")
 
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore

@@ -1,8 +1,8 @@
 // App frame: full-height sidebar, centred search, page outlet.
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { recentVMs, useHosts, useIsAdmin, usePlatform, useTemplates, useVms } from "../api/hooks";
-import { getToken, setToken } from "../api/client";
+import { recentVMs, useHosts, useIsAdmin, usePlatform, useSession, useTemplates, useVms } from "../api/hooks";
+import { api, getToken, setToken } from "../api/client";
 import { cubeSVG, token } from "../kit/svg";
 import { dispatchPageKey, isTyping, keyName, type KeyHint } from "../kit/keys";
 import { stateLabel } from "../kit/format";
@@ -92,8 +92,9 @@ function Sidebar() {
   const title = cluster ? "Cluster" : "This host";
   const sub = cluster ? `${plat?.health.hosts_ready ?? 0}/${plat?.health.hosts ?? 0} hosts ready` : (plat?.health.backend_kind ?? "daemon");
   const [menu, setMenu] = useState(false);
-  // The card is only there for its menu's actions: leave demo data, or sign out of a cluster.
-  const hasMenu = !!plat?.mock || !!getToken();
+  // The card is only there for its menu's actions: leave demo data, or sign out.
+  const session = useSession().data;
+  const hasMenu = !!plat?.mock || !!getToken() || !!session;
   const theme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
   return (
     <nav className="rail" aria-label="Main">
@@ -152,6 +153,7 @@ const tenantVarCss = (t: string) => { let h = 0; for (const ch of t) h = (h * 31
 
 function ConnMenu({ onClose }: { onClose: () => void }) {
   const plat = usePlatform().data;
+  const session = useSession().data;
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const out = (e: MouseEvent) => { if (!(e.target as Element).closest("#connmenu,#wsbtn")) onClose(); };
@@ -165,7 +167,9 @@ function ConnMenu({ onClose }: { onClose: () => void }) {
       <div className="mi" style={{ cursor: "default" }}><span className="grow"><b>{location.host}</b><small>{plat?.mode === "cluster" ? `control plane · ${plat.health.replica ?? ""}${plat.health.leader ? " · leader" : ""}` : `daemon · ${plat?.health.backend_kind ?? ""}`}</small></span></div>
       <div className="msep" />
       {plat?.mock && <button className="mi" role="menuitem" onClick={() => { sessionStorage.removeItem("flint.mock"); location.href = location.pathname + "?live"; }}><Icon k="out" /><span className="grow">Leave demo data</span></button>}
-      {getToken() && <button className="mi" role="menuitem" onClick={() => { setToken(""); location.reload(); }}><Icon k="out" /><span className="grow">Sign out<small>forget the API token in this browser</small></span></button>}
+      {session && <div className="mi" style={{ cursor: "default" }}><span className="grow">{session.identity.replace(/^[^:]*:/, "")}<small>{session.kind}{session.tenants.length ? ` · ${session.tenants.join(", ")}` : ""}</small></span></div>}
+      {session && <button className="mi" role="menuitem" onClick={async () => { await api.post("/auth/logout").catch(() => undefined); location.reload(); }}><Icon k="out" /><span className="grow">Sign out</span></button>}
+      {!session && getToken() && <button className="mi" role="menuitem" onClick={() => { setToken(""); location.reload(); }}><Icon k="out" /><span className="grow">Sign out<small>forget the API token in this browser</small></span></button>}
     </div>
   );
 }

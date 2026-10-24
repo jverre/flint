@@ -61,6 +61,11 @@ def _cipher() -> Fernet:
         return _fernet
 
 
+def derived_key(label: str) -> str:
+    """A key for another purpose (e.g. signing cookies), derived from the secret key."""
+    return hashlib.sha256(_load_key() + b"\0" + label.encode()).hexdigest()
+
+
 def seal(text: str) -> str:
     return _PREFIX + _cipher().encrypt(text.encode()).decode()
 

@@ -19,6 +19,7 @@ The `flint` CLI groups commands under daemon control, backend selection, and age
 | Command | Description |
 |---------|-------------|
 | `flint ui` | Open the web UI signed in with the daemon's admin token (`--no-open` prints the link) |
+| `flint login` / `flint logout` | Sign in to the server at `FLINT_URL` with its identity provider ([SSO](/sso)) |
 | `flint token create` | Create an API token for TCP clients (`--kind service\|admin`, `--tenant`, `--name`); printed once |
 | `flint token list` | List tokens, never their secrets |
 | `flint token revoke <id>` | Revoke a token |

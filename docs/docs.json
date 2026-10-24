@@ -39,7 +39,8 @@
             "pages": [
               "introduction",
               "quickstart",
-              "web-ui"
+              "web-ui",
+              "sso"
             ]
           }
         ]

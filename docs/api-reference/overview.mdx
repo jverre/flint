@@ -29,6 +29,8 @@ To point the SDK and CLI at TCP, set `FLINT_URL=http://127.0.0.1:9100` and `FLIN
 
 Every VM, volume and template build belongs to a **tenant**: an isolation group, such as one of your customers. Pass `tenant` when you create one; without it, it goes to the `default` tenant.
 
+People can also sign in with your identity provider instead of a token: see [Sign-in with SSO](/sso).
+
 There are two kinds of tokens:
 
 - `admin`: everything, including `/config` and tokens.
