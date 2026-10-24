@@ -373,6 +373,7 @@ async def callback(pid: str, request: Request):
     rule = match(sso.config.rules, who)
     if rule is None:
         log.warning("SSO %s: %s has no access (no rule matches)", pid, who.name)
+        _audit_sign_in(request, "anonymous", who.name, pid, 403)
         shown = who.email or who.login or who.subject
         return _page("No access", f"{shown} isn't allowed to use this Flint. Ask its admin to add a rule for you.", 403)
     ttl = sso.config.session_hours * 3600
@@ -380,6 +381,7 @@ async def callback(pid: str, request: Request):
         rule.kind, f"sign-in {who.name}", rule.tenants, ttl=ttl, identity=who.name)
     log.info("SSO %s: %s signed in as %s%s", pid, who.name, rule.kind,
              f" for {', '.join(rule.tenants)}" if rule.tenants else "")
+    _audit_sign_in(request, f"token:{record['id']}", who.name, pid, 302)
     if pending.get("cli_port"):
         info = {"kind": rule.kind, "tenants": rule.tenants, "identity": who.name, "expires_at": record["expires_at"]}
         code = sso.hold_for_cli(api_token, pending["cli_challenge"], info)
@@ -388,6 +390,14 @@ async def callback(pid: str, request: Request):
     resp.set_cookie(SESSION_COOKIE, api_token, max_age=int(ttl), httponly=True, samesite="lax",
                     secure=sso.secure_cookies, path="/")
     return resp
+
+
+def _audit_sign_in(request: Request, actor: str, who: str, pid: str, status: int) -> None:
+    """Sign-ins go in the audit log: who got (or was refused) a session."""
+    eventlog = getattr(getattr(request.app.state, "daemon", None), "eventlog", None)
+    if eventlog is not None:
+        eventlog.audit(actor=actor, actor_name=who, method="GET", path=f"/auth/callback/{pid}", status=status,
+                       request_id=request.scope.get("state", {}).get("request_id", ""))
 
 
 class _GitHubAPI:

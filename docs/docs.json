@@ -92,6 +92,7 @@
               "api-reference/files",
               "api-reference/templates",
               "api-reference/volumes",
+              "api-reference/events",
               "api-reference/cluster",
               "api-reference/terminal"
             ]

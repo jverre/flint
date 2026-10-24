@@ -375,8 +375,15 @@ func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Hos
 		if f, ok := e["ts"].(float64); ok {
 			ts = int64(f * 1000)
 		}
-		s.db.Exec(ctx, `INSERT INTO events (ts, type, tenant, vm_id, host_id, payload) VALUES (?, ?, ?, ?, ?, ?)`,
-			ts, typ, tenant, vmID, h.ID, mustJSON(e))
+		// The host knows who caused it when the gateway told it (X-Flint-Actor).
+		actor, _ := e["actor"].(string)
+		name, _ := e["actor_name"].(string)
+		if actor == "" || actor == "control-plane" || actor == "system" {
+			actor, name = "host:"+h.ID, ""
+			e["actor"] = actor
+			delete(e, "actor_name")
+		}
+		s.insertEvent(ctx, ts, typ, tenant, vmID, h.ID, actor, name, e)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

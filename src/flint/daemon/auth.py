@@ -68,6 +68,7 @@ class Principal:
     tenants: tuple[str, ...] = field(default_factory=tuple)  # empty: any tenant
     token_id: str = ""  # "" for the socket and the cluster's control plane
     identity: str = ""  # "provider:email" for an SSO session
+    name: str = ""  # the token's name
 
     @property
     def is_admin(self) -> bool:
@@ -173,13 +174,13 @@ class TokenStore:
         token_id, secret = parsed
         with self._lock:
             row = self._conn.execute(
-                "SELECT kind, secret_hash, tenants, expires_at, identity FROM api_tokens WHERE id = ?", (token_id,)
+                "SELECT kind, secret_hash, tenants, expires_at, identity, name FROM api_tokens WHERE id = ?", (token_id,)
             ).fetchone()
         if not row or not hmac.compare_digest(row[1], _hash(secret)):
             return None
         if row[3] is not None and row[3] < time.time():
             return None
-        return Principal(row[0], tuple(json.loads(row[2])), token_id, row[4])
+        return Principal(row[0], tuple(json.loads(row[2])), token_id, row[4], row[5])
 
     def ensure_admin_token_file(self, path: str = ADMIN_TOKEN_PATH) -> None:
         """Keep a working admin token in ``path`` (0600) for TCP clients like the web UI."""
@@ -203,7 +204,7 @@ class TokenStore:
 # Reachable without a token: liveness, the web UI's static files, and SSO
 # sign-in (the UI then signs in with SSO or a token).
 _PUBLIC = re.compile(r"^/(health|ui(/.*)?|auth(/.*)?)?$")
-_ADMIN_ONLY = re.compile(r"^/(config|v1/tokens)(/.*)?$")
+_ADMIN_ONLY = re.compile(r"^/(config|v1/tokens|v1/audit)(/.*)?$")
 _VM_PATH = re.compile(r"^/vms/([^/]+)(/.*)?$")
 
 
@@ -263,22 +264,75 @@ class AuthMiddleware:
     a VM of a tenant the caller can't act for answers 404, as if it didn't exist.
     """
 
-    def __init__(self, app, *, tokens, cluster_mode, vm_tenant) -> None:
+    def __init__(self, app, *, tokens, cluster_mode, vm_tenant, eventlog=lambda: None) -> None:
         self.app = app
         self._tokens = tokens  # callable -> TokenStore | None
         self._cluster_mode = cluster_mode  # callable -> bool
         self._vm_tenant = vm_tenant
+        self._eventlog = eventlog  # callable -> EventLog | None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
+        import uuid
+        from flint.daemon.eventlog import actor
         path = scope.get("path", "")
+        request_id = uuid.uuid4().hex[:16]
         try:
             principal = self._authenticate(scope, path)
         except AuthError as e:
             return await self._refuse(scope, receive, send, e)
         scope.setdefault("state", {})["principal"] = principal
-        return await self.app(scope, receive, send)
+        scope["state"]["request_id"] = request_id
+        who = self._actor(scope, principal)
+        token = actor.set(who)
+        status = [0]
+
+        async def send_and_note(message):
+            if message["type"] == "http.response.start":
+                status[0] = message["status"]
+                message = {**message, "headers": [*message.get("headers", []), (b"x-request-id", request_id.encode())]}
+            elif message["type"] == "websocket.accept":
+                status[0] = 101
+            elif message["type"] == "websocket.close" and not status[0]:
+                status[0] = 403
+            await send(message)
+
+        try:
+            return await self.app(scope, receive, send_and_note)
+        finally:
+            actor.reset(token)
+            if principal is not None and self._audited(scope, path):
+                self._audit(who, scope, path, status[0] or 500, request_id)
+
+    def _actor(self, scope, principal: Principal | None) -> tuple[str, str]:
+        if principal is None:
+            return ("anonymous", "")
+        if self._cluster_mode():
+            # The control plane says who it acts for (it's the only caller, over mTLS).
+            return (_header(scope, b"x-flint-actor") or "control-plane", _header(scope, b"x-flint-actor-name"))
+        if principal.token_id:
+            return (f"token:{principal.token_id}", principal.identity or principal.name)
+        return ("socket", "")
+
+    def _audited(self, scope, path: str) -> bool:
+        if self._cluster_mode():
+            return False  # the control plane keeps the cluster's audit log
+        if scope["type"] == "websocket":
+            return path.endswith("/terminal")
+        return scope.get("method") not in ("GET", "HEAD", "OPTIONS")
+
+    def _audit(self, who: tuple[str, str], scope, path: str, status: int, request_id: str) -> None:
+        log_ = self._eventlog()
+        if log_ is None:
+            return
+        m = _VM_PATH.match(path)
+        tenant = (self._vm_tenant(m.group(1)) or "") if m else ""
+        try:
+            log_.audit(actor=who[0], actor_name=who[1], method=scope.get("method") or "WS", path=path,
+                       status=status, tenant=tenant, request_id=request_id)
+        except Exception:
+            log.exception("audit: recording %s %s failed", scope.get("method"), path)
 
     def _authenticate(self, scope, path: str) -> Principal | None:
         if _PUBLIC.match(path):
