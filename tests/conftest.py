@@ -68,6 +68,35 @@ def _read_daemon_log() -> str:
         return "(no daemon log available)"
 
 
+# A real OpenID provider for the SSO tests (test_sso.py), started before the
+# daemon so its sso.json can point at it. None when it couldn't start.
+MOCK_IDP: str | None = None
+_mock_idp_server = None
+
+
+def _start_mock_identity_provider() -> None:
+    global MOCK_IDP, _mock_idp_server
+    try:
+        from oidc_provider_mock import run_server_in_thread
+    except ImportError:
+        return
+    _mock_idp_server = run_server_in_thread()
+    MOCK_IDP = f"http://localhost:{_mock_idp_server.__enter__().server_port}"
+    import json
+    os.makedirs(TEST_STATE_DIR, exist_ok=True)
+    with open(os.path.join(TEST_STATE_DIR, "sso.json"), "w") as f:
+        json.dump({
+            "public_url": TCP_URL,
+            "session_hours": 1,
+            "providers": [{"id": "mock", "type": "oidc", "label": "Mock", "issuer": MOCK_IDP,
+                           "client_id": "flint-tests", "client_secret": "not-secret"}],
+            "rules": [
+                {"email": "admin@flint.test", "kind": "admin"},
+                {"group": "acme-support", "kind": "service", "tenants": ["acme"]},
+            ],
+        }, f)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_daemon(request):
     global _daemon_process
@@ -79,6 +108,7 @@ def _ensure_daemon(request):
         yield
         return
 
+    _start_mock_identity_provider()
     env = os.environ.copy()
     print(f"Starting daemon: uv run flint start (port={env.get('FLINT_PORT')})")
     # Write daemon output to a file instead of a pipe to avoid pipe buffer
@@ -120,6 +150,8 @@ def _ensure_daemon(request):
 
     yield
 
+    if _mock_idp_server is not None:
+        _mock_idp_server.__exit__(None, None, None)
     _daemon_process.terminate()
     try:
         _daemon_process.wait(timeout=10)

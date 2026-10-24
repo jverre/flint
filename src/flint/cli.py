@@ -241,6 +241,104 @@ def quota_set(tenant, **limits):
 
 
 @cli.command()
+@click.option("--provider", default=None, help="Identity provider ID (default: the only one)")
+@click.option("--open/--no-open", "open_browser", default=True, help="Open the sign-in page in a browser")
+def login(provider, open_browser):
+    """Sign in to the Flint at FLINT_URL with its identity provider (SSO)."""
+    import http.server
+    import json as _json
+    import secrets
+    import threading
+    import webbrowser
+    import httpx
+    from urllib.parse import parse_qs, urlencode, urlsplit
+    from flint.core.config import CREDENTIALS_PATH, DAEMON_URL
+    from flint.daemon.sso import pkce_challenge
+    if DAEMON_URL.startswith("unix://"):
+        raise click.ClickException("the daemon's socket needs no sign-in; set FLINT_URL to sign in to a server over HTTP")
+    providers = httpx.get(f"{DAEMON_URL}/auth/providers", timeout=10).json().get("providers", [])
+    if not providers:
+        raise click.ClickException(f"{DAEMON_URL} has no identity provider set up; use an API token (FLINT_API_KEY)")
+    ids = [p["id"] for p in providers]
+    if provider is None:
+        if len(ids) > 1:
+            raise click.ClickException(f"choose a provider with --provider: {', '.join(ids)}")
+        provider = ids[0]
+    elif provider not in ids:
+        raise click.ClickException(f"no provider {provider!r}; there are: {', '.join(ids)}")
+
+    verifier = secrets.token_urlsafe(48)
+    got: dict = {}
+    done = threading.Event()
+
+    class _Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlsplit(self.path).query)
+            if urlsplit(self.path).path == "/callback" and q.get("code"):
+                got["code"] = q["code"][0]
+                done.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><title>Flint</title><p>Signed in. You can close this tab.</p>")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Callback)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    query = urlencode({"cli_port": server.server_port, "cli_challenge": pkce_challenge(verifier)})
+    url = f"{DAEMON_URL}/auth/login/{provider}?{query}"
+    click.echo(f"Sign in at: {url}")
+    if open_browser:
+        webbrowser.open(url)
+    if not done.wait(300):
+        server.shutdown()
+        raise click.ClickException("no sign-in within 5 minutes")
+    server.shutdown()
+    resp = httpx.post(f"{DAEMON_URL}/auth/cli/exchange", json={"code": got["code"], "verifier": verifier}, timeout=10)
+    if resp.status_code != 200:
+        raise click.ClickException(f"sign-in failed: {resp.text}")
+    session = resp.json()
+    try:
+        with open(CREDENTIALS_PATH) as f:
+            creds = _json.load(f)
+    except (OSError, ValueError):
+        creds = {}
+    creds[DAEMON_URL] = {"token": session["token"], "expires_at": session.get("expires_at"), "identity": session.get("identity")}
+    os.makedirs(os.path.dirname(CREDENTIALS_PATH), mode=0o700, exist_ok=True)
+    fd = os.open(CREDENTIALS_PATH + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        _json.dump(creds, f)
+    os.replace(CREDENTIALS_PATH + ".tmp", CREDENTIALS_PATH)
+    scope = f" for {', '.join(session['tenants'])}" if session.get("tenants") else ""
+    click.echo(f"Signed in to {DAEMON_URL} as {session.get('identity')} ({session.get('kind')}{scope})")
+
+
+@cli.command()
+def logout():
+    """End the sign-in session `flint login` started for FLINT_URL."""
+    import json as _json
+    import httpx
+    from flint.core.config import CREDENTIALS_PATH, DAEMON_URL, stored_token
+    tok = stored_token(DAEMON_URL)
+    if tok:
+        try:
+            httpx.post(f"{DAEMON_URL}/auth/logout", headers={"Authorization": f"Bearer {tok}"}, timeout=10)
+        except httpx.HTTPError:
+            pass
+    try:
+        with open(CREDENTIALS_PATH) as f:
+            creds = _json.load(f)
+        creds.pop(DAEMON_URL, None)
+        with open(CREDENTIALS_PATH, "w") as f:
+            _json.dump(creds, f)
+    except (OSError, ValueError):
+        pass
+    click.echo(f"Signed out of {DAEMON_URL}")
+
+
+@cli.command()
 @click.option("--open/--no-open", "open_browser", default=True, help="Open the URL in a browser")
 def ui(open_browser):
     """Sign in to the local daemon's web UI with its admin token."""

@@ -59,6 +59,9 @@ function Splash({ text, retry }: { text: string; retry?: boolean }) {
 function Login() {
   const qc = useQueryClient();
   const [tok, setTok] = useState(""), [busy, setBusy] = useState(false), [err, setErr] = useState("");
+  const [providers, setProviders] = useState<{ id: string; label: string }[]>([]);
+  useEffect(() => { fetch("/auth/providers").then((r) => (r.ok ? r.json() : { providers: [] })).then((j) => setProviders(j.providers ?? []), () => undefined); }, []);
+  const next = encodeURIComponent(location.pathname + location.search);
   return (
     <div className="splash">
       <form className="login" onSubmit={async (e) => {
@@ -69,10 +72,12 @@ function Login() {
       }}>
         <Cube s={32} />
         <h1>Sign in to Flint</h1>
-        <p className="mut">Flint needs an API token. On the daemon's host, <code>flint ui</code> signs you in; <code>flint token create</code> makes more.</p>
-        <input type="password" autoFocus placeholder="flint_…" value={tok} onChange={(e) => setTok(e.target.value)} aria-label="API token" />
+        {providers.map((p) => <a key={p.id} className="btn fill" onClick={() => setToken("")} href={`/auth/login/${encodeURIComponent(p.id)}?next=${next}`}>Continue with {p.label}</a>)}
+        {providers.length > 0 && <p className="dim">or use an API token</p>}
+        {providers.length === 0 && <p className="mut">Flint needs an API token. On the daemon's host, <code>flint ui</code> signs you in; <code>flint token create</code> makes more.</p>}
+        <input type="password" autoFocus={!providers.length} placeholder="flint_…" value={tok} onChange={(e) => setTok(e.target.value)} aria-label="API token" />
         {err && <p className="errc">{err}</p>}
-        <button className="btn fill" disabled={!tok.trim() || busy}>Sign in</button>
+        <button className={providers.length ? "btn" : "btn fill"} disabled={!tok.trim() || busy}>Sign in with token</button>
         <p className="dim">The token is kept in this browser only.</p>
       </form>
     </div>

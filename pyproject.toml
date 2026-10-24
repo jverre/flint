@@ -20,6 +20,8 @@ dependencies = [
     "websockets>=14.0",
     "mitmproxy>=10.0",
     "cryptography>=42",
+    "authlib>=1.6",
+    "itsdangerous>=2.2",
     "pyobjc-core>=11.1; platform_system == 'Darwin'",
     "pyobjc-framework-Cocoa>=11.1; platform_system == 'Darwin'",
     "pyobjc-framework-Virtualization>=11.1; platform_system == 'Darwin'",
@@ -56,4 +58,5 @@ markers = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "oidc-provider-mock>=0.4",
 ]
