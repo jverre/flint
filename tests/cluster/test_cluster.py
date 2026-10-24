@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -266,15 +267,25 @@ def test_move_interrupted_by_a_replica_crash_is_finished_by_the_leader(cluster, 
     vm.commands.run("echo kept > /root/m; true")
     health = lambda i: httpx.get(f"http://127.0.0.1:{cluster.port + 10 + i}/health", timeout=5).json()
     victim = next(i for i in range(len(cluster.servers)) if not health(i)["leader"])
-    # Freeze the target so the restore hangs and the move is caught half-way.
-    hosts["b"].freeze()
+
+    def migrate():
+        with replica_api(cluster, victim) as api:
+            return api.post(f"/vms/{vm.id}/migrate", timeout=30)
+
     try:
-        threading.Thread(target=lambda: replica_api(cluster, victim).post(f"/vms/{vm.id}/migrate"), daemon=True).start()
-        wait_for(lambda: state(vm).get("cluster_state") == "migrating", 15, "the move to start")
-        cluster.servers[victim].kill()
-    finally:
-        hosts["b"].thaw()
-    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Freeze the target so the restore hangs and the move is caught half-way.
+            hosts["b"].freeze()
+            try:
+                request = executor.submit(migrate)
+                wait_for(lambda: state(vm).get("cluster_state") == "migrating", 15, "the move to start")
+                cluster.servers[victim].kill()
+            finally:
+                hosts["b"].thaw()
+            # Killing the serving replica closes the pending HTTP request (EOF or reset).
+            # Observe its exception here so unexpected worker failures fail the test.
+            with pytest.raises((httpx.RemoteProtocolError, httpx.ReadError)):
+                request.result(timeout=10)
         recovered = lambda: [e for e in cluster.api.get("/v1/events", params={"since": 0, "type": "operation.recovered"}).json()["events"]
                              if e.get("vm_id") == vm.id]
         wait_for(lambda: recovered(), 40, "the leader to take over the interrupted move")
