@@ -20,6 +20,14 @@ export function usePlatform() {
     },
   });
 }
+export interface Session { identity: string; kind: "admin" | "service"; tenants: string[] }
+/** The SSO session this browser is signed in with, if any (null with an API token or none). */
+export function useSession() {
+  return useQuery<Session | null>({
+    queryKey: ["session"], staleTime: 60_000, retry: false,
+    queryFn: async () => { try { const s = await api.get<Session>("/auth/me"); return s.identity ? s : null; } catch { return null; } },
+  });
+}
 export const useIsCluster = () => usePlatform().data?.mode === "cluster";
 export const useIsAdmin = () => { const p = usePlatform().data; return p?.access === "admin"; };
 
