@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   go-r2nfs:
@@ -107,9 +106,6 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     needs: [go-r2nfs, go-flintd]
-    permissions:
-      contents: read
-      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -219,67 +215,9 @@ jobs:
           done
           echo "=== Kernel log: NBD, block and ext4 ==="
           sudo dmesg -T | grep -iE "nbd|I/O error|EXT4|blk_update" | tail -120 || true
-          # Errors anywhere in the daemon log: the PR comment only has its tail.
+          # Include errors from anywhere in the daemon log.
           echo "=== Daemon errors ==="
           sudo grep -n -A25 -E "Traceback|failed:|ERROR" /tmp/flint-test-daemon.log /tmp/flint-test-state/flint-debug.log 2>/dev/null | tail -400 || true
-      - name: Post diagnostics comment on failure
-        if: failure() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          {
-            echo "### CI failure: \`e2e (${FLINT_BACKEND}, ${{ matrix.suite }})\`"
-            echo
-            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo
-            echo "#### Step markers"
-            echo '```'
-            cat /tmp/step-markers 2>/dev/null || echo '(no step markers)'
-            echo '```'
-            echo
-            echo "#### Filesystem state"
-            echo '```'
-            echo '--- /usr/local/bin ---'
-            ls -la /usr/local/bin 2>/dev/null | grep -E 'firecracker|jailer|cloud-hypervisor' || echo '(no relevant binaries)'
-            echo
-            echo '--- /root/firecracker-vm ---'
-            sudo ls -la /root/firecracker-vm 2>/dev/null || echo '(missing)'
-            echo
-            echo '--- /tmp (relevant) ---'
-            ls -la /tmp 2>/dev/null | grep -E 'alpine|build-rootfs|probe|pytest|step-markers|flint' || echo '(no relevant tmp files)'
-            echo '```'
-            echo
-            echo "#### Alpine download log"
-            echo '```'
-            tail -c 2000 /tmp/alpine-download.log 2>/dev/null || echo '(no alpine log)'
-            echo '```'
-            echo
-            echo "#### setup-rootfs.sh log (last 4000 chars)"
-            echo '```'
-            tail -c 4000 /tmp/build-rootfs.log 2>/dev/null || echo '(no build-rootfs log)'
-            echo '```'
-            echo
-            echo "#### Probe log"
-            echo '```'
-            tail -c 4000 /tmp/probe.log 2>/dev/null || echo '(no probe log)'
-            echo '```'
-            echo
-            echo "#### Pytest tail (last 8000 chars)"
-            echo '```'
-            tail -c 8000 /tmp/pytest.log 2>/dev/null || echo '(no pytest log)'
-            echo '```'
-            echo
-            echo "#### Daemon errors (first 6000 chars)"
-            echo '```'
-            sudo grep -h -A25 -E "Traceback|failed:|ERROR" /tmp/flint-test-daemon.log /tmp/flint-test-state/flint-debug.log 2>/dev/null | head -c 6000 || echo '(none)'
-            echo '```'
-            echo
-            echo "#### Daemon log tail (last 6000 chars)"
-            echo '```'
-            sudo tail -c 6000 /tmp/flint-test-daemon.log 2>/dev/null || echo '(no daemon log)'
-            echo '```'
-          } > /tmp/comment.md
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md --repo "${GITHUB_REPOSITORY}"
 
   agent-e2e:
     runs-on: ubuntu-latest
@@ -359,39 +297,6 @@ jobs:
           tail -100 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log found"
           echo "=== Disk space ==="
           df -h /
-      - name: Post diagnostics as PR comment
-        if: failure() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          {
-            echo "## Agent E2E Diagnostics (auto-posted)"
-            echo ""
-            echo "<details><summary>Daemon log (last 150 lines)</summary>"
-            echo ""
-            echo '```'
-            tail -150 /tmp/flint-test-daemon.log 2>/dev/null || echo "No daemon log"
-            echo '```'
-            echo ""
-            echo "</details>"
-            echo ""
-            echo "<details><summary>Debug log (last 80 lines)</summary>"
-            echo ""
-            echo '```'
-            tail -80 /tmp/flint-test-state/flint-debug.log 2>/dev/null || echo "No debug log"
-            echo '```'
-            echo ""
-            echo "</details>"
-            echo ""
-            echo "<details><summary>Pytest output (last 150 lines)</summary>"
-            echo ""
-            echo '```'
-            tail -150 /tmp/pytest-agent-output.log 2>/dev/null || echo "No pytest output"
-            echo '```'
-            echo ""
-            echo "</details>"
-          } > /tmp/pr-comment-body.md
-          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} -F /tmp/pr-comment-body.md
 
   maintenance-prerequisites:
     runs-on: ubuntu-latest
