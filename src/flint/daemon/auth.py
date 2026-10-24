@@ -8,6 +8,9 @@
   builder's backend: VMs, volumes and templates, but not daemon config or
   tokens. A service token pinned to tenants sees only their resources;
   others' look like they don't exist.
+- A browser that signed in with SSO (``sso.py``) sends its token in the
+  ``flint_session`` cookie instead. Such a request must come from the
+  daemon's own origin when it changes something, or opens a WebSocket.
 - In a cluster, the daemon is a host agent behind mTLS: the control plane
   is the only caller and enforces tenancy itself.
 
@@ -43,9 +46,13 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     secret_hash TEXT NOT NULL,
     tenants     TEXT NOT NULL DEFAULT '[]',
     name        TEXT NOT NULL DEFAULT '',
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    expires_at  REAL,                       -- NULL: until revoked
+    identity    TEXT NOT NULL DEFAULT ''    -- who signed in, for SSO sessions
 );
 """
+
+SESSION_COOKIE = "flint_session"
 
 
 class AuthError(Exception):
@@ -60,6 +67,7 @@ class Principal:
     kind: str
     tenants: tuple[str, ...] = field(default_factory=tuple)  # empty: any tenant
     token_id: str = ""  # "" for the socket and the cluster's control plane
+    identity: str = ""  # "provider:email" for an SSO session
 
     @property
     def is_admin(self) -> bool:
@@ -110,10 +118,16 @@ class TokenStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(api_tokens)")}
+        for col, decl in (("expires_at", "REAL"), ("identity", "TEXT NOT NULL DEFAULT ''")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE api_tokens ADD COLUMN {col} {decl}")
         self._conn.commit()
 
-    def create(self, kind: str, name: str = "", tenants: list[str] | None = None) -> tuple[dict, str]:
-        """Returns the token's record and its string form, which is shown once."""
+    def create(self, kind: str, name: str = "", tenants: list[str] | None = None, *,
+               ttl: float | None = None, identity: str = "") -> tuple[dict, str]:
+        """Returns the token's record and its string form, which is shown once.
+        ``ttl`` (seconds) makes it expire, like an SSO session."""
         if kind not in (ADMIN, SERVICE):
             raise AuthError(400, "'kind' must be 'admin' or 'service'")
         tenants = list(tenants or [])
@@ -124,11 +138,15 @@ class TokenStore:
                 raise AuthError(400, f"Invalid tenant {t!r}")
         token_id = secrets.token_hex(6)
         secret = secrets.token_urlsafe(24).replace("_", "x")
-        record = {"id": token_id, "kind": kind, "tenants": tenants, "name": name or "", "created_at": time.time()}
+        now = time.time()
+        record = {"id": token_id, "kind": kind, "tenants": tenants, "name": name or "", "created_at": now,
+                  "expires_at": now + ttl if ttl else None, "identity": identity}
         with self._lock:
+            self._conn.execute("DELETE FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
             self._conn.execute(
-                "INSERT INTO api_tokens (id, kind, secret_hash, tenants, name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (token_id, kind, _hash(secret), json.dumps(tenants), record["name"], record["created_at"]),
+                "INSERT INTO api_tokens (id, kind, secret_hash, tenants, name, created_at, expires_at, identity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (token_id, kind, _hash(secret), json.dumps(tenants), record["name"], now, record["expires_at"], identity),
             )
             self._conn.commit()
         return record, _format(token_id, secret)
@@ -136,9 +154,11 @@ class TokenStore:
     def list(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, kind, tenants, name, created_at FROM api_tokens ORDER BY created_at"
+                "SELECT id, kind, tenants, name, created_at, expires_at, identity FROM api_tokens "
+                "WHERE expires_at IS NULL OR expires_at > ? ORDER BY created_at", (time.time(),)
             ).fetchall()
-        return [{"id": r[0], "kind": r[1], "tenants": json.loads(r[2]), "name": r[3], "created_at": r[4]} for r in rows]
+        return [{"id": r[0], "kind": r[1], "tenants": json.loads(r[2]), "name": r[3], "created_at": r[4],
+                 "expires_at": r[5], "identity": r[6]} for r in rows]
 
     def revoke(self, token_id: str) -> bool:
         with self._lock:
@@ -153,11 +173,13 @@ class TokenStore:
         token_id, secret = parsed
         with self._lock:
             row = self._conn.execute(
-                "SELECT kind, secret_hash, tenants FROM api_tokens WHERE id = ?", (token_id,)
+                "SELECT kind, secret_hash, tenants, expires_at, identity FROM api_tokens WHERE id = ?", (token_id,)
             ).fetchone()
         if not row or not hmac.compare_digest(row[1], _hash(secret)):
             return None
-        return Principal(row[0], tuple(json.loads(row[2])), token_id)
+        if row[3] is not None and row[3] < time.time():
+            return None
+        return Principal(row[0], tuple(json.loads(row[2])), token_id, row[4])
 
     def ensure_admin_token_file(self, path: str = ADMIN_TOKEN_PATH) -> None:
         """Keep a working admin token in ``path`` (0600) for TCP clients like the web UI."""
@@ -178,9 +200,9 @@ class TokenStore:
 
 # ── Request authentication (ASGI middleware) ─────────────────────────────
 
-# Reachable without a token: liveness and the web UI's static files (the
-# UI then signs in with a token).
-_PUBLIC = re.compile(r"^/(health|ui(/.*)?)?$")
+# Reachable without a token: liveness, the web UI's static files, and SSO
+# sign-in (the UI then signs in with SSO or a token).
+_PUBLIC = re.compile(r"^/(health|ui(/.*)?|auth(/.*)?)?$")
 _ADMIN_ONLY = re.compile(r"^/(config|v1/tokens)(/.*)?$")
 _VM_PATH = re.compile(r"^/vms/([^/]+)(/.*)?$")
 
@@ -195,6 +217,36 @@ def _bearer(scope) -> str:
         return ""  # ?token= is for browsers' WebSockets, which can't set headers; keep tokens out of other URLs
     from urllib.parse import parse_qs
     return (parse_qs((scope.get("query_string") or b"").decode()).get("token") or [""])[0]
+
+
+def _header(scope, name: bytes) -> str:
+    for k, v in scope.get("headers") or []:
+        if k == name:
+            return v.decode("latin-1")
+    return ""
+
+
+def session_cookie(scope) -> str:
+    from http.cookies import SimpleCookie
+    jar = SimpleCookie()
+    try:
+        jar.load(_header(scope, b"cookie"))
+    except Exception:
+        return ""
+    morsel = jar.get(SESSION_COOKIE)
+    return morsel.value if morsel else ""
+
+
+def _same_origin(scope) -> bool:
+    """The browser says the request comes from a page of this server.
+
+    Browsers always send Origin on WebSockets and on requests that change
+    something; comparing hosts (not schemes) keeps this working behind a
+    proxy that terminates TLS.
+    """
+    from urllib.parse import urlsplit
+    origin = _header(scope, b"origin")
+    return bool(origin) and urlsplit(origin).netloc.lower() == _header(scope, b"host").lower()
 
 
 def _over_unix_socket(scope) -> bool:
@@ -236,6 +288,13 @@ class AuthMiddleware:
         else:
             token = _bearer(scope)
             store = self._tokens()
+            if not token and (cookie := session_cookie(scope)):
+                # A browser session: refuse what another site's page could make
+                # the browser send (state changes, WebSockets).
+                unsafe = scope["type"] == "websocket" or scope.get("method") not in ("GET", "HEAD", "OPTIONS")
+                if unsafe and not _same_origin(scope):
+                    raise AuthError(403, "Cross-origin request refused")
+                token = cookie
             principal = store.authenticate(token) if (token and store) else None
             if principal is None:
                 raise AuthError(401, "Missing or invalid API token (use the daemon's socket, "

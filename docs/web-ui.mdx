@@ -10,7 +10,7 @@ Flint ships an admin web UI. The daemon and the cluster control plane both serve
 | `flint start` (one host) | `flint ui`: it opens `http://127.0.0.1:9100/ui/` signed in with the daemon's admin token |
 | `flint-cluster server` | `https://<control-plane>/ui/`, then sign in with an API token |
 
-The daemon listens on localhost, so the UI is only reachable from the machine it runs on. To use it remotely, forward the port (`ssh -L 9100:127.0.0.1:9100 host`) and sign in with a token (`flint ui --no-open` prints the link). The UI uses the same Bearer tokens as the API, on a daemon and in a cluster. An admin token sees everything. A service token sees only its tenants, and the UI hides the pages it can't use.
+The daemon listens on localhost, so the UI is only reachable from the machine it runs on. To use it remotely, forward the port (`ssh -L 9100:127.0.0.1:9100 host`) and sign in with a token (`flint ui --no-open` prints the link). The UI uses the same Bearer tokens as the API, on a daemon and in a cluster, or [SSO](/sso) when it is set up. An admin token sees everything. A service token sees only its tenants, and the UI hides the pages it can't use.
 
 ## What's in it
 

@@ -78,7 +78,22 @@ DAEMON_SOCKET = os.environ.get("FLINT_SOCKET", f"{STATE_DIR}/flint.sock")
 DAEMON_URL = os.environ.get("FLINT_URL", f"unix://{DAEMON_SOCKET}").rstrip("/")
 # Written at the daemon's first start: an admin token for TCP clients (the web UI).
 ADMIN_TOKEN_PATH = f"{STATE_DIR}/admin.token"
-API_KEY = os.environ.get("FLINT_API_KEY", "")
+# `flint login` keeps sign-in tokens here, per server URL (0600).
+CREDENTIALS_PATH = os.environ.get("FLINT_CREDENTIALS", os.path.expanduser("~/.config/flint/credentials.json"))
+
+
+def stored_token(url: str) -> str:
+    """The unexpired token `flint login` stored for ``url``, or ""."""
+    import time
+    try:
+        with open(CREDENTIALS_PATH) as f:
+            cred = json.load(f).get(url.rstrip("/")) or {}
+    except (OSError, ValueError):
+        return ""
+    return cred.get("token", "") if (cred.get("expires_at") or float("inf")) > time.time() else ""
+
+
+API_KEY = os.environ.get("FLINT_API_KEY", "") or stored_token(DAEMON_URL)
 TENANT = os.environ.get("FLINT_TENANT", "")
 DAEMON_DIR = STATE_DIR
 DAEMON_STATE_PATH = f"{STATE_DIR}/state.json"

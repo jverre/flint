@@ -1,0 +1,76 @@
+---
+title: "Sign-in with SSO"
+description: "Let the people who run Flint sign in to the web UI and CLI with Google, GitHub, Auth0, Okta, Microsoft or any OpenID Connect provider."
+---
+
+By default, the web UI and remote CLIs sign in with an [API token](/api-reference/overview#tokens-and-tenants). With SSO, people sign in with your identity provider instead, and **rules** decide who gets which access. This is for the people who operate Flint; your app's end users never sign in to Flint, and your backend keeps using service tokens.
+
+## Set it up
+
+1. Register an OAuth application with your provider. Its redirect URI is `<public_url>/auth/callback/<provider id>`; the daemon prints it at start.
+2. Write `sso.json` in the daemon's state directory (`/var/lib/flint/state` on Linux), or point `FLINT_SSO_CONFIG` at it.
+3. Restart the daemon. The sign-in page now shows a button per provider.
+
+```json
+{
+  "public_url": "https://flint.acme.com",
+  "session_hours": 12,
+  "providers": [
+    {"id": "google", "type": "google", "client_id": "123.apps.googleusercontent.com", "client_secret_env": "GOOGLE_SECRET"},
+    {"id": "github", "type": "github", "client_id": "Iv1.abc", "client_secret_env": "GITHUB_SECRET"}
+  ],
+  "rules": [
+    {"email": "alice@acme.com", "kind": "admin"},
+    {"provider": "github", "github_team": "acme/platform", "kind": "admin"},
+    {"email_domain": "acme.com", "kind": "service", "tenants": ["acme-staging"]}
+  ]
+}
+```
+
+`public_url` is the address people reach Flint on (default `http://127.0.0.1:9100`). Use HTTPS for anything beyond your own machine: the session cookie is then sent over HTTPS only.
+
+## Providers
+
+| `type` | Also needs | Notes |
+|--------|-----------|-------|
+| `google` | | |
+| `github` | | `url` and `api_url` for GitHub Enterprise. Asks for `read:org` to check orgs and teams. |
+| `microsoft` | `tenant` (your Entra tenant ID) | Entra ID tokens have no verified-email flag: match on `group` instead of email. |
+| `auth0` | `domain` (`acme.eu.auth0.com`) | Add groups to the ID token with an Action, and set `groups_claim` to its claim name. |
+| `okta` | `domain` (`acme.okta.com`) | |
+| `gitlab` | | `url` for self-hosted GitLab. |
+| `oidc` | `issuer` | Any other OpenID Connect provider: Keycloak, Authentik, Dex, ... |
+
+Every provider takes `id`, `client_id`, and `client_secret` or `client_secret_env` (the name of an environment variable that holds it). Optional: `label` (the button text), `scopes`, and `groups_claim` (default `groups`).
+
+Sign-in uses the authorization code flow with PKCE, state and nonce, and Flint checks ID tokens against the provider's published keys.
+
+## Rules
+
+The first rule that matches decides the access; someone no rule matches can't sign in. A rule matches when **all** of its conditions hold:
+
+| Condition | Matches |
+|-----------|---------|
+| `provider` | the provider ID they signed in with |
+| `email` | their email, if the provider verified it |
+| `email_domain` | the domain of their verified email |
+| `group` | a value in the provider's groups claim |
+| `github_org` | a GitHub organization they belong to |
+| `github_team` | a GitHub team, as `org/team-slug` |
+
+`kind` is `admin` (everything) or `service`, with `tenants` to limit what they see, exactly like [service tokens](/api-reference/overview#tokens-and-tenants).
+
+## Sessions
+
+A sign-in creates a token that expires after `session_hours`. A browser keeps it in an HttpOnly cookie; a request with that cookie that changes something must come from Flint's own pages. Sessions are listed with `flint token list` (with who signed in) and an admin can revoke them with `flint token revoke`. Signing out revokes the session.
+
+## The CLI
+
+```bash
+export FLINT_URL=https://flint.acme.com
+flint login            # opens your browser; --provider to choose one, --no-open to print the URL
+flint list
+flint logout
+```
+
+`flint login` keeps the token in `~/.config/flint/credentials.json` (0600), per server, until it expires; the SDK and CLI use it when `FLINT_API_KEY` isn't set. The browser hands the CLI a one-time code over `127.0.0.1`, and only the CLI that started the sign-in can trade it for the token (PKCE).
