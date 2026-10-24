@@ -7,9 +7,13 @@ By default, the web UI and remote CLIs sign in with an [API token](/api-referenc
 
 ## Set it up
 
-1. Register an OAuth application with your provider. Its redirect URI is `<public_url>/auth/callback/<provider id>`; the daemon prints it at start.
-2. Write `sso.json` in the daemon's state directory (`/var/lib/flint/state` on Linux), or point `FLINT_SSO_CONFIG` at it.
-3. Restart the daemon. The sign-in page now shows a button per provider.
+1. Register an OAuth application with your provider. Its redirect URI is `<public_url>/auth/callback/<provider id>`; Flint prints it at start.
+2. Write `sso.json`:
+   - **single daemon:** in its state directory (`/var/lib/flint/state` on Linux), or point `FLINT_SSO_CONFIG` at it;
+   - **cluster:** give every control-plane replica the same file with `flint-cluster server --sso-config` (or `FLINT_SSO_CONFIG`). `public_url` is required there: the address behind your load balancer.
+3. Restart. The sign-in page now shows a button per provider.
+
+The same file works for both. In a cluster, sign-in works across replicas: the sign-in state is in a cookie signed with a key kept in the cluster's database.
 
 ```json
 {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -22,9 +23,10 @@ const (
 
 // Principal is an authenticated API caller.
 type Principal struct {
-	TokenID string
-	Kind    string
-	Tenants []string // empty = any tenant (service tokens)
+	TokenID  string
+	Kind     string
+	Tenants  []string // empty = any tenant (service tokens)
+	Identity string   // "provider:email" for an SSO session (sso.go)
 }
 
 func (p *Principal) IsAdmin() bool { return p.Kind == KindAdmin }
@@ -58,9 +60,10 @@ func parseToken(tok string) (id, secret string, ok bool) {
 }
 
 type tokenRow struct {
-	kind, hash string
-	tenants    []string
-	loaded     time.Time
+	kind, hash, identity string
+	tenants              []string
+	expires              int64 // unix ms; 0 = until revoked
+	loaded               time.Time
 }
 
 var tokenCache sync.Map // id -> tokenRow
@@ -99,9 +102,31 @@ func (s *Server) authenticate(r *http.Request) (*Principal, error) {
 	h := r.Header.Get("Authorization")
 	tok := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
 	if tok == "" || tok == h {
-		// WebSocket clients that can't set headers may pass ?token=.
-		tok = r.URL.Query().Get("token")
+		tok = ""
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			// WebSocket clients that can't set headers may pass ?token=.
+			tok = r.URL.Query().Get("token")
+		}
 	}
+	if tok == "" {
+		if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+			// A browser session (sso.go): refuse what another site's page
+			// could make the browser send.
+			unsafe := strings.EqualFold(r.Header.Get("Upgrade"), "websocket") ||
+				(r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions)
+			if unsafe && !sameOrigin(r) {
+				return nil, errCrossOrigin
+			}
+			tok = c.Value
+		}
+	}
+	return s.authenticateToken(r.Context(), tok)
+}
+
+var errCrossOrigin = errors.New("cross-origin request refused")
+
+// authenticateToken checks an API token (or SSO session token).
+func (s *Server) authenticateToken(ctx context.Context, tok string) (*Principal, error) {
 	if tok == "" {
 		return nil, errBadToken
 	}
@@ -114,7 +139,9 @@ func (s *Server) authenticate(r *http.Request) (*Principal, error) {
 		row = v.(tokenRow)
 	} else {
 		var tenants string
-		err := s.db.QueryRow(r.Context(), `SELECT kind, secret_hash, tenants FROM tokens WHERE id = ?`, id).Scan(&row.kind, &row.hash, &tenants)
+		var expires sql.NullInt64
+		err := s.db.QueryRow(ctx, `SELECT kind, secret_hash, tenants, expires_at, identity FROM tokens WHERE id = ?`, id).
+			Scan(&row.kind, &row.hash, &tenants, &expires, &row.identity)
 		if isNotFound(err) {
 			return nil, errBadToken
 		}
@@ -122,13 +149,17 @@ func (s *Server) authenticate(r *http.Request) (*Principal, error) {
 			return nil, err
 		}
 		json.Unmarshal([]byte(tenants), &row.tenants)
+		row.expires = expires.Int64
 		row.loaded = time.Now()
 		tokenCache.Store(id, row)
 	}
 	if subtle.ConstantTimeCompare([]byte(row.hash), []byte(pki.HashSecret(secret))) != 1 {
 		return nil, errBadToken
 	}
-	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants}, nil
+	if row.expires != 0 && row.expires < nowMs() {
+		return nil, errBadToken
+	}
+	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants, Identity: row.identity}, nil
 }
 
 type ctxKey int
@@ -146,6 +177,10 @@ func (s *Server) requireAuth(admin bool, h http.HandlerFunc) http.HandlerFunc {
 		p, err := s.authenticate(r)
 		if errors.Is(err, errBadToken) {
 			writeErr(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+		if errors.Is(err, errCrossOrigin) {
+			writeErr(w, http.StatusForbidden, "Cross-origin request refused")
 			return
 		}
 		if err != nil {

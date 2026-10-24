@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"github.com/jverre/flint/cluster/internal/webui"
 
 	"encoding/json"
@@ -23,6 +24,14 @@ func (s *Server) apiHandler() http.Handler {
 	admin := func(h http.HandlerFunc) http.HandlerFunc { return s.requireAuth(true, h) }
 
 	mux.HandleFunc("GET /health", s.handleHealth)
+
+	// Sign-in with identity providers (sso.go); public by nature.
+	mux.HandleFunc("GET /auth/providers", s.handleSSOProviders)
+	mux.HandleFunc("GET /auth/login/{id}", s.handleSSOLogin)
+	mux.HandleFunc("GET /auth/callback/{id}", s.handleSSOCallback)
+	mux.HandleFunc("POST /auth/cli/exchange", s.handleSSOCLIExchange)
+	mux.HandleFunc("GET /auth/me", s.handleSSOMe)
+	mux.HandleFunc("POST /auth/logout", s.handleSSOLogout)
 
 	// VMs: the daemon's API, served for the whole cluster.
 	mux.HandleFunc("POST /vms", auth(s.idempotent(s.handleCreateVM)))
@@ -742,7 +751,8 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `SELECT id, kind, tenants, name, created_at FROM tokens ORDER BY created_at`)
+	rows, err := s.db.Query(r.Context(), `SELECT id, kind, tenants, name, created_at, expires_at, identity FROM tokens
+		WHERE expires_at IS NULL OR expires_at > ? ORDER BY created_at`, nowMs())
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -750,12 +760,18 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, kind, tenants, name string
+		var id, kind, tenants, name, who string
 		var created int64
-		rows.Scan(&id, &kind, &tenants, &name, &created)
+		var expires sql.NullInt64
+		rows.Scan(&id, &kind, &tenants, &name, &created, &expires, &who)
 		var t []string
 		json.Unmarshal([]byte(tenants), &t)
-		out = append(out, map[string]any{"id": id, "kind": kind, "tenants": t, "name": name, "created_at": float64(created) / 1000})
+		tok := map[string]any{"id": id, "kind": kind, "tenants": t, "name": name, "created_at": float64(created) / 1000,
+			"identity": who, "expires_at": nil}
+		if expires.Valid {
+			tok["expires_at"] = float64(expires.Int64) / 1000
+		}
+		out = append(out, tok)
 	}
 	writeJSON(w, 200, map[string]any{"tokens": out})
 }
