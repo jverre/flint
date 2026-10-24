@@ -207,6 +207,61 @@ def token_revoke(token_id):
     click.echo(f"{token_id} revoked")
 
 
+def _event_line(e: dict) -> str:
+    when = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+    vm = (e.get("vm_id") or (e.get("vm") or {}).get("vm_id") or "")[:8]
+    who = e.get("actor_name") or e.get("actor", "")
+    detail = ""
+    if e.get("type") == "vm.exec":
+        detail = f"{e.get('cmd', '')!r} -> {e.get('exit_code')} ({e.get('duration_ms')} ms)"
+    elif e.get("type") == "vm.state_changed":
+        detail = f"{e.get('from')} -> {e.get('to')}"
+    return f"{when}  {e.get('seq', ''):>6}  {e.get('type', ''):20s} {vm:8s}  {e.get('tenant', ''):12s} {who:24s} {detail}"
+
+
+@cli.command()
+@click.option("--vm", "vm_id", default="", help="Only this VM's events")
+@click.option("--tenant", default="")
+@click.option("--type", "type_", default="", help="e.g. vm.exec")
+@click.option("--since", default=0, type=int, help="After this seq")
+@click.option("-f", "--follow", is_flag=True, help="Keep printing new events")
+@click.option("-o", "--output", type=click.Choice(["table", "json"]), default="table")
+def events(vm_id, tenant, type_, since, follow, output):
+    """Stored events: lifecycle changes, execs and more, with who caused them."""
+    import json as _json
+    while True:
+        page = _cp("GET", "/v1/events", params={"since": since, "vm_id": vm_id, "tenant": tenant, "type": type_})
+        for e in page["events"]:
+            click.echo(_json.dumps(e) if output == "json" else _event_line(e))
+        if page["next"] > since:
+            since = page["next"]
+            continue
+        if not follow:
+            return
+        time.sleep(1)
+
+
+@cli.command()
+@click.option("--since", default=0, type=int)
+@click.option("--verify", is_flag=True, help="Recompute the hash chain instead of listing")
+def audit(since, verify):
+    """The audit log (admin): every API call that changed something, hash-chained."""
+    if verify:
+        r = _cp("GET", "/v1/audit/verify")
+        if not r["ok"]:
+            raise click.ClickException(f"audit log broken at entry {r['broken_at']}: {r['why']} ({r['count']} entries checked)")
+        click.echo(f"audit log intact: {r['count']} entries, last hash {r['last_hash'][:16]}")
+        return
+    while True:
+        page = _cp("GET", "/v1/audit", params={"since": since})
+        for a in page["entries"]:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["ts_ms"] / 1000))
+            click.echo(f"{when}  {a['seq']:>6}  {a['status']}  {a['method']:6s} {a['path']:40s} {a['actor_name'] or a['actor']}")
+        if not page["entries"] or page["next"] == since:
+            return
+        since = page["next"]
+
+
 @cli.group()
 def quota():
     """Per-tenant limits: VMs, vCPUs, memory and volume space."""
