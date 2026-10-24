@@ -22,14 +22,15 @@ This is what holds on a single host, with the Firecracker and Cloud Hypervisor b
 | Boundary | What holds |
 |----------|------------|
 | **VM ↔ host** | Each VMM runs jailed: its own chroot, an unprivileged user with `no_new_privs`, seccomp, its own cgroup, and only the devices it needs (`/dev/kvm`, `/dev/urandom`, and `/dev/net/tun` for Firecracker). |
-| **VM ↔ VM** | No packets between VMs, of different tenants or the same one: bridge port isolation, plus an ingress firewall in every VM's network namespace. See [networking](/architecture/networking). |
+| **VM ↔ VM** | Cross-tenant traffic is blocked. Same-tenant traffic is blocked by default and can be enabled explicitly; host and namespace nftables ACLs keep the guest agent and credential proxy private. See [networking](/architecture/networking). |
 | **VM ↔ host services** | A VM can't reach any service on the host, except the volume server when it mounts a volume. |
 | **Egress** | Private, loopback, CGNAT, multicast and link-local destinations (cloud metadata at `169.254.169.254` included) are blocked, in the VM's namespace and again on the host. The internet is reachable unless the VM is created with `allow_internet_access=False`. |
 | **VM ↔ daemon** | A VM can't reach the daemon's API. The daemon listens on a Unix socket (its user only) and on `127.0.0.1`, where every call needs an API token. |
 | **Callers ↔ tenants** | A service token pinned to tenants sees only their VMs, volumes, templates and events; the others answer `404`. Only admins manage tokens, quotas and daemon config. Tokens are stored hashed. People can sign in with an identity provider instead ([SSO](/sso)): rules map them to the same access, and a session cookie only acts for Flint's own pages. |
 | **Credentials** | The [credential proxy](/api-reference/vms#network-policy) adds them to the VM's HTTPS requests, matched on the TLS server name, so the VM never holds them. The daemon stores them encrypted, never returns them (only redacted), and forgets them when the VM is deleted. |
-| **Storage** | Every VM has its own copy-on-write disk. A volume belongs to a tenant and can only be mounted into that tenant's VMs. When a VM or volume is deleted, its files are wiped before they are removed, and `vm.wiped` reports it. |
-| **Resources** | Every VM has a fixed number of vCPUs and amount of memory. Per tenant, an admin can cap VMs, vCPUs, memory and volume space. |
+| **Storage** | Every VM has its own copy-on-write disk. A volume belongs to a tenant and can only be mounted into that tenant's VMs. Files are wiped before successful deletion. Wipe failures retain the VM or volume for retry and do not emit `vm.wiped`; the event reports successful VM cleanup. |
+| **Resources** | Every VM has a fixed number of vCPUs and amount of memory. Host-enforced cgroups cap CPU, memory, tasks and root-disk IO; the TAP caps network traffic. Per tenant, an admin can also cap VMs, vCPUs, memory and volume space. |
+| **Template builds** | Submitted Dockerfiles execute in disposable jailed VMs on the selected Linux backend. Each build has a private disk/cache, resource ceilings and public-only egress with no storage-server exception. Artifacts are streamed out with a size bound and never mounted on the host. Builder disks are wiped after completion, failure, or recovery from a daemon crash. |
 | **Events** | Every event carries its tenant. A tenant's token gets only its tenant's events, logs, metrics and terminals. |
 
 `tests/test_tenants.py::test_two_tenants_are_isolated` checks these boundaries end to end on both Linux backends, with two tenants on one host.
@@ -38,10 +39,8 @@ This is what holds on a single host, with the Firecracker and Cloud Hypervisor b
 
 - **Hypervisor and kernel exploits** beyond what jailing and seccomp contain, and **side channels** between VMs that share CPU cores. Run tenants that must never share hardware on separate hosts.
 - **A malicious host operator**, or anyone with root on the host.
-- **Template builds.** A template's Dockerfile runs in Docker on the host, in a container rather than a VM, with the host's network (cloud metadata included) and a build cache shared by all tenants. Only build Dockerfiles you trust, or vet what your users submit. Template IDs are one namespace across tenants: a tenant can see that a name is taken.
-- **Disk and network throughput.** Nothing caps a VM's disk IO or network bandwidth yet, so one VM can slow its neighbours.
+- **Template names.** IDs are still one namespace across tenants, so a tenant can discover that a name is taken. New builds always have a tenant; the built-in default template and existing shared templates remain shared. The host Docker daemon prepares only the fixed, trusted builder appliance.
 - **Domain allowlists.** Egress to the internet is all or nothing; there is no per-domain allowlist except for injected credentials.
-- **Traffic between a tenant's own VMs.** It is always blocked; there is no way to allow it yet.
 - **Data on the host's disk.** Wiping discards a file's blocks (or zeroes them), which keeps them out of reach of anything on the host. It is not a forensic erase of the physical disk: encrypt the host's disks for that. Volume data already pushed to a remote object store stays there.
 - **The encryption key.** Credentials are encrypted with a key kept beside the database (`secret.key`, or `FLINT_SECRET_KEY`): a copied database or backup is safe, root on the host is not.
 - **In a cluster**, the control plane keeps each VM's network policy in its database in plaintext, so it can recreate the VM on another host.

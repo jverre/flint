@@ -5,7 +5,7 @@ description: "Build custom sandbox environments from Docker images."
 
 By default, sandboxes use a minimal Alpine Linux rootfs. If you need Python packages, system libraries, or a specific runtime pre-installed, you can build a custom template.
 
-Templates work by building a Docker image, extracting the filesystem, and creating a new golden snapshot from it. Once built, you can create sandboxes from your template just like the default one - with the same fast startup time.
+On Linux, templates build inside disposable jailed VMs with a fresh Docker cache. The builder cannot reach the host, other tenants, private networks or cloud metadata. It creates a filesystem image that Flint copies out and boots in another jail to create the golden snapshot. Once built, you can create sandboxes from your template just like the default one - with the same fast startup time.
 
 ## Building a template
 
@@ -57,7 +57,7 @@ Templates work by building a Docker image, extracting the filesystem, and creati
     </ParamField>
 
     <ParamField body="rootfs_size_mb" type="int" default="500">
-      Rootfs image size in MB.
+      Rootfs image size in MB, from 64 to 16384.
     </ParamField>
 
     **Response** `200` - returns immediately, build happens in background

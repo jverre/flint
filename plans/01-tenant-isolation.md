@@ -29,23 +29,24 @@ table is `docs/architecture/security.mdx`.
 |----------|-------------|---------------|
 | **VM ↔ host** | VMM runs jailed: chroot, unprivileged uid, seccomp, cgroups, minimal devices | Done for both: Firecracker uses the jailer; Cloud Hypervisor runs in Flint's equivalent jail (`_ch_jail.py`, TAP passed as an fd). Golden-snapshot boots of tenant templates are jailed on both. Covered by `test_vmm_runs_unprivileged_in_its_jail` |
 | **VM ↔ VM (cross-tenant)** | No packets between tenants' VMs | Done: bridge port isolation + per-netns ingress firewall; host drops bridge hairpin. Covered by `test_sandbox_cannot_reach_other_sandboxes_on_bridge` |
-| **VM ↔ VM (same tenant)** | Allowed only when the tenant opts in | Blocked, with no way to opt in yet (stricter than required). Covered by the two-tenant test |
+| **VM ↔ VM (same tenant)** | Allowed only when the tenant opts in | Blocked by default; `PUT /v1/tenants/{tenant}/network` opts in. Traffic is routed through host and namespace nftables ACLs. Control ports stay private; revocation also blocks established flows. Covered by the two-tenant and Linux kernel flows |
 | **VM ↔ host services** | VMs can reach only explicitly exposed host services | Done: host `FLINT-INPUT` drops everything from `br-flint` except the r2nfs port; netns egress policy blocks private ranges. Covered by `test_sandbox_cannot_reach_host_services`. r2nfs authorizes exports by veth IP, which is now unique and unspoofable (per-netns NAT + port isolation) |
 | **VM ↔ another VM's proxy** | A VM can never use another VM's credential proxy | Done: proxy listens on `172.16.0.1` only, and the netns drops unsolicited veth ingress |
 | **VM ↔ control plane** | Guest can't reach daemon API; guest agent only reachable from its own netns | Daemon listens on a Unix socket (its user and the `flint` group) and on `127.0.0.1:9100`, where every call needs an API token (#41). `flintd` is reachable only through the VM's netns: the bridge sweep in the two-tenant test finds no other namespace |
 | **Egress** | Default deny or allowlist; always block host, link-local (`169.254.0.0/16`, cloud metadata), RFC1918 and the bridge subnet | Host, link-local, RFC1918, CGNAT, loopback and multicast blocked in every netns and again on the host (storage endpoint excepted). Still no per-domain allowlist for non-HTTP |
 | **Secrets** | Injected by proxy, never in the guest, encrypted at rest, never returned by the API | Done on the single daemon (#40): sealed with Fernet (`secret.key` or `FLINT_SECRET_KEY`), redacted on every read, write-only (a redacted value sent back keeps the credential), dropped when the VM dies; the proxy's rules file lives in a 0700 tmpfs dir. The cluster's VM `spec` still holds policies in plaintext |
 | **Storage** | No shared writable layers across tenants; rootfs, snapshots, pause state and volumes wiped on delete | Done (#42): private files are discarded (hole punched, or zeroed) before removal, `vm.wiped` reports it; r2nfs wipes a deleted image's overlay and collects its unshared chunks. Volumes have a tenant and mount only into its VMs (#41). Not a forensic erase; remote-store chunks stay. The cluster doesn't serve volumes yet (`501`) |
-| **Resources** | Per-VM CPU, memory, disk IO, network limits; per-tenant quotas (VM count, vCPU, RAM, disk) | Per-VM cgroups and fixed VM sizes on both VMMs. The single daemon enforces per-tenant VM, vCPU, memory and volume-GiB quotas (#43); the cluster only a VM count. **No IO/network rate limits** |
-| **Template builds** | A tenant's build can't reach the host, other tenants or private networks | **Not isolated**: `docker build` runs the Dockerfile on the host's Docker with the host's network (metadata included) and a shared BuildKit cache. Needs builds inside a VM, or `--network` restricted plus a builder per tenant |
+| **Resources** | Per-VM CPU, memory, disk IO, network limits; per-tenant quotas (VM count, vCPU, RAM, disk) | Per-VM cgroups and fixed VM sizes on both VMMs. The single daemon enforces per-tenant VM, vCPU, memory and volume-GiB quotas (#43); the cluster only a VM count. Cgroup v2 CPU/memory/PID ceilings and root-disk `io.max`, plus TAP shaping/policing on both Linux backends |
+| **Template builds** | A tenant's build can't reach the host, other tenants or private networks | Disposable jailed builder VM on the selected backend, with private disk/cache and public-only egress. The host Docker daemon builds only the fixed trusted appliance; exported artifacts are streamed out with a size bound and never mounted on the host. Abandoned builders are killed and wiped during recovery |
 | **Telemetry** | Every event, log line and metric tagged with tenant; queries scoped by tenant | Every single-daemon event carries `tenant` and `/events` sends a token only its tenants' (#41); per-VM logs, metrics and terminals are scoped by the VM's tenant. Events are still in memory only. The cluster stores events with `tenant` and filters `/v1/events?tenant=` |
 
 ## Work items
 
 ### 1. Network isolation
 
-*Done except: same-tenant opt-in, the move to nftables, and r2nfs access
-by something stronger than the source address.*
+*Native nftables and same-tenant opt-in are implemented. r2nfs remains
+source-address authorized; namespace source filtering, NAT and bridge
+isolation protect those addresses.*
 
 - Model networks per tenant: either a bridge per tenant, or keep one bridge
   and enforce isolation with nftables (per-veth ingress rules keyed on a
@@ -83,7 +84,10 @@ means the token's only tenant, else `default`.*
 
 ### 4. Storage
 
-*Done (#42): discard (hole punch, else zeros) rather than crypto-erase.*
+*Discard (hole punch, else zeros), with durability checks. A wipe or removal
+failure retains the resource for retry; cleanup does not mark it dead or emit
+`vm.wiped`. Volumes keep their database row until local wiping and chunk
+collection succeed. This is not a forensic physical erase.*
 
 - On delete: discard/zero rootfs and snapshot files before unlink (or
   per-VM dm-crypt/LUKS keys destroyed on delete: crypto-erase is cheaper and
@@ -99,7 +103,9 @@ passed as an fd. Cgroup *limits* are part of item 6.
 
 ### 6. Resource limits and quotas
 
-*Quotas done (#43); rate limits not started.*
+*Quotas and per-VM limits implemented. Both backends require cgroup v2 and
+local block-backed root disks; kernel `tc` enforces network ceilings on the
+guest TAP, including storage traffic.*
 
 - Per-VM IO and network rate limits (both VMMs support rate limiters).
 - Per-tenant quota config: max VMs, vCPU, RAM, disk; enforced at create.
@@ -124,7 +130,18 @@ Linux backends:
 3. Same-tenant pair: unreachable by default.
 4. Set credentials on A; they're injected on A's egress, absent inside A,
    redacted in `GET /network-policy`, and not usable from B.
-5. Delete A; its files are gone and `vm.wiped` was emitted.
-6. Create with tenant `a` over quota → refused with a clear error.
+5. Opt tenant `a` into peer networking: its VMs connect, the other tenant and
+   control ports remain unreachable; pause/resume preserves the setting;
+   revocation blocks traffic again.
+6. Pause and delete A; hold its private disk and snapshot inodes open and
+   verify they contain only zeros, the directory is gone, and `vm.wiped`
+   reports nonzero files/bytes.
+7. Create with tenant `a` over quota → refused with a clear error.
 
 A run where the VM fixtures skip is not a pass.
+
+The daemon CI matrix also runs `test_template_build_and_run` on both backends,
+with a live host listener and cloud-metadata probes during the Dockerfile's
+`RUN` steps. `tests/maintenance/test_network_linux.py` exercises the nftables
+rules with real TCP stacks. Local unit/kernel checks are not a substitute for
+a passing, non-skipped hypervisor run of the strengthened flows.

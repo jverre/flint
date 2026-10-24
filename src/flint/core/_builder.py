@@ -72,6 +72,8 @@ def cleanup_abandoned_builders() -> None:
                 time.sleep(.02)
         _delete_netns(data["ns"])
         cleanup_jailer(spec.chroot_base, vm_id) if spec else jail.cleanup()
+        from ._wipe import take
+        take(vm_id)
         marker.unlink()
 
 
@@ -171,6 +173,8 @@ def _vm(kind: str, disk_mb: int):
             cleanup_jailer(spec.chroot_base, vm_id)
         elif jail:
             jail.cleanup()
+        from ._wipe import take
+        take(vm_id)
         marker.unlink(missing_ok=True)
 
 

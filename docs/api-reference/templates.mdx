@@ -7,7 +7,7 @@ description: "Build and manage custom sandbox environments."
 
 `POST /templates/build`
 
-Starts a template build in the background and returns immediately. Poll `GET /templates/{template_id}` to check when it's ready.
+Starts a template build in the background and returns immediately. Poll `GET /templates/{template_id}` to check when it's ready. Submitted Dockerfiles run in disposable jailed VMs with private caches; host services, private networks and cloud metadata are unreachable.
 
 **Request body**
 
@@ -23,7 +23,12 @@ Starts a template build in the background and returns immediately. Poll `GET /te
 |-------|------|---------|-------------|
 | `name` | string | required | Human-readable name |
 | `dockerfile` | string | required | Full Dockerfile contents |
-| `rootfs_size_mb` | int | `500` | Rootfs image size in MB |
+| `rootfs_size_mb` | int | `500` | Rootfs image size in MB, from 64 to 16384 |
+| `tenant` | string | Caller's sole tenant, otherwise `default` | Owner of the resulting template |
+
+A token scoped to several tenants must specify one. A build for an existing template cannot change its owner. Invalid sizes return `400`; a concurrent build of the same ID returns `409`. Deleting a template while its build runs also returns `409`.
+
+Builds require host Docker for the trusted appliance. Each builder has 2 vCPUs, 2 GiB of guest memory, a bounded private disk and a 15-minute command deadline. `FLINT_BUILD_CONCURRENCY` limits simultaneous builders (default `1`, valid range `1`–`4`). After a daemon crash, abandoned builders are stopped and wiped before new requests are accepted.
 
 **Response** `200`
 
