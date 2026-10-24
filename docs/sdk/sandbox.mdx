@@ -287,6 +287,23 @@ Set an auto-cleanup timeout. Useful for making sure sandboxes don't run indefini
   </Tab>
 </Tabs>
 
+## Credentials
+
+The credential proxy adds headers to a sandbox's outbound HTTPS requests, so code in the sandbox can call an API without ever holding its key.
+
+```python
+sandbox.update_network_policy({
+    "allow": {
+        "api.openai.com": [{"transform": [{"headers": {"Authorization": "Bearer sk-..."}}]}],
+    }
+})
+
+sandbox.get_network_policy()
+# {"allow": {"api.openai.com": [{"transform": [{"headers": {"Authorization": "Bear***..."}}]}]}}
+```
+
+Values are write-only: `get_network_policy()` returns them redacted. Writing a redacted value back unchanged keeps the current credential, so you can edit a policy you read. See [Network policy](/api-reference/vms#network-policy).
+
 ## run_code
 
 A convenience method for executing code strings directly.

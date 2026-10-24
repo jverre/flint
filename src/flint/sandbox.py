@@ -259,7 +259,10 @@ class Sandbox:
         _get_client().update_network_policy(self._id, policy)
 
     def get_network_policy(self) -> dict | None:
-        """Get the current network policy for this sandbox."""
+        """This sandbox's network policy, with credential values redacted.
+
+        Values are write-only: pass a redacted value back unchanged to
+        ``update_network_policy`` to keep the current credential."""
         return _get_client().get_network_policy(self._id)
 
     # ── Filesystem methods ──────────────────────────────────────────────────

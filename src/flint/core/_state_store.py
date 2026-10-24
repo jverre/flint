@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 
+from . import _secrets
 from .config import log
 from .types import SandboxState
 from ._state_machine import validate_transition
@@ -103,6 +104,23 @@ class StateStore:
                 self._conn.commit()
             except Exception:
                 pass
+        self._seal_policies()
+
+    def _seal_policies(self) -> None:
+        """Encrypt policies stored before they were sealed, and drop dead VMs' ones."""
+        self._conn.execute("UPDATE sandboxes SET network_policy_json = NULL WHERE state = ?",
+                           (SandboxState.DEAD.value,))
+        rows = self._conn.execute(
+            "SELECT vm_id, network_policy_json FROM sandboxes WHERE network_policy_json IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            if not _secrets.is_sealed(row["network_policy_json"]):
+                self._conn.execute("UPDATE sandboxes SET network_policy_json = ? WHERE vm_id = ?",
+                                   (_secrets.seal(row["network_policy_json"]), row["vm_id"]))
+        self._conn.commit()
+        # Plaintext can survive in free pages and the WAL; rewrite them.
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._conn.execute("VACUUM")
 
     def insert_sandbox(
         self,
@@ -161,6 +179,9 @@ class StateStore:
             "UPDATE sandboxes SET state = ?, updated_at = ?, error_message = COALESCE(?, error_message) WHERE vm_id = ?",
             (new_state.value, now, detail, vm_id),
         )
+        if new_state == SandboxState.DEAD:
+            # A dead VM's credentials have no use left.
+            self._conn.execute("UPDATE sandboxes SET network_policy_json = NULL WHERE vm_id = ?", (vm_id,))
         self._conn.execute(
             "INSERT INTO state_log (vm_id, from_state, to_state, timestamp, daemon_pid, detail) VALUES (?, ?, ?, ?, ?, ?)",
             (vm_id, from_state.value, new_state.value, now, daemon_pid, detail),
@@ -219,10 +240,11 @@ class StateStore:
 
     @_locked
     def set_network_policy(self, vm_id: str, policy_json: str) -> None:
+        """Store a policy, encrypted: it holds credentials."""
         now = time.time()
         self._conn.execute(
             "UPDATE sandboxes SET network_policy_json = ?, updated_at = ? WHERE vm_id = ?",
-            (policy_json, now, vm_id),
+            (_secrets.seal(policy_json), now, vm_id),
         )
         self._conn.commit()
 
@@ -231,7 +253,8 @@ class StateStore:
         row = self._conn.execute(
             "SELECT network_policy_json FROM sandboxes WHERE vm_id = ?", (vm_id,)
         ).fetchone()
-        return row["network_policy_json"] if row else None
+        stored = row["network_policy_json"] if row else None
+        return _secrets.unseal(stored) if stored else None
 
     @_locked
     def get_sandbox(self, vm_id: str) -> dict | None:
