@@ -285,7 +285,13 @@ class MacOSVirtualizationBackend(HostBackend):
         self._runtime.call(lambda: self._stop_vm(handle))
         handle.close()
         self._handles.pop(entry.vm_id, None)
-        shutil.rmtree(handle.runtime_dir, ignore_errors=True)
+        from flint.core._wipe import wipe_tree
+        wipe_tree(handle.runtime_dir, entry.vm_id)
+
+    def discard_paused(self, row: dict) -> None:
+        # The VM is stopped; its runtime directory holds its disk and saved state.
+        from flint.core._wipe import wipe_tree
+        wipe_tree(row.get("vm_dir") or "", row["vm_id"])
 
     def pause(self, entry, state_store) -> None:
         handle = self._coerce_handle(entry)

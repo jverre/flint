@@ -417,3 +417,35 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	return os.Rename(tmp, path)
 }
+
+// References returns the store keys an image with manifest m needs: its
+// layers and every chunk they point to. Garbage collection keeps these.
+func References(store Store, m Manifest) (map[string]bool, error) {
+	refs := map[string]bool{}
+	for _, key := range m.Layers {
+		l, err := loadLayer(store, key)
+		if err != nil {
+			return nil, err
+		}
+		refs[key] = true
+		for _, c := range l.Chunks {
+			if c != zeroChunk {
+				refs[c] = true
+			}
+		}
+	}
+	return refs, nil
+}
+
+// ReadManifest reads the manifest of the image in dir without opening it.
+func ReadManifest(dir string) (Manifest, error) {
+	var m Manifest
+	data, err := os.ReadFile(filepath.Join(dir, manifestFile))
+	if err != nil {
+		return m, err
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return m, fmt.Errorf("manifest: %w", err)
+	}
+	return m, nil
+}

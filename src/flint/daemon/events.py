@@ -12,6 +12,7 @@ Event types (payload keys other than `type`, `ts` and `tenant`):
   vm.state_changed     vm_id: str, from: str, to: str
   vm.paused            vm_id: str
   vm.resumed           vm: dict
+  vm.wiped             vm_id: str, files: int, bytes: int  (its files were wiped before removal)
   volume.created       volume: dict
   volume.deleted       volume_id: str
   volume.attached      vm_id: str, volume_id: str, mount_path: str
