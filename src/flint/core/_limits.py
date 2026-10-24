@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import signal
+import time
 
 from . import config
 
@@ -29,7 +31,63 @@ def _whole_device(device: int, sysfs: Path = Path("/sys/dev/block")) -> str:
     return (node / "dev").read_text().strip()
 
 
-def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 128) -> None:
+def vm_cgroup(vm_id: str, kind: str) -> str:
+    parent = os.environ.get("FLINT_CH_PARENT_CGROUP", "cloud-hypervisor") if kind == "linux-cloud-hypervisor" else config.JAILER_PARENT_CGROUP
+    return f"/sys/fs/cgroup/{parent}/{vm_id}"
+
+
+def attach_process(path: str, pid: int) -> None:
+    group = Path(path)
+    group.mkdir(parents=True, exist_ok=True)
+    (group / "cgroup.procs").write_text(str(pid))
+    verify_process(path, pid)
+
+
+def verify_process(path: str, pid: int) -> None:
+    group = Path(path)
+    expected = "0::/" + str(group.relative_to("/sys/fs/cgroup"))
+    if expected not in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+        raise RuntimeError(f"Process {pid} did not enter {path}")
+
+
+def owns_process(pid: int, root: str) -> bool:
+    try:
+        if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            return False
+        return bool(pid and root and os.path.samestat(os.stat(f"/proc/{pid}/root"), os.stat(root)))
+    except FileNotFoundError:
+        return False
+
+
+def stop_processes(path: str, *, pid: int = 0, root: str = "", process=None) -> None:
+    """Stop only this jail's processes; prove the cgroup empty before cleanup."""
+    group = Path(path)
+    if group.exists():
+        (group / "cgroup.kill").write_text("1")
+    # Older versions may have left the VMM outside its intended cgroup.
+    if owns_process(pid, root):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if isinstance(process, subprocess.Popen):
+        process.wait(timeout=10)
+    deadline = time.monotonic() + 10
+    while True:
+        populated = group.exists() and "populated 1" in (group / "cgroup.events").read_text()
+        alive = owns_process(pid, root)
+        if not populated and not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"VMM has not stopped; retaining jail {root}")
+        time.sleep(.01)
+
+
+def ch_disk_limiter() -> dict:
+    return {"bandwidth": {"size": DISK_BPS, "refill_time": 1000}}
+
+
+def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 128, vmm_disk_limit: bool = False) -> None:
     """Apply limits before the guest runs; absence of cgroup v2 is an error."""
     root = Path("/sys/fs/cgroup")
     if config.JAILER_CGROUP_VER != 2:
@@ -46,8 +104,38 @@ def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 1
     (group / "cpu.max").write_text(f"{vcpus * 100000} 100000")
     (group / "memory.max").write_text(str((memory_mib + 256) * 1024 * 1024))
     (group / "pids.max").write_text("512")
-    device = _whole_device(os.stat(rootfs).st_dev)
-    (group / "io.max").write_text(f"{device} rbps={DISK_BPS} wbps={DISK_BPS}")
+    device = os.stat(rootfs).st_dev
+    if os.major(device) or not vmm_disk_limit:
+        device = _whole_device(device)
+        (group / "io.max").write_text(f"{device} rbps={DISK_BPS} wbps={DISK_BPS}")
+
+
+def prepare_recovered(backend, rows: list[dict]) -> None:
+    """Move legacy processes out of delegated parents before enabling controllers."""
+    for row in rows:
+        if owns_process(row["pid"], row["vm_dir"]):
+            attach_process(vm_cgroup(row["vm_id"], backend.kind), row["pid"])
+
+
+def enforce_recovered(backend, row: dict) -> None:
+    if not owns_process(row["pid"], row["vm_dir"]):
+        raise RuntimeError("Recovered process identity does not match its jail")
+    group = vm_cgroup(row["vm_id"], backend.kind)
+    cpus, memory = backend.vm_resources()
+    if backend.kind == "linux-cloud-hypervisor" and not os.major(os.stat(os.path.join(row["vm_dir"], "rootfs.ext4")).st_dev):
+        import json
+        from . import _cloud_hypervisor as ch
+        status, body = ch.ch_get(row["socket_path"], "/api/v1/vm.info")
+        disks = json.loads(body).get("config", {}).get("disks", []) if status == 200 else []
+        if not disks or any(
+            (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("size") != DISK_BPS
+            or (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("refill_time") != 1000
+            for disk in disks
+        ):
+            raise RuntimeError("Recovered shared-disk VM needs a bounded disk configuration; restore from its snapshot")
+    cgroup_limits(group, os.path.join(row["vm_dir"], "rootfs.ext4"), vcpus=cpus, memory_mib=memory,
+                  vmm_disk_limit=backend.kind == "linux-cloud-hypervisor")
+    attach_process(group, row["pid"])
 
 
 def network_limits(ns_name: str, tap_name: str) -> None:

@@ -6,10 +6,11 @@ from .types import SandboxState
 
 # Valid transitions: from_state -> set of allowed to_states
 _TRANSITIONS: dict[SandboxState, set[SandboxState]] = {
-    SandboxState.STARTING: {SandboxState.RUNNING, SandboxState.ERROR, SandboxState.DEAD},
-    SandboxState.RUNNING:  {SandboxState.PAUSED, SandboxState.ERROR, SandboxState.DEAD},
-    SandboxState.PAUSED:   {SandboxState.RUNNING, SandboxState.ERROR, SandboxState.DEAD},
-    SandboxState.ERROR:    {SandboxState.DEAD},
+    SandboxState.STARTING: {SandboxState.RUNNING, SandboxState.ERROR, SandboxState.DELETING, SandboxState.DEAD},
+    SandboxState.RUNNING:  {SandboxState.PAUSED, SandboxState.ERROR, SandboxState.DELETING, SandboxState.DEAD},
+    SandboxState.PAUSED:   {SandboxState.RUNNING, SandboxState.ERROR, SandboxState.DELETING, SandboxState.DEAD},
+    SandboxState.ERROR:    {SandboxState.DELETING, SandboxState.DEAD},
+    SandboxState.DELETING: {SandboxState.DEAD},
     SandboxState.DEAD:     set(),  # terminal state
 }
 

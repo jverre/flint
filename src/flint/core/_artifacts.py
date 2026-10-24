@@ -105,7 +105,9 @@ def shared_readonly(src: str, mirror_root: str, mode: int = 0o444) -> str:
     # Drop mirrors of older generations of the same source.
     for name in os.listdir(mirror_root):
         if name.startswith(f"{key}-") and os.path.join(mirror_root, name) != mirror_dir:
-            shutil.rmtree(os.path.join(mirror_root, name), ignore_errors=True)
+            old = os.path.join(mirror_root, name)
+            if not any(os.stat(os.path.join(old, f)).st_nlink > 1 for f in os.listdir(old)):
+                shutil.rmtree(old)
     return mirror
 
 
@@ -125,8 +127,8 @@ def prune_shared(mirror_root: str) -> None:
             current = name.endswith(f"-{st.st_ino}-{st.st_mtime_ns}")
         except OSError:
             current = False
-        if not current:
-            shutil.rmtree(mirror_dir, ignore_errors=True)
+        if not current and not any(os.stat(os.path.join(mirror_dir, f)).st_nlink > 1 for f in os.listdir(mirror_dir)):
+            shutil.rmtree(mirror_dir)
 
 
 def link_into(src: str, dst: str) -> None:

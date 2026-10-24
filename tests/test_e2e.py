@@ -334,9 +334,10 @@ def test_template_build_and_run(backend_kind, require_sandbox, daemon_only):
     template = None
     try:
         template = (Template(name).from_alpine_image()
+            .run_cmd("command -v nc >/dev/null && nc -w5 1.1.1.1 80 </dev/null")
             .run_cmd(f"! nc -w2 {BRIDGE_IP} {port} </dev/null")
             .run_cmd("! nc -w2 169.254.169.254 80 </dev/null")
-            .run_cmd("test ! -S /var/run/docker.sock; touch /tmp/template-built")
+            .run_cmd("test ! -S /var/run/docker.sock && touch /tmp/template-built")
             .build(timeout=1200))
         info = api.get(f"{BASE_URL}/templates/{template.template_id}").json()["template"]
         assert info["tenant"] == "default", info

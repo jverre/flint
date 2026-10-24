@@ -175,6 +175,8 @@ class MigrationNetwork:
               }}
             }}\n'''
             self._ns(ns, "nft", "-f", "-", input=rules)
+            from ._limits import network_limits
+            network_limits(ns, "tap0")
             return ns, "tap0"
         except Exception:
             _delete_netns(ns)

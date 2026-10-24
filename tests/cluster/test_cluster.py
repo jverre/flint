@@ -116,9 +116,13 @@ def test_paused_vm_resumes_on_another_host(cluster, hosts, make_vm):
 
 def test_host_crash_recovers_vms_by_availability_class(cluster, hosts, make_vm):
     vms = {a: make_vm(on="b", availability=a) for a in ("ephemeral", "restartable", "durable")}
+    wait_for(lambda: state(vms["durable"]).get("checkpoint_at"), 30, "the durable VM's first automatic checkpoint")
     for a, v in vms.items():
         v.write_file("/root/marker", a)
-    wait_for(lambda: state(vms["durable"]).get("checkpoint_at"), 30, "the durable VM's first checkpoint")
+    # An automatic checkpoint may predate the writes. Complete a new one
+    # after them so the recovery assertion has a known recovery point.
+    checkpoint = cluster.api.post(f"/vms/{vms['durable'].id}/checkpoint")
+    assert checkpoint.status_code == 200, checkpoint.text
     hosts["b"].crash()
     t0 = time.time()
     try:
@@ -147,7 +151,8 @@ def test_hung_agent_is_fenced_before_its_vms_are_recovered(cluster, hosts, make_
     durable = make_vm(on="b", availability="durable")
     ephemeral = make_vm(on="b")
     durable.write_file("/root/marker", "durable")
-    wait_for(lambda: state(durable).get("checkpoint_at"), 30, "the durable VM's first checkpoint")
+    checkpoint = cluster.api.post(f"/vms/{durable.id}/checkpoint")
+    assert checkpoint.status_code == 200, checkpoint.text
     pid = state(durable)["pid"]
     # Started right before the hang, most likely between two heartbeats: it
     # must be fenced from the moment it exists, not from the next heartbeat.
@@ -193,7 +198,8 @@ def test_restarted_agent_kills_vms_whose_lease_lapsed(cluster, hosts, make_vm):
     elsewhere must not keep running here."""
     durable = make_vm(on="b", availability="durable")
     durable.write_file("/root/marker", "durable")
-    wait_for(lambda: state(durable).get("checkpoint_at"), 30, "the durable VM's first checkpoint")
+    checkpoint = cluster.api.post(f"/vms/{durable.id}/checkpoint")
+    assert checkpoint.status_code == 200, checkpoint.text
     old_pid = state(durable)["pid"]
     for p in (hosts["b"].agent, hosts["b"].snapd):
         p.kill()

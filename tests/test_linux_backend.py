@@ -69,7 +69,16 @@ def test_vmm_runs_unprivileged_in_its_jail(sandbox, backend_kind):
         group = Path(ChJail(sandbox.id).cgroup)
     else:
         group = Path("/sys/fs/cgroup") / config.JAILER_PARENT_CGROUP / sandbox.id
+    from flint.core._limits import verify_process
+    verify_process(str(group), pid)
     assert "max" not in (group / "cpu.max").read_text()
     assert "max" not in (group / "memory.max").read_text()
     limits = (group / "io.max").read_text()
     assert f"rbps={DISK_BPS}" in limits and f"wbps={DISK_BPS}" in limits, limits
+
+
+    # Restored VMMs must be placed and constrained just like a fresh boot.
+    sandbox.pause()
+    sandbox.resume()
+    verify_process(str(group), sandbox.pid)
+    assert "max" not in (group / "memory.max").read_text()

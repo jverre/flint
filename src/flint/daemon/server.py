@@ -243,6 +243,8 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         tmpl = _template_for(principal, template_id)
         if tmpl is None or (tmpl.get("tenant") and tmpl["tenant"] != tenant):
             raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
+        if tmpl.get("status", "ready") != "ready":
+            raise HTTPException(409, "Template is not ready")
     snapshot = data.get("snapshot")
     template_snapshot = data.get("template_snapshot")
     if (vm_id or snapshot or template_snapshot) and not daemon.cluster:
@@ -815,26 +817,40 @@ def _start_template_build(body: dict, request: Request):
             visible = _template_for(principal, template_id) is not None
             raise HTTPException(status_code=409 if visible else 403,
                                 detail=f"Template '{template_id}' already exists" + ("" if visible else " for another tenant"))
-        claim_template(template_id, name, tenant)
+    from flint.core._build_job import Admission, BuildBusy
+    try:
+        admission = Admission()
+    except BuildBusy as exc:
+        raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from exc
+    try:
+        if not daemon.cluster:
+            claim_template(template_id, name, tenant)
+        else:
+            daemon.cluster.forget_template(template_id)
+    except Exception:
+        admission.release()
+        raise
     print(f"POST /templates/build — building {template_id}...")
-
-    if daemon.cluster:
-        daemon.cluster.forget_template(template_id)  # a rebuild gets published again
 
     def _run_build():
         try:
-            daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
-            if not daemon.cluster:
-                # Builds re-create a template's entry if it went meanwhile: keep the owner.
-                claim_template(template_id, name, tenant)
+            with admission:
+                daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
             print(f"Template {template_id} built successfully")
         except Exception as e:
             print(f"Template {template_id} build failed: {e}")
             log.exception("Template build failed: %s", template_id)
+        finally:
+            with _template_build_lock:
+                _build_threads.pop(template_id, None)
 
     t = threading.Thread(target=_run_build, daemon=True, name=f"build-{template_id}")
-    t.start()
-    _build_threads[template_id] = t
+    try:
+        t.start()
+        _build_threads[template_id] = t
+    except Exception:
+        admission.release()
+        raise
 
     return {"template_id": template_id, "status": "building"}
 
@@ -1267,10 +1283,6 @@ class FlintDaemon:
     def kill_vm(self, vm_id: str) -> None:
         """Delete a sandbox (running or paused) and everything it holds."""
         mgr = self.manager
-        if self.storage:
-            entry = mgr.get_entry(vm_id)
-            veth_ip = (entry.backend_metadata or {}).get("veth_ip", "") if entry else ""
-            self.storage.teardown_sandbox(vm_id, veth_ip)
         mgr.kill(vm_id)
         if self.cluster:
             self.cluster.forget_pause(vm_id)
@@ -1378,7 +1390,7 @@ class FlintDaemon:
     def _init_manager(self) -> None:
         self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
         self.volumes = Volumes(self._state_store._conn, self.manager, self._state_store)
-        self.manager.kill_hooks.append(self._release_mounts)
+        self.manager.kill_hooks.extend((self._release_mounts, self._release_storage))
         self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [], self.backend.usage)
         _events.vm_tenant = lambda vm_id: (self.manager.get_dict(vm_id) or {}).get("tenant", "")
         _write_state(self)
@@ -1387,28 +1399,28 @@ class FlintDaemon:
         for m in self.volumes.release_vm(vm_id):
             _events.publish("volume.detached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
 
+    def _release_storage(self, vm_id: str) -> None:
+        if self.storage:
+            row = self._state_store.get_sandbox(vm_id) or {}
+            meta = json.loads(row.get("backend_meta_json") or "{}")
+            self.storage.teardown_sandbox(vm_id, meta.get("veth_ip", ""))
+
     def _recover_sandboxes(self) -> None:
         if not self._state_store or not self.manager:
             return
         if self.backend.kind.startswith("linux-"):
             from flint.core._builder import cleanup_abandoned_builders
+            from flint.core._build_job import recover_builds
+            recover_builds()
             cleanup_abandoned_builders()
         from flint.core._recovery import RecoveryEngine
         engine = RecoveryEngine(self._state_store, self.manager)
         report = engine.recover()
         if self.backend.kind.startswith("linux-"):
             from flint.core._netns import reconcile_namespace
-            from flint.core._limits import cgroup_limits
-            from flint.core import config
-            from flint.core._ch_jail import ChJail
             for row in self._state_store.list_active():
-                if row["state"] not in ("Running", "Paused"):
-                    continue
-                reconcile_namespace(row["ns_name"], proxy=bool(row.get("network_policy_json")))
-                if row["state"] == "Running":
-                    group = ChJail(row["vm_id"]).cgroup if self.backend.kind == "linux-cloud-hypervisor" else f"/sys/fs/cgroup/{config.JAILER_PARENT_CGROUP}/{row['vm_id']}"
-                    cpus, memory = self.backend.vm_resources()
-                    cgroup_limits(group, os.path.join(row["vm_dir"], "rootfs.ext4"), vcpus=cpus, memory_mib=memory)
+                if row["state"] in ("Running", "Paused"):
+                    reconcile_namespace(row["ns_name"], proxy=bool(row.get("network_policy_json")))
         self.manager.refresh_tenant_networks()
         print(f"Recovery: {report}")
 

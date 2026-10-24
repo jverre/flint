@@ -38,12 +38,32 @@ class RecoveryEngine:
 
         log.info("Recovery: found %d active sandbox(es) to probe", len(active))
         daemon_pid = os.getpid()
+        if self._manager._backend.kind.startswith("linux-"):
+            from ._limits import prepare_recovered
+            prepare_recovered(self._manager._backend, active)
 
         for row in active:
             vm_id = row["vm_id"]
+            if row["state"] in (SandboxState.DELETING.value, SandboxState.ERROR.value):
+                # Cleanup intent survives restart. Never reclaim it as serving.
+                try:
+                    self._manager.kill(vm_id)
+                    report.dead_cleaned += 1
+                except Exception:
+                    log.exception("[%s] deletion retained for retry during recovery", vm_id[:8])
+                continue
             probe, entry = self._manager._backend.recover_row(row)
 
             if probe == "alive" and entry is not None:
+                if self._manager._backend.kind.startswith("linux-"):
+                    from ._limits import enforce_recovered
+                    try:
+                        enforce_recovered(self._manager._backend, row)
+                    except Exception:
+                        self._store.transition_state(vm_id, SandboxState.DELETING, detail="recovery enforcement failed")
+                        self._manager.kill(vm_id)
+                        log.exception("[%s] recovered VM could not be confined", vm_id[:8])
+                        continue
                 entry.tenant = row.get("tenant") or ""
                 entry.availability = row.get("availability") or ""
                 with self._manager._lock:

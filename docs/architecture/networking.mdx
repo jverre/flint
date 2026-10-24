@@ -68,13 +68,13 @@ Bridge ports stay isolated. Routes send peer traffic through the host, which che
 
 ## Resource ceilings
 
-Both Linux backends require native `nftables`, `tc` from `iproute2`, and cgroup v2 with the CPU, memory, IO and PID controllers. VM root disks must live on a local block-backed filesystem where `io.max` can enforce a limit. Startup fails if these boundaries cannot be configured.
+Both Linux backends require native `nftables`, `tc` from `iproute2`, and cgroup v2 with the CPU, memory, IO and PID controllers. Firecracker root disks require a local block-backed filesystem for `io.max`. Cloud Hypervisor also configures its virtio-block limiter, including for shared NFS/CEPH root disks. Fresh and recovered processes must belong to their configured cgroup before they are served; recovery rejects a shared-disk VM whose disk limiter cannot be verified. Startup fails if these boundaries cannot be configured.
 
 Each VMM gets CPU and memory ceilings, a 512-task ceiling, and a root-disk IO limit. The guest's TAP shapes inbound traffic and polices outbound traffic, including storage traffic. Host settings apply to every VM:
 
 | Environment variable | Default | Unit |
 | --- | --- | --- |
-| `FLINT_DISK_BYTES_PER_SECOND` | `104857600` | Read and write bytes per second on the root-disk backing device |
+| `FLINT_DISK_BYTES_PER_SECOND` | `104857600` | Bytes per second through the root-disk limiter (Cloud Hypervisor also limits shared disks) |
 | `FLINT_NETWORK_BYTES_PER_SECOND` | `12500000` | Bytes per second in each network direction |
 
 Values must be positive integers. These limits complement tenant quotas; shared storage is also bounded by the VM's network ceiling.

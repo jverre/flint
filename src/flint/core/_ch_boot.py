@@ -95,11 +95,13 @@ class ChBootResult:
 
 def _build_vm_config() -> dict:
     """``vm.create`` body for a fresh boot, in chroot paths. The NIC is added via ``vm.add-net``."""
+    from ._limits import ch_disk_limiter
     return {
         "cpus": {"boot_vcpus": CH_CPU_COUNT, "max_vcpus": CH_CPU_COUNT},
         "memory": {"size": CH_MEMORY_BYTES, "shared": True},
         "payload": {"kernel": JAIL_KERNEL, "cmdline": CH_BOOT_ARGS},
-        "disks": [{"path": JAIL_ROOTFS, "readonly": False, "direct": bool(os.environ.get("FLINT_SHARED_ROOTFS_DIR"))}],
+        "disks": [{"path": JAIL_ROOTFS, "readonly": False, "direct": bool(os.environ.get("FLINT_SHARED_ROOTFS_DIR")),
+                   "rate_limiter_config": ch_disk_limiter()}],
         "serial": {"mode": "Tty"},
         "console": {"mode": "Off"},
     }
@@ -122,6 +124,18 @@ def _boot_fresh(jail: ChJail, ns_name: str, tap_name: str) -> None:
 
 
 def _restore(jail: ChJail, ns_name: str, tap_name: str, jail_snapshot_dir: str) -> None:
+    import json
+    from ._limits import ch_disk_limiter
+    from ._jailfs import copy_within
+    path = jail.host_path(jail_snapshot_dir + "/config.json")
+    # Golden config is an immutable hard link shared with other VMs.
+    copy_within(path, path, CH_UID, CH_UID)
+    with open(path) as stream:
+        vm_config = json.load(stream)
+    for disk in vm_config.get("disks", []):
+        disk["rate_limiter_config"] = ch_disk_limiter()
+    with open(path, "w") as stream:
+        json.dump(vm_config, stream)
     if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
         _ch.vm_restore(jail.socket_path, f"file://{jail_snapshot_dir}")
         _ch.vm_resume(jail.socket_path)
@@ -433,6 +447,8 @@ def ch_create_golden_snapshot(template_dir: str) -> None:
     jail = ChJail(vm_id)
     ns_name = _ch_ns_name(vm_id[len("golden-"):])
     tap_name = ch_tap_for_ns(ns_name)
+    from ._build_job import register_vm
+    register_vm(vm_id, ns_name, "linux-cloud-hypervisor")
     process = None
     t0 = time.monotonic()
     try:

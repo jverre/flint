@@ -46,7 +46,7 @@ def _fc_status_ok(resp: str) -> bool:
     return status_line.startswith("HTTP/1.1 2")
 
 
-def _wait_for_api_socket(socket_path: str, timeout: float = 5.0, *, process=None, log_path: str = "") -> None:
+def _wait_for_api_socket(socket_path: str, timeout: float = 5.0, *, process=None, log_path: str = "", vm_id: str = "") -> None:
     def failure(message: str) -> str:
         if log_path:
             try:
@@ -65,6 +65,9 @@ def _wait_for_api_socket(socket_path: str, timeout: float = 5.0, *, process=None
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             connect_unix(s, socket_path)
+            if vm_id:
+                from ._limits import verify_process, vm_cgroup
+                verify_process(vm_cgroup(vm_id, "linux-firecracker"), process.pid)
             return
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             if time.monotonic() - t0 > timeout:

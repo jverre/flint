@@ -27,6 +27,7 @@ def test_private_files_are_wiped_before_removal(tmp_path, monkeypatch):
             seen["disk"] = f.read()
         real_rmtree(path, **kw)
 
+    os.link(disk, tmp_path / "vm" / "disk-alias")
     monkeypatch.setattr(_wipe.shutil, "rmtree", look_then_remove)
     _wipe.wipe_tree(str(tmp_path / "vm"), "vm-1")
 
@@ -52,18 +53,22 @@ def test_private_files_are_wiped_before_removal(tmp_path, monkeypatch):
     assert not os.path.exists(retry)
 
 
-def test_shared_and_outside_files_are_never_touched(tmp_path):
+def test_shared_and_outside_files_are_never_touched(tmp_path, monkeypatch):
     shared = _write(tmp_path / "shared" / "kernel", b"shared kernel")
     outside = _write(tmp_path / "host" / "passwd", b"host file")
     jail = tmp_path / "jail"
     os.makedirs(jail)
-    os.link(shared, jail / "kernel")  # how read-only artifacts enter a jail
+    from flint.core import config
+    from flint.core._artifacts import shared_readonly
+    mirror = tmp_path / "mirrors"
+    monkeypatch.setattr(config, "JAILER_SHARED_DIR", str(mirror))
+    os.link(shared_readonly(shared, str(mirror)), jail / "kernel")  # how read-only artifacts enter a jail
     os.symlink(outside, jail / "planted")  # what a jailed VMM could leave behind
 
     # Another VM can still be running a shared VMM executable at deletion.
     binary = tmp_path / "shared" / "sleep"
     shutil.copy2(shutil.which("sleep"), binary)
-    os.link(binary, jail / "vmm")
+    os.link(shared_readonly(str(binary), str(mirror), mode=0o555), jail / "vmm")
     process = subprocess.Popen([str(binary), "60"])
     try:
         _wipe.wipe_tree(str(jail), "vm-2")
@@ -89,12 +94,12 @@ def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(tmp_path, mo
         _write(tmp_path / "jail" / "x" / name, b"vm data")
     real = _wipe._wipe_fd
 
-    def swap_then_wipe(fd):
+    def swap_then_wipe(fd, **kwargs):
         x = tmp_path / "jail" / "x"
         if not x.is_symlink():  # after the first file, x points at the host
             os.rename(x, tmp_path / "jail" / "moved")
             os.symlink(host, x)
-        return real(fd)
+        return real(fd, **kwargs)
 
     monkeypatch.setattr(_wipe, "_wipe_fd", swap_then_wipe)
     _wipe.wipe_tree(str(tmp_path / "jail"), "vm-3")

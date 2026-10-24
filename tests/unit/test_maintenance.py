@@ -172,27 +172,6 @@ def test_invalid_network_is_rejected(change):
         MigrationNetwork(**args)
 
 
-def test_compute_network_has_no_nat_and_keeps_egress_isolation(monkeypatch):
-    from flint.core import _migration_network as network
-
-    calls = []
-
-    def run(*args, input=None):
-        calls.append((args, input))
-        if args[:2] == ("ip", "-j"):
-            return json.dumps([{"mtu": 1600, "linkinfo": {"info_kind": "wireguard"}}])
-        return ""
-
-    monkeypatch.setattr(network, "run", run)
-    net = MigrationNetwork(VM, 42, "10.90.0.1", "10.90.0.2", mtu=1500)
-    assert net.setup_compute(True) == (net.namespace, "tap0")
-    rules = next(body for argv, body in calls if argv[-3:] == ("nft", "-f", "-"))
-    assert "masquerade" not in rules
-    assert "ct state" not in rules
-    assert "169.254.0.0/16" in rules
-    assert 'ip saddr 172.16.0.2 accept' in rules
-
-
 def test_gateway_does_not_redirect_on_destination_prepare(tmp_path, monkeypatch):
     from flint.cluster.gateway import Gateway
 

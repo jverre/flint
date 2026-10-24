@@ -112,43 +112,21 @@ def _find_init_net_sh() -> str:
 
 
 def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
-    log.info("Extracting rootfs from %s (%d MB) ...", image_tag, size_mb)
-
-    # Create empty ext4 image
-    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
-    subprocess.run(["mkfs.ext4", "-F", "-m", "0", rootfs_path], check=True, capture_output=True)
-
-    # Mount, export docker filesystem, unmount
-    mount_dir = tempfile.mkdtemp(prefix="flint-rootfs-mount-")
-    try:
-        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
-
-        # Create container, export, extract
-        result = subprocess.run(
-            ["docker", "create", image_tag],
-            check=True, capture_output=True, text=True,
-        )
-        container_id = result.stdout.strip()
+    """Export the fixed trusted appliance without creating host mounts."""
+    with tempfile.TemporaryDirectory(prefix="export-", dir=os.path.dirname(rootfs_path)) as directory:
+        container = "flint-appliance-" + os.environ["FLINT_BUILD_JOB"]
+        subprocess.run(["docker", "create", "--name", container, image_tag], check=True, capture_output=True)
         try:
-            export_proc = subprocess.Popen(
-                ["docker", "export", container_id],
-                stdout=subprocess.PIPE,
-            )
-            subprocess.run(
-                ["tar", "-x", "-C", mount_dir],
-                stdin=export_proc.stdout,
-                check=True,
-            )
-            rc = export_proc.wait()
-            if rc != 0:
-                raise RuntimeError(f"docker export failed with exit code {rc}")
+            with subprocess.Popen(["docker", "export", container], stdout=subprocess.PIPE) as export:
+                subprocess.run(["tar", "-xf", "-", "-C", directory], stdin=export.stdout, check=True)
+                export.stdout.close()
+                if export.wait() != 0:
+                    raise RuntimeError("Trusted appliance export failed")
+            with open(rootfs_path, "wb") as disk:
+                disk.truncate(size_mb << 20)
+            subprocess.run(["mkfs.ext4", "-F", "-m", "0", "-d", directory, rootfs_path], check=True, capture_output=True)
         finally:
-            subprocess.run(["docker", "rm", container_id], capture_output=True)
-    finally:
-        subprocess.run(["umount", mount_dir], check=True, capture_output=True)
-        os.rmdir(mount_dir)
-
-    log.info("Rootfs extracted to %s", rootfs_path)
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=30)
 
 
 def build_template(
@@ -162,7 +140,8 @@ def build_template(
     Returns template_id.
     """
     template_id = _slugify(name)
-    template_dir = f"{TEMPLATES_DIR}/{template_id}"
+    from ._build_job import output_dir
+    template_dir = output_dir(template_id)
     os.makedirs(template_dir, exist_ok=True)
 
     # Register as "building"
@@ -175,7 +154,7 @@ def build_template(
         rootfs_size_mb=rootfs_size_mb,
     )
 
-    context_dir = tempfile.mkdtemp(prefix="flint-build-")
+    context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
     try:
         log.info("[%s] Build started (rootfs_size_mb=%d)", template_id, rootfs_size_mb)
 
@@ -208,7 +187,8 @@ def build_template(
         )
 
         # Update status
-        update_template_artifact_status(template_id, "linux-firecracker", "ready")
+        if not os.environ.get("FLINT_BUILD_JOB"):
+            update_template_artifact_status(template_id, "linux-firecracker", "ready")
 
         # Cleanup
 

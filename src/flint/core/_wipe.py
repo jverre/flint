@@ -8,9 +8,9 @@ back to it freed and, on a disk mounted with ``discard``, trimmed. Where
 holes aren't supported the data is overwritten with zeros instead. A file
 counts as wiped once no data is left in it.
 
-Only regular files with a single link are touched: shared read-only files
-(kernel, VMM binary, template snapshots) are hard-linked into each jail,
-and are left alone. Symlinks are never followed and other mounts never
+Shared read-only artifacts are identified by the host's immutable mirror
+inventory. Private inodes are wiped once even with several in-tree names;
+unexpected external links fail cleanup rather than leaving data behind. Symlinks are never followed and other mounts never
 entered, so nothing outside the directory can be reached.
 
 This protects data left on the host's disk; it is no substitute for
@@ -27,6 +27,8 @@ import shutil
 import stat
 import struct
 import threading
+from collections import Counter
+from pathlib import Path
 
 from .config import log
 
@@ -87,34 +89,50 @@ def _overwrite(fd: int, length: int) -> None:
     os.fsync(fd)
 
 
-def _wipe_fd(fd: int) -> int:
-    """Discard the data of the open file ``fd`` if it is a private regular file.
-    Returns the bytes it held."""
+def _shared_inodes() -> set[tuple[int, int]]:
+    """Only artifacts retained in the host-owned immutable mirror are shared."""
+    from .config import JAILER_SHARED_DIR
+    found = set()
+    root = Path(JAILER_SHARED_DIR)
+    if not root.exists():
+        return found
+    for directory in root.iterdir():
+        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_uid != 0:
+            continue
+        for path in directory.iterdir():
+            st = path.lstat()
+            if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o222:
+                found.add((st.st_dev, st.st_ino))
+    return found
+
+
+def _wipe_fd(fd: int, *, links: int = 1) -> int:
     st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+    if not stat.S_ISREG(st.st_mode):
         return 0
+    if st.st_nlink > links:
+        raise WipeError("Private file has links outside the deletion tree; retaining for cleanup")
     held = st.st_blocks * 512
-    if held == 0:
-        os.fsync(fd)
-        return 0
-    if not (_punch_hole(fd, st.st_size) and not _has_data(fd, st.st_size)):
+    if held and not (_punch_hole(fd, st.st_size) and not _has_data(fd, st.st_size)):
         _overwrite(fd, st.st_size)
     os.fsync(fd)
     return held
 
 
-def _open_file(name: str, dir_fd: int | None = None) -> int | None:
+def _open_file(name: str, dir_fd: int | None = None, *, shared=frozenset()) -> int | None:
     try:
-        # Shared VMM executables cannot be opened for writing while another
-        # VM runs them (ETXTBSY). Reject them before opening; _wipe_fd checks
-        # the opened inode again to handle replacement during this check.
         st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) in shared:
             return None
-        return os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
+        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) in shared:
+            os.close(fd)
+            return None
+        return fd
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ELOOP, errno.ENXIO, errno.ENODEV):
-            return None  # gone, a symlink, socket or device
+            return None
         raise
 
 
@@ -141,21 +159,38 @@ def wipe_tree(path: str, vm_id: str = "") -> None:
     if not path or not os.path.lexists(path):
         return
     files = wiped = 0
+    shared = _shared_inodes()
+    links = Counter()
+    visited = set()
     try:
         if os.path.isdir(path) and not os.path.islink(path):
             root_dev = os.lstat(path).st_dev
             def failed(exc):
                 raise exc
 
+            # Count every in-tree alias before changing data. Unknown links
+            # outside the tree are retained rather than wiped or silently skipped.
+            for _, _, names, directory in os.fwalk(path, follow_symlinks=False, onerror=failed):
+                if os.fstat(directory).st_dev != root_dev:
+                    raise WipeError(f"Refusing to wipe mounted filesystem under {path}")
+                for name in names:
+                    st = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode):
+                        links[(st.st_dev, st.st_ino)] += 1
             for _dirpath, dirnames, filenames, dir_fd in os.fwalk(path, follow_symlinks=False, onerror=failed):
                 if os.fstat(dir_fd).st_dev != root_dev:
                     raise WipeError(f"Refusing to wipe mounted filesystem under {path}")
                 for name in filenames:
-                    fd = _open_file(name, dir_fd)
+                    fd = _open_file(name, dir_fd, shared=shared)
                     if fd is None:
                         continue
                     try:
-                        n = _wipe_fd(fd)
+                        st = os.fstat(fd)
+                        inode = (st.st_dev, st.st_ino)
+                        if inode in visited:
+                            continue
+                        n = _wipe_fd(fd, links=links[inode])
+                        visited.add(inode)
                     finally:
                         os.close(fd)
                     if n:

@@ -147,5 +147,5 @@ class Template:
                         status="ready",
                     )
                 if status in ("failed", "error"):  # a daemon says failed, a cluster error
-                    raise RuntimeError(f"Template build failed: {template_id}")
+                    raise RuntimeError(f"Template build failed: {template_id}: {info.get('error') or 'see daemon log'}")
             time.sleep(poll_interval)

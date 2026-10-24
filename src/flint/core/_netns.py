@@ -98,10 +98,12 @@ def _create_netns(ns_name: str) -> None:
 
 
 def _delete_netns(ns_name: str) -> None:
-    try:
+    if not ns_name:
+        return
+    if os.path.exists(f"/var/run/netns/{ns_name}"):
         pynetns.remove(ns_name)
-    except Exception:
-        pass
+    if os.path.exists(f"/var/run/netns/{ns_name}"):
+        raise RuntimeError(f"Namespace {ns_name} still exists; retaining its address")
     _release_veth_ip(ns_name)
 
 

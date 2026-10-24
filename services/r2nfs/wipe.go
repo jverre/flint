@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,13 +30,16 @@ func wipeFile(path string) (int64, error) {
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return 0, err
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Size == 0 {
-		return 0, nil
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return 0, fmt.Errorf("refusing to wipe non-private regular file %s", path)
+	}
+	if st.Size == 0 {
+		return 0, f.Sync()
 	}
 	held := st.Blocks * 512
 	if unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, 0, st.Size) == nil {
 		if _, err := unix.Seek(int(f.Fd()), 0, unix.SEEK_DATA); errors.Is(err, unix.ENXIO) {
-			return held, nil // nothing left but holes
+			return held, f.Sync() // durability is required on the discard fast path too
 		}
 	}
 	zeros := make([]byte, 1<<20)

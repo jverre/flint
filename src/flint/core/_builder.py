@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import gzip
+import fcntl
 import hashlib
 import json
 import os
@@ -17,24 +18,19 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import re
 import urllib.request
 import uuid
 
 from . import config
+from ._limits import ch_disk_limiter
 from ._artifacts import sparse_copy, shared_readonly
 from ._firecracker import _fc_put, _fc_status_ok, _wait_for_api_socket, _wait_for_agent
 from ._jailer import JailSpec, build_jailer_command, cleanup_jailer, make_private
 from ._netns import (_setup_netns_pyroute2, _apply_netns_firewall, _strip_ns_prefix,
                      _enter_netns, _restore_netns, _delete_netns, open_tap_fd)
 
-_bootstrap_lock = threading.Lock()
-_concurrency = int(os.environ.get("FLINT_BUILD_CONCURRENCY", "1"))
-if not 1 <= _concurrency <= 4:
-    raise ValueError("FLINT_BUILD_CONCURRENCY must be between 1 and 4")
-_build_slots = threading.BoundedSemaphore(_concurrency)
 _MEMORY_MIB = 2048
 _CPUS = 2
 _TIMEOUT = 900
@@ -83,7 +79,8 @@ def _appliance() -> str:
     from ._template_build import _build_flintd, _find_init_net_sh, _extract_rootfs
     root = Path(config.DATA_DIR) / ".builder"
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with _bootstrap_lock, tempfile.TemporaryDirectory(prefix="bootstrap-", dir=root) as context:
+    with (root / ".lock").open("w") as lock, tempfile.TemporaryDirectory(prefix=f"prepare-{os.environ['FLINT_BUILD_JOB']}-", dir=root) as context:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         _build_flintd(os.path.join(context, "flintd"))
         shutil.copy2(_find_init_net_sh(), os.path.join(context, "init-net.sh"))
         key = hashlib.sha256(_APPLIANCE_DOCKERFILE.encode() + Path(context, "flintd").read_bytes()
@@ -97,9 +94,10 @@ def _appliance() -> str:
         config.log.info("Builder appliance %s: preparing trusted image", key)
         try:
             subprocess.run(["docker", "build", "-t", tag, context], check=True, capture_output=True, timeout=300)
-            _extract_rootfs(tag, str(path) + ".tmp", 4096)
-            os.chmod(str(path) + ".tmp", 0o600)
-            os.replace(str(path) + ".tmp", path)
+            disk = Path(context) / "appliance.ext4"
+            _extract_rootfs(tag, str(disk), 4096)
+            os.chmod(disk, 0o600)
+            os.replace(disk, path)
             config.log.info("Builder appliance %s: ready in %.1fs", key, time.monotonic() - started)
         except subprocess.CalledProcessError as exc:
             detail = ((exc.stdout or b"") + (exc.stderr or b""))[-4096:].decode(errors="replace")
@@ -119,7 +117,9 @@ def _vm(kind: str, disk_mb: int):
     jail = None
     spec = None
     marker = _marker(vm_id)
-    marker.write_text(json.dumps({"ns": ns, "kind": kind}))
+    from ._build_job import register_vm, _atomic
+    register_vm(vm_id, ns, kind)
+    _atomic(marker, {"ns": ns, "kind": kind})
     os.chmod(marker, 0o600)
     started = time.monotonic()
     config.log.info("Builder %s: starting %s VM", vm_id, kind)
@@ -147,7 +147,7 @@ def _vm(kind: str, disk_mb: int):
             with open(f"{spec.chroot_base}/builder.log", "w") as log:
                 process = subprocess.Popen(build_jailer_command(spec, vcpus=_CPUS, memory_mib=_MEMORY_MIB),
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-            _wait_for_api_socket(spec.socket_path_on_host, process=process, log_path=f"{spec.chroot_base}/builder.log")
+            _wait_for_api_socket(spec.socket_path_on_host, process=process, log_path=f"{spec.chroot_base}/builder.log", vm_id=spec.vm_id)
             requests = [("/machine-config", {"vcpu_count": _CPUS, "mem_size_mib": _MEMORY_MIB}),
                         ("/boot-source", {"kernel_image_path": "vmlinux", "boot_args": config.BOOT_ARGS}),
                         ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": True, "is_read_only": False}),
@@ -164,7 +164,7 @@ def _vm(kind: str, disk_mb: int):
                 "cpus": {"boot_vcpus": _CPUS, "max_vcpus": _CPUS},
                 "memory": {"size": _MEMORY_MIB << 20},
                 "payload": {"kernel": "/vmlinux", "cmdline": CH_BOOT_ARGS},
-                "disks": [{"path": "/rootfs.ext4"}], "serial": {"mode": "Tty"}, "console": {"mode": "Off"}})
+                "disks": [{"path": "/rootfs.ext4", "rate_limiter_config": ch_disk_limiter()}], "serial": {"mode": "Tty"}, "console": {"mode": "Off"}})
             fd = open_tap_fd(ns, tap)
             try:
                 ch.vm_add_net(jail.socket_path, {"id": "eth0", "mac": config.GUEST_MAC}, fd)
@@ -197,11 +197,23 @@ def _request(ns: str, path: str, data: bytes | None = None, timeout: int = 60):
         _restore_netns(old)
 
 
+class _BoundedReader:
+    def __init__(self, response, maximum: int):
+        self.response, self.remaining = response, maximum
+
+    def read(self, size=-1):
+        data = self.response.read(min(size if size >= 0 else self.remaining + 1, self.remaining + 1))
+        self.remaining -= len(data)
+        if self.remaining < 0:
+            raise RuntimeError("Builder compressed artifact exceeded its size bound")
+        return data
+
+
 def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb: int) -> None:
     """Build an artifact inside a fresh VM, and wipe the builder on every path."""
     if kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
         raise ValueError("Isolated template builds require a Linux hypervisor")
-    with _build_slots, _vm(kind, size_mb) as ns:
+    with _vm(kind, size_mb) as ns:
         def run(cmd: str, timeout: int = 60, *, stage: str):
             started = time.monotonic()
             config.log.info("Builder %s: %s", ns, stage)
@@ -242,7 +254,7 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
             # disk over the guest's rate-limited link. Decompression remains
             # bounded by the exact expected artifact size below.
             with _request(ns, "/files?path=/artifact.ext4.gz", timeout=300) as response, \
-                    gzip.GzipFile(fileobj=response) as artifact, open(tmp, "xb") as dest:
+                    gzip.GzipFile(fileobj=_BoundedReader(response, expected + expected // 100 + 65536)) as artifact, open(tmp, "xb") as dest:
                 left = expected
                 while left:
                     chunk = artifact.read(min(left, 1 << 20))

@@ -568,6 +568,9 @@ class LinuxCloudHypervisorBackend(HostBackend):
         return "alive", entry
 
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+        if not os.environ.get("FLINT_BUILD_JOB"):
+            from flint.core._build_job import run_build
+            return run_build(self.kind, name, dockerfile, rootfs_size_mb)
         """Build a CH template: Docker build -> rootfs extraction -> golden snapshot -> register."""
         from flint.core._template_build import (
             _build_flintd,
@@ -581,7 +584,8 @@ class LinuxCloudHypervisorBackend(HostBackend):
         from flint.core.config import TEMPLATES_DIR
 
         template_id = _slugify(name)
-        template_dir = f"{TEMPLATES_DIR}/{template_id}"
+        from flint.core._build_job import output_dir
+        template_dir = output_dir(template_id)
         os.makedirs(template_dir, exist_ok=True)
 
         register_template_artifact(
@@ -594,7 +598,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         )
 
         import tempfile
-        context_dir = tempfile.mkdtemp(prefix="flint-ch-build-")
+        context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
 
         try:
             _build_flintd(os.path.join(context_dir, "flintd"))
@@ -609,7 +613,9 @@ class LinuxCloudHypervisorBackend(HostBackend):
             build_rootfs(self.kind, dockerfile, context_dir, rootfs_path, rootfs_size_mb)
             ch_create_golden_snapshot(template_dir)
 
-            update_template_artifact_status(template_id, self.kind, "ready")
+            # The supervisor publishes only after worker cleanup and durable output.
+            if not os.environ.get("FLINT_BUILD_JOB"):
+                update_template_artifact_status(template_id, self.kind, "ready")
 
 
             log.info("CH template %s built successfully", template_id)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import functools
+import weakref
 import time
 from typing import TYPE_CHECKING, Callable
 
@@ -43,6 +45,15 @@ def _extract_transform_rules(policy: dict) -> dict:
     return rules
 
 
+def _vm_operation(method):
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        vm_id = args[0] if args else kwargs.get("sandbox_id", kwargs.get("vm_id"))
+        with self._operation_lock(vm_id):
+            return method(self, *args, **kwargs)
+    return run
+
+
 class SandboxManager:
     """Owns all sandbox state and lifecycle. No TUI dependencies."""
 
@@ -52,9 +63,18 @@ class SandboxManager:
         self._lock = threading.Lock()
         self._delete_lock = threading.RLock()
         self._network_lock = threading.RLock()
+        self._operation_locks = weakref.WeakValueDictionary()
         self._state_store = state_store
         # Called with the sandbox ID just before a sandbox is killed.
         self.kill_hooks: list[Callable[[str], None]] = []
+
+    def _operation_lock(self, vm_id: str):
+        with self._lock:
+            lock = self._operation_locks.get(vm_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._operation_locks[vm_id] = lock
+            return lock
 
     def refresh_tenant_networks(self) -> None:
         if not self._backend.kind.startswith("linux-") or not self._state_store:
@@ -63,7 +83,7 @@ class SandboxManager:
         with self._network_lock:
             groups: dict[tuple[str, str], list[str]] = {}
             for row in self._state_store.list_active():
-                if not row.get("ns_name") or row["state"] == SandboxState.ERROR.value:
+                if not row.get("ns_name") or row["state"] in (SandboxState.ERROR.value, SandboxState.DELETING.value):
                     continue
                 tenant = row.get("tenant") or "default"
                 key = ("tenant", tenant) if self._state_store.tenant_network(tenant) else ("vm", row["ns_name"])
@@ -99,6 +119,7 @@ class SandboxManager:
         )
         return self._register_boot(boot, template_id, network_policy, tenant, availability)
 
+    @_vm_operation
     def restore(self, vm_id: str, src_dir: str, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, network_policy: dict | None = None, tenant: str = "", availability: str = "") -> str:
         """Start ``vm_id`` from a snapshot of another VM (paused, checkpointed or
         forked, possibly on another host) restored into ``src_dir``."""
@@ -112,6 +133,7 @@ class SandboxManager:
         boot = self._backend.import_snapshot(vm_id, src_dir, allow_internet_access=allow_internet_access)
         return self._register_boot(boot, template_id, network_policy, tenant, availability)
 
+    @_vm_operation
     def checkpoint(self, sandbox_id: str, snapshot: Callable[[str, dict[str, str]], object]) -> object:
         """Snapshot a running sandbox without stopping it (see BackendPlugin.checkpoint)."""
         with self._lock:
@@ -123,6 +145,10 @@ class SandboxManager:
         return self._backend.checkpoint(entry, snapshot)
 
     def _register_boot(self, boot, template_id: str, network_policy: dict | None, tenant: str, availability: str) -> str:
+        with self._operation_lock(boot.vm_id):
+            return self._register_boot_locked(boot, template_id, network_policy, tenant, availability)
+
+    def _register_boot_locked(self, boot, template_id, network_policy, tenant, availability):
         vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
         agent_url = boot.agent_url
 
@@ -214,6 +240,7 @@ class SandboxManager:
 
         return vm_id
 
+    @_vm_operation
     def kill(self, sandbox_id: str) -> None:
         with self._delete_lock:
             self._kill(sandbox_id)
@@ -221,45 +248,47 @@ class SandboxManager:
     def _kill(self, sandbox_id: str) -> None:
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
+        row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
+        if not entry and (not row or row["state"] == SandboxState.DEAD.value):
+            return
         if entry:
-            entry.state = SandboxState.ERROR
+            entry.state = SandboxState.DELETING
             entry.agent_healthy = False
         if self._state_store:
-            self._state_store.transition_state(sandbox_id, SandboxState.ERROR, detail="deletion pending")
-        # Revoke peer ACLs before releasing a bridge address for reuse.
-        self.refresh_tenant_networks()
-        for hook in self.kill_hooks:
-            hook(sandbox_id)
-        if not entry:
-            row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
-            if row and row["state"] in (SandboxState.PAUSED.value, SandboxState.ERROR.value):
-                self._backend.discard_paused(row)
-                self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
-                self._report_wiped(sandbox_id)
-            return
-
-        # Stop credential proxy before tearing down the VM
-        if entry.proxy:
-            try:
-                entry.proxy.stop()
-            except Exception:
-                pass
-
+            if row and row["state"] != SandboxState.DELETING.value:
+                self._state_store.transition_state(sandbox_id, SandboxState.DELETING, detail="deletion pending")
+            self._state_store.update_sandbox(sandbox_id, deletion_attempt_at=time.time())
         try:
-            self._backend.kill(entry)
+            # A firewall failure must not prevent the VMM from stopping.
+            if self._backend.kind.startswith("linux-"):
+                from ._limits import stop_processes, vm_cgroup
+                pid = entry.pid if entry else row.get("pid", 0)
+                root = entry.vm_dir if entry else row["vm_dir"]
+                stop_processes(vm_cgroup(sandbox_id, self._backend.kind), pid=pid, root=root,
+                               process=entry.process if entry else None)
+                if entry:
+                    entry.process = None
+                    entry.pid = 0
+                if self._state_store:
+                    self._state_store.update_sandbox(sandbox_id, pid=0)
+            # Revoke peer addresses before any namespace/address is released.
+            self.refresh_tenant_networks()
+            if entry and entry.proxy:
+                entry.proxy.stop()
+            for hook in self.kill_hooks:
+                hook(sandbox_id)
+            if entry:
+                self._backend.kill(entry)
+            elif row:
+                self._backend.discard_paused({**row, "pid": 0})
         except Exception as exc:
-            entry.state = SandboxState.ERROR
-            entry.agent_healthy = False
             if self._state_store:
-                self._state_store.transition_state(sandbox_id, SandboxState.ERROR, detail=str(exc))
-            raise
-
+                self._state_store.update_sandbox(sandbox_id, error_message=str(exc))
+            raise _wipe.WipeError(f"Deletion pending for {sandbox_id}; retry cleanup: {exc}") from exc
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
-
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
-        self.refresh_tenant_networks()
         self._report_wiped(sandbox_id)
 
     @staticmethod
@@ -273,6 +302,7 @@ class SandboxManager:
         except Exception:
             pass
 
+    @_vm_operation
     def pause(self, sandbox_id: str) -> None:
         """Pause a running sandbox: snapshot state to disk, kill process."""
         from ._firecracker import _fc_patch, _fc_put, _fc_status_ok
@@ -291,6 +321,7 @@ class SandboxManager:
 
         log.debug("[%s] paused", sandbox_id[:8])
 
+    @_vm_operation
     def resume(self, sandbox_id: str) -> str:
         """Resume a paused sandbox from its snapshot."""
         if not self._state_store:
@@ -382,7 +413,7 @@ class SandboxManager:
             dicts = [entry.to_dict() for entry in self._sandboxes.values()]
             live = set(self._sandboxes)
         if self._state_store:
-            for row in self._state_store.list_in_state(SandboxState.PAUSED):
+            for row in self._state_store.list_active():
                 if row["vm_id"] not in live:
                     dicts.append(self._row_dict(row))
         return dicts
@@ -433,13 +464,15 @@ class SandboxManager:
     def get_entry(self, sandbox_id: str) -> _SandboxEntry | None:
         """Return the raw entry for a VM. None if not found."""
         with self._lock:
-            return self._sandboxes.get(sandbox_id)
+            entry = self._sandboxes.get(sandbox_id)
+            return entry if entry and entry.state != SandboxState.DELETING else None
 
     def vm_ids(self) -> list[str]:
         """Return list of all VM IDs."""
         with self._lock:
             return list(self._sandboxes.keys())
 
+    @_vm_operation
     def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
         """Replace the network policy (credential injection rules) of a sandbox.
 
@@ -448,8 +481,8 @@ class SandboxManager:
         """
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        if not entry or entry.state != SandboxState.RUNNING:
+            raise RuntimeError(f"Sandbox {sandbox_id} is not running")
         policy = _secrets.keep_unchanged(policy, entry.network_policy)
 
         # Apply first: a policy that can't be applied isn't recorded.

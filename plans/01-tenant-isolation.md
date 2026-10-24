@@ -103,8 +103,7 @@ passed as an fd. Cgroup *limits* are part of item 6.
 
 ### 6. Resource limits and quotas
 
-*Quotas and per-VM limits implemented. Both backends require cgroup v2 and
-local block-backed root disks; kernel `tc` enforces network ceilings on the
+*Quotas and per-VM limits implemented. Both backends require cgroup v2; Firecracker uses block-backed root disks and Cloud Hypervisor also limits shared disks through virtio-block; kernel `tc` enforces network ceilings on the
 guest TAP, including storage traffic.*
 
 - Per-VM IO and network rate limits (both VMMs support rate limiters).
