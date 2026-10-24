@@ -22,6 +22,13 @@ log() { printf '[flint-install] %s\n' "$*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 case "$ROLE" in server|host) ;; *) echo "FLINT_ROLE must be server or host" >&2; exit 1 ;; esac
 
+if [ "$ROLE" = host ]; then
+  : "${FLINT_HOST_KERNEL:?pin the exact approved host kernel release}"
+  : "${FLINT_HYPERVISOR_VERSION:?pin the approved hypervisor release}"
+  [ "$(uname -r)" = "$FLINT_HOST_KERNEL" ] || { echo "running host kernel differs from approved image" >&2; exit 1; }
+  [[ "$FLINT_HYPERVISOR_VERSION" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "hypervisor release must be pinned" >&2; exit 1; }
+fi
+
 log "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -49,8 +56,21 @@ else
   fi
 fi
 
+# Runtime code and its environment never change beneath a running agent.
+COMMIT=$(git -C "$SRC" rev-parse HEAD)
+RELEASE="/opt/flint/releases/$COMMIT"
+if [ ! -d "$RELEASE/src" ]; then
+  mkdir -p "$RELEASE"
+  stage="$RELEASE/src.tmp-$$"
+  mkdir "$stage"
+  git -C "$SRC" archive "$COMMIT" | tar -x -C "$stage"
+  mv "$stage" "$RELEASE/src"
+fi
+SRC="$RELEASE/src"
+
 log "flint-cluster"
-(cd "$SRC/cluster" && go build -trimpath -o /usr/local/bin/flint-cluster ./cmd/flint-cluster)
+(cd "$SRC/cluster" && go build -trimpath -o /usr/local/bin/.flint-cluster-new ./cmd/flint-cluster)
+mv -Tf /usr/local/bin/.flint-cluster-new /usr/local/bin/flint-cluster
 
 mkdir -p /etc/flint
 [ -f /etc/flint/flint.env ] || cp "$SRC/deploy/flint.env.example" /etc/flint/flint.env
@@ -63,6 +83,7 @@ if [ "$ROLE" = server ]; then
   for f in /etc/flint/*.key; do [ -e "$f" ] && chgrp flint "$f" && chmod 640 "$f"; done
   systemctl daemon-reload
   systemctl enable --now flint-server.service
+  systemctl try-restart flint-server.service
   log "control plane started: journalctl -u flint-server"
   exit 0
 fi
@@ -75,16 +96,16 @@ if ! command -v uv >/dev/null; then
   curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >/dev/null
 fi
 log "flint (python)"
-(cd "$SRC" && UV_PROJECT_ENVIRONMENT=/opt/flint/venv uv sync -q --no-dev --frozen)
-ln -sf /opt/flint/venv/bin/flint /usr/local/bin/flint
+(cd "$SRC" && UV_PROJECT_ENVIRONMENT="$RELEASE/venv" uv sync -q --no-dev --frozen)
 
 log "r2nfs (volumes)"
 (cd "$SRC/services/r2nfs" && go build -trimpath -o r2nfs .)
 
 log "hypervisor and guest kernel"
-INSTALL_DIR=/usr/local/bin KERNEL_DIR=/root/firecracker-vm bash "$SRC/scripts/install-deps.sh"
 if [ "$BACKEND" = cloud-hypervisor ]; then
-  flint install-deps --backend cloud-hypervisor --skip-kernel
+  "$RELEASE/venv/bin/flint" install-deps --backend cloud-hypervisor --version "$FLINT_HYPERVISOR_VERSION"
+else
+  FC_VERSION="$FLINT_HYPERVISOR_VERSION" INSTALL_DIR=/usr/local/bin KERNEL_DIR=/root/firecracker-vm bash "$SRC/scripts/install-deps.sh"
 fi
 
 if [ ! -f /root/firecracker-vm/rootfs.ext4 ]; then
@@ -102,5 +123,20 @@ if grep -q '^FLINT_WATCHDOG_DEVICE=/dev/watchdog' /etc/flint/flint.env && [ ! -e
 fi
 
 systemctl daemon-reload
-systemctl enable --now flint-agent.service flint-snapd.path
+# Prepare the upgrade while the old agent still renews normally. A missing
+# snapd handover API or active VM operation aborts before stopping the agent.
+if systemctl is-active --quiet flint-agent.service; then
+  "$RELEASE/venv/bin/flint" agent-handover || {
+    echo "handover refused; old agent left running. Settle VM operations and upgrade snapd separately before retrying." >&2
+    exit 1
+  }
+fi
+ln -s "$RELEASE/venv/bin/flint" /usr/local/bin/.flint-new-$$
+mv -Tf /usr/local/bin/.flint-new-$$ /usr/local/bin/flint
+systemctl enable --now flint-snapd.path
+if systemctl is-active --quiet flint-agent.service; then
+  systemctl restart flint-agent.service
+else
+  systemctl enable --now flint-agent.service
+fi
 log "host agent started: journalctl -u flint-agent -u flint-snapd"

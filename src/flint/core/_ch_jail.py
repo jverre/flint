@@ -76,6 +76,10 @@ class ChJail:
         os.mknod(kvm, 0o600 | stat.S_IFCHR, os.makedev(10, 232))
         os.chown(kvm, config.CH_UID, config.CH_UID)
         os.mknod(self.host_path("/dev/urandom"), 0o444 | stat.S_IFCHR, os.makedev(1, 9))
+        if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+            os.mkdir(self.host_path("/dev/net"))
+            os.mknod(self.host_path("/dev/net/tun"), 0o600 | stat.S_IFCHR, os.makedev(10, 200))
+            os.chown(self.host_path("/dev/net/tun"), config.CH_UID, config.CH_UID)
         os.link(shared_readonly(_ch_binary(), JAILER_SHARED_DIR, mode=0o555), self.host_path(JAIL_BINARY))
         os.link(shared_readonly(config.KERNEL_PATH, JAILER_SHARED_DIR), self.host_path(JAIL_KERNEL))
 
@@ -126,6 +130,13 @@ class ChJail:
             f.write(str(pid))
 
     def cleanup(self) -> None:
+        marker = f"{self.base}/shared-rootfs"
+        if os.path.exists(marker):
+            target = self.host_path(JAIL_ROOTFS)
+            # Never lazily unmount a disk a VMM might still be using.
+            if subprocess.run(["mountpoint", "-q", target]).returncode == 0:
+                subprocess.run(["umount", target], check=True, capture_output=True, timeout=30)
+            os.unlink(marker)
         shutil.rmtree(self.base, ignore_errors=True)
         try:
             os.rmdir(self.cgroup)

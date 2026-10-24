@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable
 
 from . import _secrets
 from .backends.base import HostBackend
+from . import config
 from .config import log, DEFAULT_TEMPLATE_ID
 from .types import _SandboxEntry, SandboxState
 
@@ -59,6 +60,13 @@ class SandboxManager:
         ``vm_id`` is chosen by the caller in a cluster (the control plane),
         so a VM keeps its ID when it moves between hosts.
         """
+        if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+            if not config.CLUSTER_MODE:
+                raise ValueError("shared root disks require cluster ownership and fencing")
+            if self._backend.kind != "linux-cloud-hypervisor":
+                raise ValueError("shared root disks require Cloud Hypervisor")
+            if network_policy or config.STORAGE_BACKEND != "local":
+                raise ValueError("migration networking requires rootfs-local workspaces and no host-local credential proxy")
         boot = self._backend.create(
             template_id=template_id,
             allow_internet_access=allow_internet_access,
@@ -122,6 +130,15 @@ class SandboxManager:
             availability=availability,
         )
 
+        try:
+            disk_mb = (os.stat(os.path.join(boot.vm_dir, "rootfs.ext4")).st_size + (1 << 20) - 1) // (1 << 20)
+        except OSError:
+            disk_mb = 0
+        entry.backend_metadata["resources"] = {
+            "vcpus": config.CH_CPU_COUNT if entry.backend_kind == "linux-cloud-hypervisor" else 1,
+            "memory_mb": config.CH_MEMORY_BYTES // (1 << 20) if entry.backend_kind == "linux-cloud-hypervisor" else 128,
+            "disk_mb": disk_mb,
+        }
         # Warmup: send a quick exec to measure time-to-interactive.
         t0 = time.monotonic()
         try:

@@ -9,7 +9,9 @@ import (
 
 // placeReq describes what a new (or moved) VM needs from a host.
 type placeReq struct {
-	TemplateID string
+	ReservationVM string
+	Resources     Resources
+	TemplateID    string
 	// SnapshotID: the VM restores from this snapshot, so the host must be of
 	// the snapshot's host class; hosts that cache it score higher.
 	SnapshotID string
@@ -41,6 +43,8 @@ func (s *Server) eligibility(h *Host, active int, req placeReq, tmplSnaps map[st
 		return "excluded"
 	case h.State != HostReady:
 		return "host " + h.State
+	case h.HandoverToken != "":
+		return "agent handover"
 	case h.Cordoned:
 		return "cordoned"
 	case nowMs()-h.LastHeartbeat > s.cfg.LeaseTTL.Milliseconds():
@@ -51,9 +55,11 @@ func (s *Server) eligibility(h *Host, active int, req placeReq, tmplSnaps map[st
 		return "different host class"
 	case h.maxVMs() > 0 && active >= h.maxVMs():
 		return fmt.Sprintf("full (%d/%d VMs)", active, h.maxVMs())
-	case h.Capacity.MemAvailableMB > 0 && h.Capacity.MemAvailableMB < minFreeMemMB:
+	case h.Capacity.VCPUs > 0 && active*max(1, h.Capacity.VMVCPUs)+max(1, req.Resources.VCPUs)+h.Capacity.ReserveVCPUs > h.Capacity.VCPUs:
+		return "low CPU"
+	case h.Capacity.MemAvailableMB > 0 && h.Capacity.MemAvailableMB < max(minFreeMemMB, h.Capacity.ReserveMemoryMB)+req.Resources.MemoryMB:
 		return "low memory"
-	case h.Capacity.DiskFreeMB > 0 && h.Capacity.DiskFreeMB < minFreeDiskMB:
+	case h.Capacity.DiskFreeMB > 0 && h.Capacity.DiskFreeMB < max(minFreeDiskMB, h.Capacity.ReserveDiskMB)+req.Resources.DiskMB:
 		return "low disk"
 	}
 	if req.TemplateID != "" && req.TemplateID != "default" && req.SnapshotID == "" {
@@ -94,6 +100,9 @@ func spreadDomain(h *Host, spread string) string {
 func (s *Server) candidates(ctx context.Context, req placeReq) ([]*Host, error) {
 	hosts, err := s.listHosts(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.subtractDrainReservations(ctx, hosts, req.ReservationVM); err != nil {
 		return nil, err
 	}
 	active, err := s.activeCounts(ctx)
@@ -199,4 +208,38 @@ func (s *Server) peersFor(ctx context.Context, snapshotID, exclude string) []str
 		}
 	}
 	return out
+}
+
+// Reservations are durable and visible to every control-plane replica. A move
+// may consume its own reservation, while unrelated creates cannot consume it.
+func (s *Server) subtractDrainReservations(ctx context.Context, hosts []*Host, ownVM string) error {
+	rows, err := s.db.Query(ctx, `SELECT target_host,COUNT(*),SUM(vcpus),SUM(memory_mb),SUM(disk_mb) FROM drain_reservations WHERE vm_id <> ? GROUP BY target_host`, ownVM)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var slots, cpu int
+		var mem, disk int64
+		if err := rows.Scan(&id, &slots, &cpu, &mem, &disk); err != nil {
+			return err
+		}
+		for _, h := range hosts {
+			if h.ID == id {
+				// Collapse zero/negative into explicit exhaustion, never unknown.
+				h.Capacity.MemAvailableMB = max(1, h.Capacity.MemAvailableMB-mem)
+				h.Capacity.DiskFreeMB = max(1, h.Capacity.DiskFreeMB-disk)
+				h.Capacity.ReserveVCPUs += cpu
+				limit := h.maxVMs()
+				if limit > 0 {
+					h.MaxVMs = max(1, limit-slots)
+					if slots >= limit {
+						h.Cordoned = true
+					}
+				}
+			}
+		}
+	}
+	return rows.Err()
 }

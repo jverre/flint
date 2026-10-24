@@ -195,7 +195,9 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
             raise HTTPException(status_code=507, detail="host is full")
 
     def _create() -> str:
-        vm_id = _start()
+        from flint.core._shared_rootfs import disk_replacement
+        with disk_replacement(bool(data.get("replace_shared_disk",False)) and daemon.cluster is not None):
+            vm_id = _start()
         if daemon.cluster:
             try:
                 daemon.cluster.fence_started(vm_id)
@@ -267,6 +269,30 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         _logs.append(vm_id, f"  timing.{step} = {ms:.1f} ms")
     print(f"POST /vms — created {vm_id[:8]}")
     return {"vm": result}
+
+
+@app.post("/vms/{vm_id}/live-migration/{action}")
+def live_migration(vm_id: str, action: str, body: dict):
+    daemon = _get_daemon()
+    if not daemon.cluster:
+        raise HTTPException(409, "live migration requires a cluster host")
+    migration = daemon.cluster.migration
+    try:
+        if action == "prepare":
+            return migration.prepare(vm_id,body)
+        if action == "send":
+            return migration.send(vm_id,body)
+        if action == "status":
+            return migration.status(vm_id)
+        if action == "abort":
+            return migration.abort(vm_id)
+        if action == "rollback":
+            return migration.rollback(vm_id)
+        if action == "commit":
+            return migration.commit(vm_id)
+        raise ValueError("unknown migration action")
+    except Exception as exc:
+        raise HTTPException(409,str(exc)) from exc
 
 
 @app.get("/vms")
@@ -775,6 +801,9 @@ def list_mounts(vm_id: str):
 @app.post("/vms/{vm_id}/mounts")
 def mount_volume(vm_id: str, body: dict):
     """Mount a volume (or a subpath of it) into a running sandbox."""
+    entry = _require_manager().get_entry(vm_id)
+    if entry and entry.backend_metadata.get("maintenance",{}).get("root_disk"):
+        raise HTTPException(409,"host-local volumes are incompatible with migration networking")
     m = _volume_call(
         _require_volumes().mount, vm_id, body.get("volume"), body.get("path"),
         body.get("subpath", ""), body.get("readonly", False), body.get("exclusive", False),

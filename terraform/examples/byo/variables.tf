@@ -65,3 +65,16 @@ variable "flint_ref" {
   type    = string
   default = "main"
 }
+
+variable "host_image" {
+  description = "Immutable identity of the externally provisioned Ubuntu host image."
+  type        = string
+}
+variable "host_kernel" {
+  description = "Exact running kernel release and flavour of that image."
+  type        = string
+}
+variable "hypervisor_version" {
+  description = "Pinned hypervisor release."
+  type        = string
+}

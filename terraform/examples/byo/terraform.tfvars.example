@@ -8,3 +8,8 @@ database_url            = "postgres://flint:secret@10.0.0.20:5432/flint?sslmode=
 store_url               = "s3://flint-snapshots/prod"
 store_access_key_id     = "AKIA..."
 store_secret_access_key = "..."
+
+# Pin these to the approved image you provisioned, after checking Livepatch coverage.
+host_image = "ubuntu-24.04-approved-image-sha256"
+host_kernel = "6.8.0-101-generic"
+hypervisor_version = "v1.15.0"

@@ -39,14 +39,6 @@ data "aws_subnets" "zones" {
   }
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
-  }
-}
 
 locals {
   subnets       = [for z in var.zones : data.aws_subnets.zones[z].ids[0]]
@@ -234,7 +226,7 @@ module "server" {
 
 resource "aws_launch_template" "server" {
   name_prefix            = "${var.name}-server-"
-  image_id               = data.aws_ami.ubuntu.id
+  image_id               = var.ubuntu_ami_id
   instance_type          = var.server_instance_type
   user_data              = base64encode(module.server.user_data)
   vpc_security_group_ids = [aws_security_group.server.id]
@@ -264,21 +256,25 @@ resource "aws_autoscaling_group" "server" {
 # ── hosts: one group per zone ─────────────────────────────────────────────
 
 module "host" {
-  source       = "../../modules/flint-cloudinit"
-  for_each     = toset(var.zones)
-  role         = "host"
-  flint_ref    = var.flint_ref
-  backend      = var.backend
-  store_url    = local.store_url
-  store_region = var.region
-  join_token   = module.pki.join_token
-  zone         = each.value
+  source             = "../../modules/flint-cloudinit"
+  for_each           = toset(var.zones)
+  role               = "host"
+  flint_ref          = contains(var.canary_zones, each.value) && var.canary_host != null ? var.canary_host.flint_ref : var.flint_ref
+  backend            = var.backend
+  store_url          = local.store_url
+  store_region       = var.region
+  join_token         = module.pki.join_token
+  zone               = each.value
+  host_image         = contains(var.canary_zones, each.value) && var.canary_host != null ? var.canary_host.ami_id : var.ubuntu_ami_id
+  host_kernel        = contains(var.canary_zones, each.value) && var.canary_host != null ? var.canary_host.kernel : var.host_kernel
+  hypervisor_version = contains(var.canary_zones, each.value) && var.canary_host != null ? var.canary_host.hypervisor_version : var.hypervisor_version
+  rollout_group      = contains(var.canary_zones, each.value) ? "canary" : "stable"
 }
 
 resource "aws_launch_template" "host" {
   for_each               = toset(var.zones)
   name_prefix            = "${var.name}-host-"
-  image_id               = data.aws_ami.ubuntu.id
+  image_id               = contains(var.canary_zones, each.value) && var.canary_host != null ? var.canary_host.ami_id : var.ubuntu_ami_id
   instance_type          = var.host_instance_type
   user_data              = base64encode(module.host[each.value].user_data)
   vpc_security_group_ids = [aws_security_group.host.id]

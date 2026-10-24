@@ -16,7 +16,7 @@ output "install_script" {
 
 output "install_command" {
   description = "Run on the machine after writing env_file (and the CA files on servers)."
-  value       = "sudo env FLINT_ROLE=${var.role} FLINT_REF=${var.flint_ref} FLINT_REPO=${var.flint_repo} FLINT_BACKEND=${var.backend} bash /opt/flint/install.sh"
+  value       = "sudo env FLINT_ROLE=${var.role} FLINT_REF=${var.flint_ref} FLINT_REPO=${var.flint_repo} FLINT_BACKEND=${var.backend} FLINT_HOST_KERNEL=${var.host_kernel} FLINT_HYPERVISOR_VERSION=${var.hypervisor_version} bash /opt/flint/install.sh"
 }
 
 output "pki_files" {

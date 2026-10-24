@@ -83,3 +83,31 @@ variable "destroy_snapshots_with_cluster" {
   type        = bool
   default     = false
 }
+
+variable "ubuntu_ami_id" {
+  description = "Pinned Canonical Ubuntu AMI for this region. Promote an explicitly tested image; no automatic latest lookup."
+  type        = string
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]+$", var.ubuntu_ami_id))
+    error_message = "Provide an explicit Ubuntu AMI ID."
+  }
+}
+variable "host_kernel" {
+  description = "Exact running kernel release of the approved host image, including flavour. Livepatch support must be verified for this exact kernel."
+  type        = string
+}
+variable "hypervisor_version" {
+  description = "Explicit hypervisor release, e.g. v46.0 for Cloud Hypervisor; never latest."
+  type        = string
+}
+variable "canary_zones" {
+  description = "Zones designated for canary hosts. Apply and rehearse their image changes before stable hosts."
+  type        = list(string)
+  default     = []
+}
+
+variable "canary_host" {
+  description = "Candidate host image/kernel/VMM/source applied only to canary_zones. Promote these exact values to stable after maintenance rehearsals pass."
+  type        = object({ ami_id = string, kernel = string, hypervisor_version = string, flint_ref = string })
+  default     = null
+}

@@ -74,6 +74,14 @@ var errNoCapacity = errors.New("capacity_exhausted")
 // placeAndCreate picks a host for v (already inserted, state pending) and
 // creates it there, trying the next candidate if a host is full or fails.
 func (s *Server) placeAndCreate(ctx context.Context, v *VM, req placeReq, snap *snapshotRef) (*Host, map[string]any, error) {
+	lock, err := s.lockVM(ctx, "_placement", vmLockWait)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer lock.Release()
+	ctx = lock.ctx
+	req.ReservationVM = v.ID
+	req.Resources = vmResources(v)
 	if req.TemplateID == "" {
 		req.TemplateID = v.TemplateID
 	}
@@ -96,7 +104,8 @@ func (s *Server) placeAndCreate(ctx context.Context, v *VM, req placeReq, snap *
 			return nil, nil, err
 		}
 		cr := createOnHostReq{
-			VMID: v.ID, Tenant: v.Tenant, TemplateID: v.TemplateID, AllowInternet: v.Spec.AllowInternet,
+			ReplaceSharedDisk: snap != nil || v.State == VMRecovering,
+			VMID:              v.ID, Tenant: v.Tenant, TemplateID: v.TemplateID, AllowInternet: v.Spec.AllowInternet,
 			NetworkPolicy: v.Spec.NetworkPolicy, Availability: v.Availability,
 			TimeoutSecs: v.Spec.TimeoutSecs, TimeoutPolicy: v.Spec.TimeoutPolicy,
 		}
@@ -209,6 +218,21 @@ func (s *Server) lockedVM(ctx context.Context, id, kind string, wait time.Durati
 		run.end(err)
 		return nil, nil, err
 	}
+	guard, gerr := s.lockVM(run.ctx(), "_placement", vmLockWait)
+	if gerr != nil {
+		run.end(gerr)
+		return nil, nil, gerr
+	}
+	if v.HostID != "" {
+		host, herr := s.getHost(guard.ctx, v.HostID)
+		if (herr != nil && !isNotFound(herr)) || (herr == nil && host.HandoverToken != "" && host.HandoverUntil > nowMs()) {
+			guard.Release()
+			err := &apiError{http.StatusConflict, "host agent upgrade in progress or host unavailable"}
+			run.end(err)
+			return nil, nil, err
+		}
+	}
+	guard.Release()
 	return run, v, nil
 }
 
@@ -484,7 +508,7 @@ func (s *Server) migrateLocked(run *opRun, v *VM, target string, reason string) 
 		return &apiError{http.StatusConflict, fmt.Sprintf("VM is %s", apiState(v.State))}
 	}
 	// Check there is somewhere to go before stopping it.
-	req := placeReq{TemplateID: v.TemplateID, HostClass: src.HostClass, Backend: src.Backend, Exclude: map[string]bool{src.ID: true}}
+	req := placeReq{ReservationVM: v.ID, Resources: vmResources(v), TemplateID: v.TemplateID, HostClass: src.HostClass, Backend: src.Backend, Exclude: map[string]bool{src.ID: true}}
 	if target != "" {
 		for _, h := range mustHosts(s.listHosts(ctx)) {
 			if h.ID != target {
@@ -494,6 +518,13 @@ func (s *Server) migrateLocked(run *opRun, v *VM, target string, reason string) 
 	}
 	if _, err := s.candidates(ctx, req); err != nil {
 		return fmt.Errorf("%w: %s", errNoCapacity, strings.TrimPrefix(err.Error(), "capacity_exhausted: "))
+	}
+	if meta := liveMaintenance(v); meta["root_disk"] != nil {
+		cands, err := s.candidates(ctx, req)
+		if err != nil {
+			return err
+		}
+		return s.liveMigrate(run, v, src, cands[0], reason)
 	}
 	t0 := time.Now()
 	snapID := "move-" + uuid.NewString()

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -138,6 +139,10 @@ func (r *opRun) end(err error) {
 		state, msg := OpSucceeded, ""
 		if err != nil {
 			state, msg = OpFailed, err.Error()
+			var retry retryOperation
+			if errors.As(err, &retry) {
+				state = OpRunning
+			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -219,6 +224,14 @@ func (s *Server) finishInterrupted(r *opRun) error {
 	}
 	if err != nil {
 		return err
+	}
+	if v.HostID != "" {
+		if h, err := s.getHost(ctx, v.HostID); err == nil && h.HandoverToken != "" && h.HandoverUntil > nowMs() {
+			return retryOperation{fmt.Errorf("host agent upgrade in progress")}
+		}
+	}
+	if op.Kind == OpMigrate && strings.HasPrefix(op.Step, "live_") {
+		return s.finishLive(r, v)
 	}
 	switch op.Kind {
 	case OpCreate:

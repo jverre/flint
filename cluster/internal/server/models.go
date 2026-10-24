@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"github.com/jverre/flint/cluster/internal/db"
 	"strings"
 	"time"
 )
@@ -200,18 +201,28 @@ func (s *Server) updateVM(ctx context.Context, id string, u vmUpdate) error {
 }
 
 func (s *Server) deleteVMRow(ctx context.Context, id string) error {
-	_, err := s.db.Exec(ctx, `DELETE FROM vms WHERE id = ?`, id)
-	return err
+	return s.db.Tx(ctx, func(tx *db.Tx) error {
+		if _, err := tx.Exec(ctx, `DELETE FROM drain_reservations WHERE vm_id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM vms WHERE id = ?`, id)
+		return err
+	})
 }
 
 // Capacity is what a host reports in its heartbeat.
 type Capacity struct {
-	MaxVMs         int   `json:"max_vms"`
-	VCPUs          int   `json:"vcpus"`
-	MemTotalMB     int64 `json:"mem_total_mb"`
-	MemAvailableMB int64 `json:"mem_available_mb"`
-	DiskFreeMB     int64 `json:"disk_free_mb"`
-	NetnsFree      int   `json:"netns_free"`
+	VMVCPUs         int   `json:"vm_vcpus"`
+	VMMemoryMB      int64 `json:"vm_memory_mb"`
+	ReserveVCPUs    int   `json:"reserve_vcpus"`
+	ReserveMemoryMB int64 `json:"reserve_memory_mb"`
+	ReserveDiskMB   int64 `json:"reserve_disk_mb"`
+	MaxVMs          int   `json:"max_vms"`
+	VCPUs           int   `json:"vcpus"`
+	MemTotalMB      int64 `json:"mem_total_mb"`
+	MemAvailableMB  int64 `json:"mem_available_mb"`
+	DiskFreeMB      int64 `json:"disk_free_mb"`
+	NetnsFree       int   `json:"netns_free"`
 }
 
 // HostTemplate is a template a host has locally.
@@ -223,6 +234,9 @@ type HostTemplate struct {
 }
 
 type Host struct {
+	HandoverToken string            `json:"-"`
+	HandoverUntil int64             `json:"handover_until_ms"`
+	PatchState    map[string]any    `json:"patch_state"`
 	ID            string            `json:"id"`
 	Name          string            `json:"name"`
 	AgentURL      string            `json:"agent_url"`
@@ -252,17 +266,18 @@ func (h *Host) maxVMs() int {
 	return h.Capacity.MaxVMs
 }
 
-const hostCols = `id, name, agent_url, snapd_url, zone, labels, backend, host_class, state, cordoned, capacity, cached, templates, version, last_heartbeat, state_since, max_vms, created_at`
+const hostCols = `id, name, agent_url, snapd_url, zone, labels, backend, host_class, state, cordoned, capacity, cached, templates, version, last_heartbeat, state_since, max_vms, created_at, patch_state, handover_token, handover_until`
 
 func scanHost(r scanner) (*Host, error) {
 	var h Host
-	var labels, capacity, cached, templates string
+	var labels, capacity, cached, templates, patchState string
 	var cordoned int
 	if err := r.Scan(&h.ID, &h.Name, &h.AgentURL, &h.SnapdURL, &h.Zone, &labels, &h.Backend, &h.HostClass, &h.State, &cordoned,
-		&capacity, &cached, &templates, &h.Version, &h.LastHeartbeat, &h.StateSince, &h.MaxVMs, &h.CreatedAt); err != nil {
+		&capacity, &cached, &templates, &h.Version, &h.LastHeartbeat, &h.StateSince, &h.MaxVMs, &h.CreatedAt, &patchState, &h.HandoverToken, &h.HandoverUntil); err != nil {
 		return nil, err
 	}
 	h.Cordoned = cordoned != 0
+	json.Unmarshal([]byte(patchState), &h.PatchState)
 	json.Unmarshal([]byte(labels), &h.Labels)
 	json.Unmarshal([]byte(capacity), &h.Capacity)
 	json.Unmarshal([]byte(cached), &h.Cached)
@@ -416,9 +431,9 @@ type VMSetSpec struct {
 	MaxSkew int    `json:"max_skew"`
 	// Standby: extra paused replicas kept ready. A lost replica is replaced by
 	// resuming a standby (a snapshot restore) instead of a fresh create.
-	Standby       int    `json:"standby"`
-	AllowInternet *bool  `json:"allow_internet_access,omitempty"`
-	MaxUnavail    int    `json:"max_unavailable"`
+	Standby       int   `json:"standby"`
+	AllowInternet *bool `json:"allow_internet_access,omitempty"`
+	MaxUnavail    int   `json:"max_unavailable"`
 }
 
 type VMSet struct {

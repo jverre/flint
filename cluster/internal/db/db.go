@@ -106,6 +106,15 @@ func (t *Tx) Query(ctx context.Context, q string, args ...any) (*sql.Rows, error
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS drain_reservations (
+    vm_id TEXT PRIMARY KEY,
+    source_host TEXT NOT NULL,
+    target_host TEXT NOT NULL,
+    vcpus INTEGER NOT NULL,
+    memory_mb BIGINT NOT NULL,
+    disk_mb BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -268,6 +277,9 @@ func (d *DB) eventsTable() string {
 // adds them to existing databases.
 var addedColumns = []struct{ table, column, def string }{
 	{"hosts", "max_vms", "INTEGER NOT NULL DEFAULT 0"},
+	{"hosts", "patch_state", "TEXT NOT NULL DEFAULT '{}'"},
+	{"hosts", "handover_token", "TEXT NOT NULL DEFAULT ''"},
+	{"hosts", "handover_until", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 func (d *DB) addColumns(ctx context.Context, exec func(context.Context, string, ...any) (sql.Result, error)) error {

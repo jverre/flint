@@ -43,6 +43,7 @@ from .config import (
     CH_CPU_COUNT,
     CH_MEMORY_BYTES,
     CH_GOLDEN_DIR,
+    CH_UID,
     DEFAULT_TEMPLATE_ID,
     GUEST_MAC,
     SOURCE_ROOTFS,
@@ -86,6 +87,7 @@ class ChBootResult:
     agent_url: str
     tap_name: str
     veth_ip: str = ""
+    maintenance: dict = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
     t_total: float = 0.0
 
@@ -94,16 +96,22 @@ def _build_vm_config() -> dict:
     """``vm.create`` body for a fresh boot, in chroot paths. The NIC is added via ``vm.add-net``."""
     return {
         "cpus": {"boot_vcpus": CH_CPU_COUNT, "max_vcpus": CH_CPU_COUNT},
-        "memory": {"size": CH_MEMORY_BYTES},
+        "memory": {"size": CH_MEMORY_BYTES, "shared": True},
         "payload": {"kernel": JAIL_KERNEL, "cmdline": CH_BOOT_ARGS},
-        "disks": [{"path": JAIL_ROOTFS, "readonly": False}],
+        "disks": [{"path": JAIL_ROOTFS, "readonly": False, "direct": bool(os.environ.get("FLINT_SHARED_ROOTFS_DIR"))}],
         "serial": {"mode": "Tty"},
         "console": {"mode": "Off"},
     }
 
 
 def _boot_fresh(jail: ChJail, ns_name: str, tap_name: str) -> None:
-    _ch.vm_create(jail.socket_path, _build_vm_config())
+    vm_config = _build_vm_config()
+    if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+        vm_config["net"] = [{"id": NET_ID, "mac": GUEST_MAC, "tap": tap_name}]
+        _ch.vm_create(jail.socket_path, vm_config)
+        _ch.vm_boot(jail.socket_path)
+        return
+    _ch.vm_create(jail.socket_path, vm_config)
     tap_fd = open_tap_fd(ns_name, tap_name)
     try:
         _ch.vm_add_net(jail.socket_path, {"id": NET_ID, "mac": GUEST_MAC}, tap_fd)
@@ -113,6 +121,10 @@ def _boot_fresh(jail: ChJail, ns_name: str, tap_name: str) -> None:
 
 
 def _restore(jail: ChJail, ns_name: str, tap_name: str, jail_snapshot_dir: str) -> None:
+    if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+        _ch.vm_restore(jail.socket_path, f"file://{jail_snapshot_dir}")
+        _ch.vm_resume(jail.socket_path)
+        return
     tap_fd = open_tap_fd(ns_name, tap_name)
     try:
         _ch.vm_restore(jail.socket_path, f"file://{jail_snapshot_dir}", {NET_ID: tap_fd})
@@ -162,7 +174,7 @@ def ch_boot(
 
     template_dir = _template_dir(template_id)
     snapshot_dir = _snapshot_dir(template_dir)
-    restore = ch_snapshot_ready(template_dir)
+    restore = ch_snapshot_ready(template_dir) and not os.environ.get("FLINT_SHARED_ROOTFS_DIR")
     rootfs_src = os.path.join(snapshot_dir if restore else template_dir, "rootfs.ext4")
     if not os.path.exists(rootfs_src):
         raise RuntimeError(f"cloud-hypervisor rootfs not found: {rootfs_src}")
@@ -172,29 +184,50 @@ def ch_boot(
     process: subprocess.Popen | None = None
     pool_entry_dir = None
 
+    from ._shared_rootfs import configured_pool
+    pool = configured_pool()
+    maintenance = {}
     try:
         jail.prepare()
+        if pool:
+            maintenance["root_disk"] = pool.create(vm_id, rootfs_src, CH_UID)
+            # Marker is outside the chroot, inaccessible to the VMM.
+            with open(f"{jail.base}/shared-rootfs", "x") as marker:
+                marker.write(pool.pool_id)
+            pool.attach(vm_id, jail.host_path(JAIL_ROOTFS))
 
         with _timed(timings, "copy_rootfs_ms"):
             # Pool entries are copies of the snapshot's disk, so only use them
             # when restoring; a fresh boot starts from the template rootfs.
-            if use_pool and restore:
+            if pool:
+                pass
+            elif use_pool and restore:
                 pool_entry_dir = _claim_pool_entry(template_id)
             if pool_entry_dir:
                 link_into(f"{pool_entry_dir}/rootfs.ext4", jail.host_path(JAIL_ROOTFS))
                 shutil.rmtree(pool_entry_dir, ignore_errors=True)
                 pool_entry_dir = None
-            else:
+            elif not pool:
                 sparse_copy(rootfs_src, jail.host_path(JAIL_ROOTFS))
             jail.give(JAIL_ROOTFS)
 
         # Pre-built by the netns pool when available.
         with _timed(timings, "netns_setup_ms"):
-            net = acquire_netns(
-                "ch-", ch_tap_for_ns, allow_internet_access,
-                use_pool=use_pool, use_pyroute2=use_pyroute2,
-            )
-            ns_name, tap_name, veth_ip = net.ns_name, net.tap_name, net.veth_ip
+            if pool:
+                from ._migration_network import configured_network
+                from flint.cluster.gateway import gateway_request
+                network = configured_network(vm_id, maintenance["root_disk"]["vni"])
+                gateway_request("prepare", vm_id, internet=allow_internet_access)
+                ns_name, tap_name = network.setup_compute(allow_internet_access)
+                veth_ip = ""
+                maintenance["network"] = {"vni": network.vni, "gateway": network.gateway_ip,
+                                           "underlay": network.underlay, "mtu": network.mtu}
+            else:
+                net = acquire_netns(
+                    "ch-", ch_tap_for_ns, allow_internet_access,
+                    use_pool=use_pool, use_pyroute2=use_pyroute2,
+                )
+                ns_name, tap_name, veth_ip = net.ns_name, net.tap_name, net.veth_ip
 
         with _timed(timings, "popen_ms"):
             process = jail.spawn(ns_name)
@@ -211,6 +244,9 @@ def ch_boot(
             with _timed(timings, "api_vm_boot_ms"):
                 _boot_fresh(jail, ns_name, tap_name)
 
+        if pool:
+            gateway_request("activate", vm_id)
+            network.announce()
         with _timed(timings, "agent_connect_ms"):
             agent_url = _wait_for_agent(ns_name)
 
@@ -220,6 +256,7 @@ def ch_boot(
 
         return ChBootResult(
             vm_id=vm_id,
+            maintenance=maintenance,
             vm_dir=jail.root,
             chroot_base=jail.base,
             socket_path=jail.socket_path,
@@ -304,14 +341,28 @@ def ch_resume_from_pause(
     use_pyroute2: bool = True,
     allow_internet_access: bool = True,
     veth_ip: str = "",
+    maintenance: dict | None = None,
 ) -> ChBootResult:
     """Restart the jailed VMM and restore from the sandbox's pause snapshot."""
     jail = ChJail(vm_id)
 
+    maintenance = maintenance or {}
+    shared = bool(os.environ.get("FLINT_SHARED_ROOTFS_DIR"))
+    if shared:
+        from ._shared_rootfs import configured_pool
+        from ._migration_network import configured_network
+        from flint.cluster.gateway import gateway_request
+        disk = maintenance.get("root_disk") or configured_pool().descriptor(vm_id)
+        network = configured_network(vm_id,disk["vni"])
+
     # The netns survives pause; it's gone only after a host reboot.
     if not os.path.exists(f"/var/run/netns/{ns_name}"):
-        setup = _setup_netns_pyroute2 if use_pyroute2 else _setup_netns_subprocess
-        veth_ip = setup(ns_name, tap_name, internet=allow_internet_access)
+        if shared:
+            gateway_request("prepare", vm_id, internet=allow_internet_access)
+            ns_name,tap_name = network.setup_compute(allow_internet_access)
+        else:
+            setup = _setup_netns_pyroute2 if use_pyroute2 else _setup_netns_subprocess
+            veth_ip = setup(ns_name, tap_name, internet=allow_internet_access)
 
     timings: dict[str, float] = {}
     t_total = time.monotonic()
@@ -321,6 +372,9 @@ def ch_resume_from_pause(
             process = jail.spawn(ns_name)
         with _timed(timings, "api_vm_restore_ms"):
             _restore(jail, ns_name, tap_name, "/pause")
+        if shared:
+            gateway_request("activate",vm_id)
+            network.announce()
         with _timed(timings, "agent_connect_ms"):
             agent_url = _wait_for_agent(ns_name)
     except Exception:
@@ -337,6 +391,7 @@ def ch_resume_from_pause(
 
     return ChBootResult(
         vm_id=vm_id,
+        maintenance=maintenance,
         vm_dir=jail.root,
         chroot_base=jail.base,
         socket_path=jail.socket_path,
@@ -411,7 +466,7 @@ def ch_create_golden_snapshot(template_dir: str) -> None:
 
 def _machine() -> str:
     """The VM shape baked into a CH snapshot; restores keep it, so changing it means a rebuild."""
-    return f"cpus={CH_CPU_COUNT} memory={CH_MEMORY_BYTES} cmdline={CH_BOOT_ARGS}"
+    return f"shared=on cpus={CH_CPU_COUNT} memory={CH_MEMORY_BYTES} cmdline={CH_BOOT_ARGS}"
 
 
 def ch_create_golden(dest_dir: str = CH_GOLDEN_DIR, source_rootfs: str = SOURCE_ROOTFS) -> None:

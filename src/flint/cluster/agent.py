@@ -34,6 +34,7 @@ from flint.core.types import SandboxState
 from flint.daemon import events as _events
 
 from .snapd import Snapd, SnapdError
+from .maintenance import PatchInventory
 
 HEARTBEAT_INTERVAL = 2.0
 LEASED = ("durable", "restartable")  # availability classes fenced on lease loss
@@ -58,7 +59,15 @@ def host_class(backend) -> str:
         vmm = out.strip().splitlines()[0] if out.strip() else vmm
     except Exception:
         pass
-    return f"{backend.kind}|{cpu}|{platform.release()}|{vmm}"
+    migration = ""
+    if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+        from flint.core._shared_rootfs import configured_pool
+        pool = configured_pool()
+        migration = f"|pool={pool.pool_id}|gateway={os.environ.get('FLINT_MIGRATION_GATEWAY_IP','')}"
+    group = os.environ.get("FLINT_MIGRATION_COMPATIBILITY_GROUP", "")
+    if group and backend.kind == "linux-cloud-hypervisor":
+        return f"{backend.kind}|{cpu}|validated:{group}{migration}"
+    return f"{backend.kind}|{cpu}|{platform.release()}|{vmm}{migration}"
 
 
 def capacity() -> dict:
@@ -85,6 +94,11 @@ def capacity() -> dict:
         "max_vms": max_vms, "vcpus": os.cpu_count() or 1, "mem_total_mb": mem_total,
         "mem_available_mb": mem_avail, "disk_free_mb": disk_free,
         "netns_free": 253 - len(_netns._veth_ips),
+        "vm_vcpus": config.CH_CPU_COUNT if os.environ.get("FLINT_BACKEND") == "cloud-hypervisor" else 1,
+        "vm_memory_mb": max(128, config.CH_MEMORY_BYTES // (1 << 20)) if os.environ.get("FLINT_BACKEND") == "cloud-hypervisor" else 128,
+        "reserve_vcpus": int(os.environ.get("FLINT_RESERVE_VCPUS", "0")),
+        "reserve_memory_mb": int(os.environ.get("FLINT_RESERVE_MEMORY_MB", "256")),
+        "reserve_disk_mb": int(os.environ.get("FLINT_RESERVE_DISK_MB", "1024")),
     }
 
 
@@ -98,6 +112,10 @@ class ClusterAgent:
         self.server = self.identity["server"].rstrip("/")
         self.snapd = Snapd(config.SNAPD_SOCKET)
         self.host_class = host_class(daemon.backend)
+        self._inventory = PatchInventory()
+        from .live_migration import LiveMigration
+        self.migration = LiveMigration(self)
+        self._handover_token = ""
         self.lease_ttl_ms = 15000
         self._events: collections.deque = collections.deque(maxlen=20000)
         self._stop = threading.Event()
@@ -141,6 +159,11 @@ class ClusterAgent:
         os.replace(tmp, path)
 
     def start(self) -> None:
+        if os.path.exists(os.path.join(self.dir, "handover.json")):
+            self._handover_token = self.snapd._call("POST", "/v1/handover/claim", timeout=5).get("token", "")
+            lease = self._load_json(self._lease_path)
+            expires = lease.get("renewed_at", 0.0) + lease.get("ttl_ms", 0) / 1000
+            self._lease_deadline = time.monotonic() + (expires - time.time())
         self._fence_lapsed_leases()
         _events.hooks.append(self._events.append)
         threading.Thread(target=self._heartbeat_loop, daemon=True, name="cluster-heartbeat").start()
@@ -222,9 +245,11 @@ class ClusterAgent:
             cached = []
         resp = self._post("/v1/hosts/self/heartbeat", {
             "version": VERSION,
+            "handover_token": self._handover_token,
             "backend": self.daemon.backend.kind,
             "host_class": self.host_class,
             "capacity": capacity(),
+            "patch_state": self._patch_state(),
             "vms": self._vm_reports(),
             "cached_snapshots": cached,
             "templates": self._template_reports(),
@@ -238,6 +263,9 @@ class ClusterAgent:
         # Persisted so a restarted agent knows whether its leases lapsed meanwhile;
         # backdated to the send time like the fence deadline.
         self._save_json(self._lease_path, {"renewed_at": self.last_lease_ok - (time.monotonic() - sent), "ttl_ms": self.lease_ttl_ms})
+        if self._handover_token:
+            self.snapd._call("DELETE", "/v1/handover", {"token": self._handover_token}, timeout=5)
+            self._handover_token = ""
         for vm_id in resp.get("evict") or []:
             log.info("cluster: evicting %s (owned elsewhere or deleted)", vm_id[:8])
             try:
@@ -255,7 +283,7 @@ class ClusterAgent:
         with self._fence_lock:
             with mgr._lock:
                 leased = [{"vm_id": e.vm_id, "pid": e.pid} for e in mgr._sandboxes.values()
-                          if e.state == SandboxState.RUNNING and e.availability in LEASED and e.pid > 0]
+                          if e.state in (SandboxState.RUNNING, SandboxState.STARTING) and e.availability in LEASED and e.pid > 0]
             remaining = int((self._lease_deadline - time.monotonic()) * 1000)
             if not leased:
                 self.snapd.disarm()
@@ -277,12 +305,22 @@ class ClusterAgent:
         if not self._arm_fence():
             raise RuntimeError("this host's lease has lapsed")
 
+    def _patch_state(self) -> dict:
+        mgr = self.daemon.manager
+        with mgr._lock:
+            processes = {e.vm_id: e.pid for e in mgr._sandboxes.values()
+                         if e.state == SandboxState.RUNNING and e.pid > 1}
+        binary = config.FIRECRACKER_BINARY if self.daemon.backend.kind == "linux-firecracker" else config.CH_BINARY
+        return self._inventory.report(binary, processes)
+
     def _vm_reports(self) -> list[dict]:
         mgr = self.daemon.manager
         out = {}
         with mgr._lock:
             for e in mgr._sandboxes.values():
-                out[e.vm_id] = {"vm_id": e.vm_id, "state": str(e.state)}
+                out[e.vm_id] = {"vm_id": e.vm_id, "state": str(e.state),
+                                "resources": e.backend_metadata.get("resources", {}),
+                                "maintenance": e.backend_metadata.get("maintenance", {})}
         for row in self.daemon._state_store.list_active():
             if row["vm_id"] in out:
                 continue

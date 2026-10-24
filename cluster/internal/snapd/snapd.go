@@ -72,7 +72,8 @@ type Daemon struct {
 	certMu sync.RWMutex
 	cert   *tls.Certificate
 
-	fence fence
+	fence    fence
+	handover handover
 }
 
 // Run starts snapd and blocks until ctx is done.
@@ -123,6 +124,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	os.Chmod(cfg.Socket, 0o600)
+	d.fence.path = filepath.Join(cfg.IdentityDir, "fence.json")
+	d.fence.load()
 	local := &http.Server{Handler: d.localHandler()}
 	go func() { errc <- local.Serve(ln) }()
 
@@ -138,9 +141,8 @@ func Run(ctx context.Context, cfg Config) error {
 
 	go d.storageHeartbeat(ctx)
 	go d.renewLoop(ctx)
-	d.fence.path = filepath.Join(cfg.IdentityDir, "fence.json")
-	d.fence.load()
 	go d.fence.loop(ctx)
+	go d.handoverLoop(ctx)
 	if cfg.WatchdogDevice != "" {
 		go d.watchdog(ctx)
 	}
@@ -175,7 +177,9 @@ func (d *Daemon) currentCert() *tls.Certificate {
 	return d.cert
 }
 
-func (d *Daemon) clientCert(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return d.currentCert(), nil }
+func (d *Daemon) clientCert(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return d.currentCert(), nil
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -247,7 +251,51 @@ func (d *Daemon) localHandler() http.Handler {
 	mux.HandleFunc("GET /v1/cache", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"complete": d.store.Cache.Complete(), "bytes": d.store.Cache.Size()})
 	})
+	mux.HandleFunc("POST /v1/handover", func(w http.ResponseWriter, r *http.Request) {
+		if err := d.beginHandover(r.Context()); err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("POST /v1/handover/claim", func(w http.ResponseWriter, r *http.Request) {
+		result, err := d.claimHandover()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		writeJSON(w, 200, result)
+	})
+	mux.HandleFunc("DELETE /v1/handover", func(w http.ResponseWriter, r *http.Request) {
+		d.handover.mu.Lock()
+		defer d.handover.mu.Unlock()
+		var req struct {
+			Token string `json:"token"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "token required", 400)
+			return
+		}
+		b, _ := os.ReadFile(d.handoverPath())
+		var saved struct {
+			Token string `json:"token"`
+		}
+		json.Unmarshal(b, &saved)
+		if req.Token == "" || saved.Token != req.Token {
+			http.Error(w, "handover token changed", 409)
+			return
+		}
+		d.handover.active = false
+		os.Remove(d.handoverPath())
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	})
 	mux.HandleFunc("POST /v1/fence", func(w http.ResponseWriter, r *http.Request) {
+		d.handover.mu.Lock()
+		defer d.handover.mu.Unlock()
+		if d.handover.active {
+			http.Error(w, "handover owns the fence", 409)
+			return
+		}
 		var req fenceReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TTLMs <= 0 {
 			writeErr(w, 400, errors.New("ttl_ms and vms are required"))
@@ -257,6 +305,12 @@ func (d *Daemon) localHandler() http.Handler {
 		writeJSON(w, 200, d.fence.status())
 	})
 	mux.HandleFunc("DELETE /v1/fence", func(w http.ResponseWriter, r *http.Request) {
+		d.handover.mu.Lock()
+		defer d.handover.mu.Unlock()
+		if d.handover.active {
+			http.Error(w, "handover owns the fence", 409)
+			return
+		}
 		d.fence.disarm()
 		writeJSON(w, 200, d.fence.status())
 	})

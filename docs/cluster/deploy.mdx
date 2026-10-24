@@ -9,6 +9,8 @@ A cluster needs:
 - **hosts** with `/dev/kvm`: bare metal, or cloud instances with nested virtualization;
 - **Postgres** (managed is best) and an **S3-compatible bucket**.
 
+See [host maintenance](/cluster/maintenance) for required image/kernel/VMM pins, canary promotion, shared root disks and migration networking.
+
 ## With Terraform
 
 The Terraform is layered so each cloud only adds what's specific to it:

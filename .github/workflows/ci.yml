@@ -392,3 +392,16 @@ jobs:
             echo "</details>"
           } > /tmp/pr-comment-body.md
           gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} -F /tmp/pr-comment-body.md
+
+  maintenance-prerequisites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build locked Linux maintenance test environment
+        run: docker build -t flint-maintenance-test -f tests/maintenance/Dockerfile .
+      - name: Rehearse namespace cutover and shared disk mounts
+        run: >-
+          docker run --rm --privileged -v "$PWD:/workspace:ro"
+          -e FLINT_PRIVILEGED_TESTS=1 flint-maintenance-test
+          pytest tests/unit tests/maintenance --basetemp=/tmp/flint-tests
+          -o cache_dir=/tmp/pytest-cache -v

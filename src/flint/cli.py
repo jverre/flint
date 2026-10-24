@@ -259,6 +259,30 @@ def backends_list():
                 click.echo(f"      - {problem}")
 
 
+@cli.command(name="migration-gateway")
+def migration_gateway():
+    """Run the stable migration gateway after provisioning its identity and underlay."""
+    from flint.cluster.gateway import main
+    main()
+
+
+@cli.command(name="init-rootfs-pool")
+@click.argument("directory",type=click.Path(exists=True,file_okay=False))
+def init_rootfs_pool(directory):
+    """Initialise an already mounted shared POSIX root disk pool once."""
+    from flint.core._shared_rootfs import SharedRootfs
+    click.echo(SharedRootfs.initialize(directory).pool_id)
+
+
+@cli.command(name="agent-handover")
+def agent_handover():
+    """Hand bounded upgrade lease renewal to snapd before stopping the agent."""
+    from flint.cluster.snapd import Snapd
+    from flint.core import config
+    Snapd(config.SNAPD_SOCKET)._call("POST", "/v1/handover", timeout=10)
+    click.echo("snapd owns lease renewal for at most 120 seconds")
+
+
 @cli.command()
 def app():
     """Start the Flint TUI (requires running daemon)."""

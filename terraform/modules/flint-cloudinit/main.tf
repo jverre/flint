@@ -21,15 +21,19 @@ locals {
     FLINT_HOSTS_CA_KEY  = var.pki == null ? "" : "/etc/flint/hosts-ca.key"
   }
   host_env = {
-    FLINT_JOIN_TOKEN        = var.join_token
-    FLINT_ADVERTISE_ADDR    = var.advertise_addr
-    FLINT_ZONE              = var.zone
-    FLINT_BACKEND           = var.backend
-    FLINT_PORT              = tostring(var.agent_port)
-    FLINT_SNAPD_PORT        = tostring(var.snapd_port)
-    FLINT_SNAPD_PEER_LISTEN = ":${var.snapd_port}"
-    FLINT_WATCHDOG_DEVICE   = var.watchdog ? "/dev/watchdog" : ""
-    FLINT_MAX_VMS           = var.max_vms == 0 ? "" : tostring(var.max_vms)
+    FLINT_HOST_IMAGE         = var.host_image
+    FLINT_HOST_KERNEL        = var.host_kernel
+    FLINT_HYPERVISOR_VERSION = var.hypervisor_version
+    FLINT_ROLLOUT_GROUP      = var.rollout_group
+    FLINT_JOIN_TOKEN         = var.join_token
+    FLINT_ADVERTISE_ADDR     = var.advertise_addr
+    FLINT_ZONE               = var.zone
+    FLINT_BACKEND            = var.backend
+    FLINT_PORT               = tostring(var.agent_port)
+    FLINT_SNAPD_PORT         = tostring(var.snapd_port)
+    FLINT_SNAPD_PEER_LISTEN  = ":${var.snapd_port}"
+    FLINT_WATCHDOG_DEVICE    = var.watchdog ? "/dev/watchdog" : ""
+    FLINT_MAX_VMS            = var.max_vms == 0 ? "" : tostring(var.max_vms)
   }
   shared_env = {
     FLINT_STORE_URL       = var.store_url
@@ -58,7 +62,8 @@ locals {
     ], local.pki_files)
     runcmd = [
       ["env", "FLINT_ROLE=${var.role}", "FLINT_REF=${var.flint_ref}", "FLINT_REPO=${var.flint_repo}",
-      "FLINT_BACKEND=${var.backend}", "/opt/flint/install.sh"],
+        "FLINT_BACKEND=${var.backend}", "FLINT_HOST_KERNEL=${var.host_kernel}",
+      "FLINT_HYPERVISOR_VERSION=${var.hypervisor_version}", "/opt/flint/install.sh"],
     ]
   }
 }

@@ -1,0 +1,24 @@
+name: Maintenance prerequisite rehearsal
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build locked Linux rehearsal environment
+        run: docker build -t flint-maintenance-test -f tests/maintenance/Dockerfile .
+      - name: Exercise connection continuity, disk mounts, TLS and fencing
+        run: >-
+          docker run --rm --privileged -v "$PWD:/workspace:ro"
+          -e FLINT_PRIVILEGED_TESTS=1 flint-maintenance-test
+          sh -c 'pytest tests/unit tests/maintenance --basetemp=/tmp/flint-tests
+          -o cache_dir=/tmp/pytest-cache -v && cd cluster && go test -race -count=1 ./...'

@@ -105,7 +105,8 @@
             "pages": [
               "cluster/overview",
               "cluster/deploy",
-              "cluster/operations"
+              "cluster/operations",
+              "cluster/maintenance"
             ]
           }
         ]
