@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import subprocess
 import signal
@@ -146,6 +147,16 @@ def network_limits(ns_name: str, tap_name: str) -> None:
                              "burst", "131072", "latency", "50ms"], check=True, capture_output=True)
     subprocess.run(prefix + ["qdisc", "replace", "dev", tap_name, "handle", "ffff:", "ingress"],
                    check=True, capture_output=True)
-    subprocess.run(prefix + ["filter", "replace", "dev", tap_name, "parent", "ffff:", "protocol", "all",
-                             "pref", "1", "matchall", "action", "police", "rate", rate,
+    current = subprocess.run(prefix + ["-j", "filter", "show", "dev", tap_name, "parent", "ffff:"],
+                             check=True, capture_output=True, text=True)
+    priorities = {item["pref"] for item in json.loads(current.stdout)}
+    priority = next(p for p in range(1, len(priorities) + 2) if p not in priorities)
+    # matchall cannot replace an existing classifier on supported kernels.
+    # Install the new ceiling before removing the previous one, including
+    # when recovering a VM or retrying an interrupted reconciliation.
+    subprocess.run(prefix + ["filter", "add", "dev", tap_name, "parent", "ffff:", "protocol", "all",
+                             "pref", str(priority), "matchall", "action", "police", "rate", rate,
                              "burst", "131072", "conform-exceed", "drop"], check=True, capture_output=True)
+    for previous in sorted(priorities):
+        subprocess.run(prefix + ["filter", "delete", "dev", tap_name, "parent", "ffff:",
+                                 "pref", str(previous)], check=True, capture_output=True)
