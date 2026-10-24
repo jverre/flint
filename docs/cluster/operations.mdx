@@ -47,3 +47,6 @@ So a host crash is detected and its VMs restored within about 20 seconds by defa
 ## Web UI
 
 The control plane serves the [web UI](/web-ui) at `/ui` on its API address. Sign in with an API token. With an admin token, the **Hosts** page shows every host and VM on an isometric floor, and lets you cordon a host, move its VMs off (drain) and put it back in service, using the same endpoints as above. Service tokens see only their own tenants.
+
+
+See [host maintenance](/cluster/maintenance) for whole-host drain preflight, destination reservations, agent lease handover and live migration prerequisites.

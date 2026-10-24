@@ -8,6 +8,8 @@ Wants=network-online.target
 EnvironmentFile=/etc/flint/flint.env
 # First start joins with FLINT_JOIN_TOKEN; flint-snapd.path then starts snapd.
 ExecStart=/usr/local/bin/flint agent
+# Explicit stop/restart transfers renewal to the independent fence, bounded to 120s.
+ExecStop=/usr/local/bin/flint agent-handover
 Restart=always
 RestartSec=2
 # VMs outlive the agent process (it re-attaches to them on restart).

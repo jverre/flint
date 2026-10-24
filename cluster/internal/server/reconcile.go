@@ -212,7 +212,10 @@ func (s *Server) drainHosts(ctx context.Context) {
 		if h.State != HostDraining {
 			continue
 		}
-		vms, _ := s.listVMs(ctx, `host_id = ? AND state IN (?, ?)`, h.ID, VMRunning, VMPaused)
+		vms, err := s.listVMs(ctx, `host_id = ? AND state IN (?, ?, ?, ?, ?)`, h.ID, VMRunning, VMPaused, VMPending, VMMigrating, VMRecovering)
+		if err != nil {
+			continue
+		}
 		if len(vms) == 0 {
 			s.setHostState(ctx, h.ID, HostDrained)
 			s.emit(ctx, "host.drained", "", "", h.ID, nil)
@@ -220,8 +223,20 @@ func (s *Server) drainHosts(ctx context.Context) {
 			continue
 		}
 		v := vms[0]
-		if _, err := s.migrateVM(ctx, v, "", "drain"); err != nil {
+		if v.State != VMRunning && v.State != VMPaused {
+			continue
+		}
+		target := ""
+		if v.State == VMRunning {
+			if err := s.db.QueryRow(ctx, `SELECT target_host FROM drain_reservations WHERE vm_id = ? AND source_host = ?`, v.ID, h.ID).Scan(&target); err != nil {
+				log.Printf("drain %s: missing reservation for %s; re-plan before moving", h.Name, v.ID)
+				continue
+			}
+		}
+		if _, err := s.migrateVM(ctx, v, target, "drain"); err != nil {
 			log.Printf("drain %s: moving %s: %v", h.Name, short(v.ID), err)
+		} else {
+			s.db.Exec(ctx, `DELETE FROM drain_reservations WHERE vm_id = ?`, v.ID)
 		}
 	}
 }

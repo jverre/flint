@@ -82,16 +82,17 @@ type snapshotRef struct {
 }
 
 type createOnHostReq struct {
-	VMID             string          `json:"vm_id"`
-	Tenant           string          `json:"tenant"`
-	TemplateID       string          `json:"template_id"`
-	AllowInternet    bool            `json:"allow_internet_access"`
-	NetworkPolicy    json.RawMessage `json:"network_policy,omitempty"`
-	Availability     string          `json:"availability"`
-	Snapshot         *snapshotRef    `json:"snapshot,omitempty"`
-	TemplateSnapshot *snapshotRef    `json:"template_snapshot,omitempty"`
-	TimeoutSecs      float64         `json:"timeout_seconds,omitempty"`
-	TimeoutPolicy    string          `json:"timeout_policy,omitempty"`
+	ReplaceSharedDisk bool            `json:"replace_shared_disk,omitempty"`
+	VMID              string          `json:"vm_id"`
+	Tenant            string          `json:"tenant"`
+	TemplateID        string          `json:"template_id"`
+	AllowInternet     bool            `json:"allow_internet_access"`
+	NetworkPolicy     json.RawMessage `json:"network_policy,omitempty"`
+	Availability      string          `json:"availability"`
+	Snapshot          *snapshotRef    `json:"snapshot,omitempty"`
+	TemplateSnapshot  *snapshotRef    `json:"template_snapshot,omitempty"`
+	TimeoutSecs       float64         `json:"timeout_seconds,omitempty"`
+	TimeoutPolicy     string          `json:"timeout_policy,omitempty"`
 }
 
 func (s *Server) createOnHost(ctx context.Context, h *Host, req createOnHostReq) (map[string]any, error) {

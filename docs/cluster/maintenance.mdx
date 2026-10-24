@@ -1,0 +1,147 @@
+---
+title: "Host maintenance"
+description: "Pin host images, inspect running patch state, hand over agent leases, and evacuate compatible hosts."
+---
+
+Flint separates an agent restart from a VM restart. For host maintenance, use a pinned image and kernel, keep compatible evacuation capacity, and rehearse with a real workload before promoting a canary.
+
+<Note>
+The shared-root-disk and migration-network paths are opt-in. Their Linux namespace and bind-mount tests run in CI. Full Cloud Hypervisor migration, NFS/Ceph failure behavior, and actual kernel patching still need validation on your Linux/KVM fleet before production promotion.
+</Note>
+
+## Pin and promote host images
+
+The AWS example requires `ubuntu_ami_id`, `host_kernel`, and `hypervisor_version`. It no longer follows the latest Canonical AMI. `host_kernel` is the complete running release, including its flavour. Installation fails if it differs from `uname -r` or if the hypervisor version is unpinned.
+
+Build the image with a maintained Livepatch-supported kernel. Enable Ubuntu Pro and Livepatch in your image pipeline using your subscription credentials, then check [Canonical's exact kernel coverage](https://ubuntu.com/security/livepatch/docs/livepatch/reference/kernels). A kernel version pin by itself does not establish Livepatch coverage, and Livepatch does not eliminate all reboots.
+
+Set `canary_zones` and `canary_host` to try a separate image, kernel, hypervisor version, and Flint source ref on the canary group. Keep the stable values unchanged until the maintenance rehearsal passes. Host autoscaling groups do not automatically replace existing compute hosts on an image change: drain each old host before terminating it.
+
+For machines you provision yourself, the BYO example accepts the same kernel and hypervisor pins plus `host_image`, your immutable image identity. Pin `flint_ref` to the source commit you tested too.
+
+## Inspect running patch state
+
+`GET /v1/hosts` and `GET /v1/hosts/{id}` include `patch_state`:
+
+- `running_kernel`, the kernel currently executing;
+- `kernel_livepatch`, the names and enabled flags from sysfs;
+- `canonical_livepatch`, the vendor's JSON status, or an explicit unknown status;
+- `reboot_required`, the Ubuntu/Debian reboot marker;
+- `installed_vmm`, the installed executable's version and SHA-256;
+- `running_vmms`, the executable identity for each running VM;
+- `host_image`, `expected_kernel`, `rollout_group`, and `observed_at`.
+
+Inventory collection runs outside the lease-renewal thread and refreshes roughly once a minute. Check its timestamp. Missing tooling, inaccessible process executables, and untrusted executable ownership report uncertainty. Replacing the installed binary leaves the running VM's old executable identity intact.
+
+## Restart an agent without losing its lease
+
+The systemd unit's `ExecStop` calls `flint agent-handover` before stopping the agent. Snapd takes over renewal for a fixed maximum of 120 seconds. It freezes the fenced VM set, renews only while the control plane confirms that set still belongs to the host, and preserves the last acknowledged fence if renewal fails. The control plane excludes the host from new placements during this handover.
+
+The returning agent claims snapd's token, checks the persisted lease deadline, and resumes ordinary heartbeats. A crashed or partitioned agent does not receive an automatic grace period. Repeated stops cannot extend an unclaimed upgrade window, and an expired fence cannot be revived by snapd.
+
+The installer stages source and Python dependencies under an immutable commit-specific release directory, then requests handover before switching the CLI and restarting the agent. A refused handover leaves the old agent running. For the first deployment of this protocol, upgrade snapd separately before retrying the agent installer. Wait for VM operations to settle, then stage dependencies and image changes before the restart. The handover covers the stop/start interval; it is not an unlimited lease for an installation that takes several minutes. Upgrade snapd separately from the Python agent, and retain watchdog fencing while doing so.
+
+## Reserve evacuation capacity
+
+Use `FLINT_RESERVE_VCPUS`, `FLINT_RESERVE_MEMORY_MB`, and `FLINT_RESERVE_DISK_MB` on every host in a compatibility group. CPU placement uses reported vCPU capacity. Memory and disk reserves are additional to the incoming VM's reported requirements.
+
+Inspect a complete evacuation plan before requesting the drain:
+
+```bash
+curl -fsS -H "Authorization: Bearer $FLINT_API_KEY" \
+  "$FLINT_URL/v1/hosts/$HOST_ID/drain-plan"
+
+curl -fsS -X POST -H "Authorization: Bearer $FLINT_API_KEY" \
+  "$FLINT_URL/v1/hosts/$HOST_ID/drain"
+```
+
+A failed preflight returns 409 before cordoning the host or moving its first VM. It rejects unknown resource requirements, active VM operations, incompatible hosts, insufficient simultaneous capacity, and paused VMs without an uploaded snapshot. A successful drain reserves its target slots, CPU, memory, and disk in the database, visible to every control-plane replica. Uncordoning cancels unused reservations.
+
+These reserves need sizing for your largest host. They do not provision a spare host automatically. A target failure can still interrupt a drain; inspect the operation and remaining reservations before replanning.
+
+## Configure shared root disks
+
+Mount the same writable NFSv4, CephFS, GFS2, or OCFS2 pool on every compatible Cloud Hypervisor host. Keep the pool root owned and prevent group/world writes. Its permissions must allow the configured VMM uid to traverse to its disk. Local filesystems are rejected.
+
+Initialise the mounted pool once, then use its existing marker on every host:
+
+```bash
+sudo flint init-rootfs-pool /srv/flint-root-disks
+```
+
+Configure hosts with:
+
+```bash
+FLINT_BACKEND=cloud-hypervisor
+FLINT_SHARED_ROOTFS_DIR=/srv/flint-root-disks
+FLINT_STORAGE_BACKEND=local
+```
+
+Here `local` means the workspace stays on the VM's root filesystem. That root disk now lives on the shared pool. Host-local NFS workspaces, volumes and credential proxy policies are rejected for this migration network. Enable shared mode on an evacuated host before creating new VMs; existing local-root-disk VMs do not acquire shared-disk or migration-network capabilities from a configuration change.
+
+Each VM gets a private writable disk and an immutable manifest. Flint bind-mounts the disk into its jail at `/rootfs.ext4`; it never substitutes a local copy for a missing shared disk. Jail cleanup unmounts the disk and retains its data. Shared-mode VMs cold-boot so their disk and network configuration are explicit rather than inherited from a local golden snapshot.
+
+Normal creation refuses to overwrite an existing VM disk. Authorised snapshot recovery creates a new generation and preserves older inodes. A failed restore can therefore leave the paused source attached to its original disk. Live migration verifies and attaches that exact source generation. Retain old generations until no VM, paused jail, or recovery operation references them; automatic disk-generation garbage collection is not implemented.
+
+Use a filesystem and mount configuration with coherent shared access, durable writes, and distributed file locking. Rehearse server failure and interrupted mounts. The control plane and snapd fences enforce VM execution ownership; the shared filesystem alone does not prevent two VMMs from writing a disk.
+
+## Keep NAT on a separate gateway
+
+A migratable VM retains its guest IP and MAC. Each VM has a unique VXLAN ID allocated under the shared pool lock. Its compute namespace routes through a WireGuard-protected VXLAN uplink to a dedicated gateway namespace. Only that gateway owns NAT and connection tracking, so changing compute hosts does not discard established connection state.
+
+Provision WireGuard before enabling migration. The WireGuard interface must have at least 50 bytes more MTU than the migration uplink; the uplink defaults to 1500. Ensure the underlying network can carry the resulting encrypted packets. Allow only your fleet's peer addresses and keep VXLAN off the public network.
+
+On each compute host, set its own WireGuard address and the common gateway:
+
+```bash
+FLINT_MIGRATION_LOCAL_IP=10.90.0.11
+FLINT_MIGRATION_GATEWAY_IP=10.90.0.1
+FLINT_MIGRATION_GATEWAY_API=https://gateway.internal:9600
+FLINT_MIGRATION_UNDERLAY=wg-flint
+FLINT_MIGRATION_MTU=1500
+```
+
+On the dedicated gateway, mount the same pool for descriptor validation, provision a Flint host certificate and its hosts CA, and set:
+
+```bash
+FLINT_SHARED_ROOTFS_DIR=/srv/flint-root-disks
+FLINT_MIGRATION_GATEWAY_IP=10.90.0.1
+FLINT_MIGRATION_UNDERLAY=wg-flint
+FLINT_MIGRATION_PEERS=10.90.0.11,10.90.0.12
+FLINT_GATEWAY_STATE_DIR=/var/lib/flint/gateway
+```
+
+Start `flint-gateway.service` after those prerequisites exist. The API requires host mTLS certificates. Repeated destination preparation leaves the source's route untouched; receiver activation changes forwarding to the new compute endpoint. Gateway namespaces and NAT state survive an API process restart. A gateway reboot loses that state, so keep gateway maintenance separate from compute evacuation. Gateway HA, connection-state replication, and automatic gateway namespace recovery after a reboot remain separate work. The current gateway bridge has 253 usable namespace addresses. The gateway reclaims a namespace only after an authenticated control-plane check confirms that its VM has been removed from the catalog. A compute outage or migration source cleanup does not discard its NAT state. Disk generations are retained separately.
+
+## Live migrate a VM
+
+The existing `POST /vms/{id}/migrate` endpoint selects live migration for VMs booted with shared-disk and migration-network metadata. Legacy VMs retain the snapshot migration path. By default, hosts must match the kernel, CPU, hypervisor version, shared pool, and gateway compatibility class. The source also checks the version of its running VMM against the receiver.
+
+After testing a kernel/VMM transition, Cloud Hypervisor hosts can opt into a common `FLINT_MIGRATION_COMPATIBILITY_GROUP` instead of exact kernel/version matching. CPU, pool and gateway identity still have to match. For a VMM version change, explicitly allow the tested forward pair on source agents with `FLINT_CH_MIGRATION_ALLOWED_PAIRS`, such as `46.0>47.0`. Validate both live migration and checkpoint restore compatibility before sharing a group. This is how a drained fleet can move from an old image to a tested newer one without leaving the final old host stranded.
+
+The receiver is fenced before migration starts, including for an ephemeral VM. Memory moves through one-use mTLS relays into jail-local Cloud Hypervisor sockets. The receiver activates its route after Cloud Hypervisor completes the transfer; the control plane then commits ownership and removes the old source. If the sender's reply is lost, reconciliation checks both sides. Before cutover, rollback requires confirmation that the receiver has stopped and that Cloud Hypervisor kept or restored the source to Running. Once the receiver may have executed, Flint fences both copies and uses coherent checkpoint/template recovery rather than resuming stale source RAM against a disk the receiver may have changed. Uncertain operations remain recoverable by the control-plane leader.
+
+This path implements cross-host live migration. Same-host VMM replacement still requires evacuation to another compatible host; an automatic local VMM swap is not implemented. Connections terminating in the old agent process, such as an API-proxied terminal WebSocket, need to reconnect even when the guest's own network connections survive.
+
+## Rehearse maintenance continuously
+
+Run the reproducible Linux prerequisite suite in an isolated container:
+
+```bash
+docker build -t flint-maintenance-test -f tests/maintenance/Dockerfile .
+docker run --rm --privileged -v "$PWD:/workspace:ro" \
+  -e FLINT_PRIVILEGED_TESTS=1 flint-maintenance-test \
+  pytest tests/unit tests/maintenance --basetemp=/tmp/flint-tests \
+  -o cache_dir=/tmp/pytest-cache -v
+```
+
+The maintenance prerequisite workflow runs daily and on demand, and the same tests run on pull requests. The network test keeps a real Linux TCP stack alive while moving its NIC between compute namespaces over WireGuard/VXLAN. The disk test verifies bind-mount identity and retained data. These tests do not replace a real VMM migration or a shared-storage outage test.
+
+For the fleet rehearsal, run `scripts/rehearse-maintenance.py` inside a VM against an external TCP echo service. While it runs, patch the canary kernel, restart its agent, migrate the VM, and check a long-running guest process plus a file on its root disk. Collect the JSON result after each action:
+
+```bash
+python3 rehearse-maintenance.py echo.staging.example.com 9000 \
+  --duration 300 --max-pause-ms 1000 --output maintenance-result.json
+```
+
+The probe records request failures, connection resets, request count, and maximum observed request pause. It exits unsuccessfully if a failure/reset occurs or the pause budget is exceeded. A trusted staging runner can also pass repeated `--action` commands. Keep staging endpoints and maintenance commands outside untrusted guest control. Promote the canary only after the workload checks, patch inventory, operation recovery, and storage failure drills pass your own error and pause budgets.

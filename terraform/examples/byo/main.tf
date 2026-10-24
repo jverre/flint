@@ -56,6 +56,9 @@ module "host_config" {
   join_token              = module.pki.join_token
   advertise_addr          = each.value.address
   zone                    = each.value.zone
+  host_image              = var.host_image
+  host_kernel             = var.host_kernel
+  hypervisor_version      = var.hypervisor_version
 }
 
 resource "terraform_data" "server" {

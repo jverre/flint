@@ -1,0 +1,16 @@
+[Unit]
+Description=Flint stable migration egress gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/flint/flint.env
+ExecStart=/usr/local/bin/flint migration-gateway
+Restart=always
+RestartSec=2
+# Namespace NAT state outlives a Python API restart. Keep this gateway separate
+# from the compute fleet that is being drained or rebooted.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

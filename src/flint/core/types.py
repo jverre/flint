@@ -77,6 +77,8 @@ class _SandboxEntry:
         return {
             "vm_id": self.vm_id,
             "pid": self.pid,
+            "resources": dict(self.backend_metadata.get("resources", {})),
+            "maintenance": dict(self.backend_metadata.get("maintenance", {})),
             "state": _STATE_API_NAMES.get(self.state, str(self.state)),
             "template_id": self.template_id,
             "backend_kind": self.backend_kind,

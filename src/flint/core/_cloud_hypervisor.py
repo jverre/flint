@@ -34,6 +34,7 @@ def _response_complete(raw: bytes) -> bool:
 
 def _request(
     sock_path: str, method: str, path: str, body: dict | None = None, fds: list[int] | None = None,
+    timeout: float = _RESPONSE_TIMEOUT,
 ) -> tuple[int, bytes]:
     """One HTTP request over the API socket. ``fds`` are passed along with SCM_RIGHTS."""
     payload = json.dumps(body).encode() if body is not None else b""
@@ -60,7 +61,7 @@ def _request(
         # Snapshot/restore of a large guest can take a while; the timeout only
         # guards against a wedged VMM. Stop as soon as the response is complete
         # rather than waiting for the peer to close (it keeps the connection alive).
-        sock.settimeout(_RESPONSE_TIMEOUT)
+        sock.settimeout(timeout)
         while True:
             chunk = sock.recv(65536)
             if not chunk:
@@ -208,3 +209,21 @@ def vmm_shutdown(sock_path: str) -> None:
         ch_put(sock_path, "/api/v1/vmm.shutdown")
     except Exception:
         pass
+
+
+def vm_receive_migration(sock_path: str, receiver_url: str) -> None:
+    if not receiver_url.startswith("unix:/"):
+        raise ValueError("migration must use the authenticated jail-local relay")
+    status, body = _request(sock_path, "PUT", "/api/v1/vm.receive-migration",
+                            {"receiver_url": receiver_url}, timeout=900)
+    if not ch_status_ok(status):
+        raise RuntimeError(f"vm.receive-migration failed: {status} {body!r}")
+
+
+def vm_send_migration(sock_path: str, destination_url: str, *, local: bool = False) -> None:
+    if not destination_url.startswith("unix:/"):
+        raise ValueError("migration must use the authenticated jail-local relay")
+    status, body = _request(sock_path, "PUT", "/api/v1/vm.send-migration",
+                            {"destination_url": destination_url, "local": local}, timeout=900)
+    if not ch_status_ok(status):
+        raise RuntimeError(f"vm.send-migration failed: {status} {body!r}")

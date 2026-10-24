@@ -60,6 +60,7 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("PATCH /v1/hosts/{id}", admin(s.handlePatchHost))
 	mux.HandleFunc("POST /v1/hosts/{id}/cordon", admin(s.handleCordon(true)))
 	mux.HandleFunc("POST /v1/hosts/{id}/uncordon", admin(s.handleCordon(false)))
+	mux.HandleFunc("GET /v1/hosts/{id}/drain-plan", admin(s.handleDrainPlan))
 	mux.HandleFunc("POST /v1/hosts/{id}/drain", admin(s.handleDrain))
 	mux.HandleFunc("DELETE /v1/hosts/{id}", admin(s.handleRemoveHost))
 	mux.HandleFunc("POST /v1/join-tokens", admin(s.handleCreateJoinToken))
@@ -670,6 +671,7 @@ func (s *Server) handleCordon(on bool) http.HandlerFunc {
 			return
 		}
 		if !on {
+			s.db.Exec(r.Context(), `DELETE FROM drain_reservations WHERE source_host = ? AND vm_id NOT IN (SELECT id FROM vms WHERE state = 'migrating')`, r.PathValue("id"))
 			// Uncordoning a drained host returns it to service.
 			s.db.Exec(r.Context(), `UPDATE hosts SET state = ?, state_since = ? WHERE id = ? AND state IN (?, ?)`,
 				HostReady, nowMs(), r.PathValue("id"), HostDraining, HostDrained)
@@ -678,15 +680,48 @@ func (s *Server) handleCordon(on bool) http.HandlerFunc {
 	}
 }
 
-func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, err := s.getHost(r.Context(), id); err != nil {
+func (s *Server) handleDrainPlan(w http.ResponseWriter, r *http.Request) {
+	h, err := s.getHost(r.Context(), r.PathValue("id"))
+	if err != nil {
 		writeErr(w, 404, "host not found")
 		return
 	}
-	s.db.Exec(r.Context(), `UPDATE hosts SET cordoned = 1, state = ?, state_since = ? WHERE id = ?`, HostDraining, nowMs(), id)
-	s.emit(r.Context(), "host.draining", "", "", id, nil)
-	writeJSON(w, 200, map[string]any{"ok": true, "state": HostDraining})
+	plan, err := s.planDrain(r.Context(), h)
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"moves": plan})
+}
+
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	lock, err := s.lockVM(r.Context(), "_placement", vmLockWait)
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	defer lock.Release()
+	id := r.PathValue("id")
+	h, err := s.getHost(lock.ctx, id)
+	if err != nil {
+		writeErr(w, 404, "host not found")
+		return
+	}
+	if h.State == HostDraining {
+		writeJSON(w, 200, map[string]any{"ok": true, "state": HostDraining})
+		return
+	}
+	plan, err := s.planDrain(lock.ctx, h)
+	if err != nil {
+		writeErr(w, 409, err.Error())
+		return
+	}
+	if err := s.reserveDrain(lock.ctx, id, plan); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.emit(lock.ctx, "host.draining", "", "", id, nil)
+	writeJSON(w, 200, map[string]any{"ok": true, "state": HostDraining, "moves": plan})
 }
 
 func (s *Server) handleRemoveHost(w http.ResponseWriter, r *http.Request) {

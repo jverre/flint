@@ -195,6 +195,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 "ns_name": boot.ns_name,
                 "tap_name": boot.tap_name,
                 "veth_ip": boot.veth_ip,
+                "maintenance": boot.maintenance,
             },
         )
 
@@ -238,7 +239,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             vm_id,
             ns_name=ns_name,
             tap_name=tap_name,
-            veth_ip=meta.get("veth_ip", ""),
+            veth_ip=meta.get("veth_ip", ""), maintenance=meta.get("maintenance",{}),
         )
         vm_dir = boot.vm_dir
         pause_dir = os.path.join(vm_dir, "pause")
@@ -248,7 +249,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             pid=boot.process.pid,
             vm_dir=vm_dir,
             socket_path=boot.socket_path,
-            ns_name=ns_name,
+            ns_name=boot.ns_name,
             guest_ip=GUEST_IP,
             agent_url=boot.agent_url,
             chroot_base=boot.chroot_base,
@@ -260,10 +261,12 @@ class LinuxCloudHypervisorBackend(HostBackend):
             t_total=boot.t_total,
             backend_metadata={
                 "api_socket": boot.socket_path,
-                "ns_name": ns_name,
-                "tap_name": tap_name,
+                "ns_name": boot.ns_name,
+                "tap_name": boot.tap_name,
                 "pause_dir": pause_dir,
                 "veth_ip": boot.veth_ip,
+                "maintenance": boot.maintenance,
+                "resources": meta.get("resources",{}),
             },
         )
 
@@ -298,24 +301,43 @@ class LinuxCloudHypervisorBackend(HostBackend):
 
     def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
         from flint.core._ch_jail import JAIL_ROOTFS
-        from flint.core._netns_pool import acquire_netns
+        from flint.core._netns_pool import acquire_netns, NetSlot
+        from flint.core._shared_rootfs import configured_pool
 
+        pool = configured_pool()
+        maintenance = {}
         jail = ChJail(vm_id)
         jail.cleanup()  # a stale jail from an earlier life of this ID
         jail.prepare()
         net = None
         try:
-            os.rename(os.path.join(src_dir, "rootfs.ext4"), jail.host_path(JAIL_ROOTFS))
+            if pool:
+                disk = pool.create(vm_id,os.path.join(src_dir,"rootfs.ext4"),_cfg.CH_UID)
+                with open(f"{jail.base}/shared-rootfs","x") as marker:
+                    marker.write(pool.pool_id)
+                pool.attach(vm_id,jail.host_path(JAIL_ROOTFS),expected=disk)
+                maintenance["root_disk"] = disk
+            else:
+                os.rename(os.path.join(src_dir, "rootfs.ext4"), jail.host_path(JAIL_ROOTFS))
             jail.give(JAIL_ROOTFS)
             os.mkdir(jail.host_path("/pause"))
             for n in self._PAUSE_FILES:
                 os.rename(os.path.join(src_dir, "pause", n), jail.host_path(f"/pause/{n}"))
                 jail.give(f"/pause/{n}")
             jail.give("/pause")
-            net = acquire_netns("ch-", ch_tap_for_ns, allow_internet_access, use_pool=use_pool)
+            if pool:
+                from flint.core._migration_network import configured_network
+                from flint.cluster.gateway import gateway_request
+                network = configured_network(vm_id,disk["vni"])
+                gateway_request("prepare",vm_id,internet=allow_internet_access)
+                ns,tap = network.setup_compute(allow_internet_access)
+                net = NetSlot(ns,tap,"",allow_internet_access)
+                maintenance["network"] = {"vni":network.vni,"gateway":network.gateway_ip,"underlay":network.underlay,"mtu":network.mtu}
+            else:
+                net = acquire_netns("ch-", ch_tap_for_ns, allow_internet_access, use_pool=use_pool)
             boot = ch_resume_from_pause(
                 vm_id, ns_name=net.ns_name, tap_name=net.tap_name,
-                allow_internet_access=allow_internet_access, veth_ip=net.veth_ip,
+                allow_internet_access=allow_internet_access, veth_ip=net.veth_ip, maintenance=maintenance,
             )
         except Exception:
             if net is not None:
@@ -343,6 +365,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 "tap_name": net.tap_name,
                 "pause_dir": os.path.join(boot.vm_dir, "pause"),
                 "veth_ip": net.veth_ip,
+                "maintenance": boot.maintenance,
             },
         )
 
@@ -486,7 +509,15 @@ class LinuxCloudHypervisorBackend(HostBackend):
             return "dead"
 
     def recover_row(self, row: dict):
+        meta = row_backend_metadata(row)
+        live_paused = row.get("state") == "Paused" and meta.get("maintenance",{}).get("live_phase") == "sent"
         probe = self._probe_sandbox(row)
+        if live_paused:
+            try:
+                os.kill(row["pid"],0)
+                probe = "alive"
+            except OSError:
+                probe = "dead"
         if probe == "paused":
             return "paused", None
         if probe != "alive":
@@ -499,7 +530,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         vm_dir = row["vm_dir"]
 
         try:
-            agent_url = _wait_for_agent(ns_name, retries=50)
+            agent_url = f"http://{GUEST_IP}:{AGENT_PORT}" if live_paused else _wait_for_agent(ns_name, retries=50)
         except Exception:
             self._cleanup_dead_row(row)
             return "dead", None
@@ -516,7 +547,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
             guest_ip=GUEST_IP,
             agent_url=agent_url,
             agent_healthy=True,
-            state=SandboxState.RUNNING,
+            state=SandboxState.PAUSED if live_paused else SandboxState.RUNNING,
             template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
             chroot_base=row.get("chroot_base") or "",
             backend_kind=row.get("backend_kind") or self.kind,

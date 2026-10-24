@@ -149,3 +149,31 @@ variable "max_vms" {
   type        = number
   default     = 0
 }
+
+variable "host_image" {
+  description = "Immutable image identity, reported in host patch inventory."
+  type        = string
+  default     = ""
+}
+variable "host_kernel" {
+  description = "Expected exact running host kernel release; install refuses a mismatch."
+  type        = string
+  default     = ""
+}
+variable "hypervisor_version" {
+  description = "Explicit hypervisor release; required for host installs."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.hypervisor_version == "" || can(regex("^v?[0-9]+\\.[0-9]+(\\.[0-9]+)?$", var.hypervisor_version))
+    error_message = "Pin a numeric hypervisor release; latest is not allowed."
+  }
+}
+variable "rollout_group" {
+  type    = string
+  default = "stable"
+  validation {
+    condition     = contains(["canary", "stable"], var.rollout_group)
+    error_message = "rollout_group must be canary or stable."
+  }
+}

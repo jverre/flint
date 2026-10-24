@@ -21,6 +21,8 @@ func (s *Server) hostHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("POST /v1/hosts/self/heartbeat", s.hostOnly(s.handleHeartbeat))
+	mux.HandleFunc("POST /v1/hosts/self/network-release", s.hostOnly(s.handleNetworkRelease))
+	mux.HandleFunc("POST /v1/hosts/self/handover", s.hostOnly(s.handleHandover))
 	mux.HandleFunc("POST /v1/hosts/self/events", s.hostOnly(s.handleHostEvents))
 	mux.HandleFunc("POST /v1/hosts/self/renew", s.hostOnly(s.handleRenew))
 	mux.HandleFunc("POST /v1/hosts/self/snapshots", s.hostOnly(s.handleHostSnapshot))
@@ -160,20 +162,24 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request, h *Host) {
 
 // hostVM is a VM as a host reports it.
 type hostVM struct {
-	ID              string `json:"vm_id"`
-	State           string `json:"state"`
-	PauseSnapshotID string `json:"pause_snapshot_id,omitempty"`
+	Resources       map[string]any `json:"resources"`
+	Maintenance     map[string]any `json:"maintenance"`
+	ID              string         `json:"vm_id"`
+	State           string         `json:"state"`
+	PauseSnapshotID string         `json:"pause_snapshot_id,omitempty"`
 }
 
 type heartbeatReq struct {
-	Version   string         `json:"version"`
-	Backend   string         `json:"backend"`
-	HostClass string         `json:"host_class"`
-	Capacity  Capacity       `json:"capacity"`
-	VMs       []hostVM       `json:"vms"`
-	Cached    []string       `json:"cached_snapshots"`
-	Templates []HostTemplate `json:"templates"`
-	Fenced    []string       `json:"fenced"`
+	HandoverToken string         `json:"handover_token"`
+	PatchState    map[string]any `json:"patch_state"`
+	Version       string         `json:"version"`
+	Backend       string         `json:"backend"`
+	HostClass     string         `json:"host_class"`
+	Capacity      Capacity       `json:"capacity"`
+	VMs           []hostVM       `json:"vms"`
+	Cached        []string       `json:"cached_snapshots"`
+	Templates     []HostTemplate `json:"templates"`
+	Fenced        []string       `json:"fenced"`
 }
 
 // handleHeartbeat renews the host's lease and reconciles its VMs against the
@@ -185,6 +191,10 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host
 		writeErr(w, 400, "invalid heartbeat")
 		return
 	}
+	if h.HandoverToken != "" && req.HandoverToken != h.HandoverToken {
+		writeErr(w, 409, "snapd owns lease renewal during agent handover")
+		return
+	}
 	ctx := r.Context()
 	now := nowMs()
 	if req.Cached == nil {
@@ -193,11 +203,17 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host
 	if req.Templates == nil {
 		req.Templates = []HostTemplate{}
 	}
-	if _, err := s.db.Exec(ctx, `UPDATE hosts SET capacity = ?, cached = ?, templates = ?, version = ?, backend = ?, host_class = ?, last_heartbeat = ? WHERE id = ?`,
-		mustJSON(req.Capacity), mustJSON(req.Cached), mustJSON(req.Templates), req.Version, req.Backend, req.HostClass, now, h.ID); err != nil {
+	result, err := s.db.Exec(ctx, `UPDATE hosts SET handover_token = '', handover_until = 0, patch_state = ?, capacity = ?, cached = ?, templates = ?, version = ?, backend = ?, host_class = ?, last_heartbeat = ? WHERE id = ? AND handover_token = ?`,
+		mustJSON(req.PatchState), mustJSON(req.Capacity), mustJSON(req.Cached), mustJSON(req.Templates), req.Version, req.Backend, req.HostClass, now, h.ID, h.HandoverToken)
+	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		writeErr(w, 409, "handover started during heartbeat")
+		return
+	}
+
 	switch h.State {
 	case HostJoining, HostUnreachable, HostIsolated, HostDown:
 		s.setHostState(ctx, h.ID, HostReady)
@@ -257,6 +273,14 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host
 
 // reconcileReportedVM folds a host's view of one of its VMs into the catalog.
 func (s *Server) reconcileReportedVM(ctx context.Context, h *Host, v *VM, hv hostVM) {
+	if len(hv.Resources) > 0 {
+		if v.Info == nil {
+			v.Info = map[string]any{}
+		}
+		v.Info["resources"] = hv.Resources
+		v.Info["maintenance"] = hv.Maintenance
+		s.updateVM(ctx, v.ID, vmUpdate{Info: v.Info})
+	}
 	switch {
 	case v.State == VMRunning && (hv.State == "Error" || hv.State == "Dead"):
 		// The VMM died on a healthy host: recover in place if the class allows.
@@ -394,4 +418,22 @@ func (s *Server) createJoinToken(ctx context.Context, zone string, labels map[st
 // CreateJoinToken is createJoinToken for the CLI (--print-join-token).
 func (s *Server) CreateJoinToken(ctx context.Context, zone string, ttl time.Duration) (string, error) {
 	return s.createJoinToken(ctx, zone, nil, ttl)
+}
+
+// Gate gateway garbage collection on authoritative catalog absence. Temporary
+// agent outages and migration source cleanup must not discard live NAT state.
+func (s *Server) handleNetworkRelease(w http.ResponseWriter, r *http.Request, h *Host) {
+	var req struct {
+		VMID string `json:"vm_id"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req) != nil || req.VMID == "" {
+		writeErr(w, 400, "VM ID required")
+		return
+	}
+	_, err := s.getVM(r.Context(), req.VMID)
+	if err != nil && !isNotFound(err) {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"allowed": isNotFound(err)})
 }
