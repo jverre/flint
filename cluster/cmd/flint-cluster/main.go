@@ -78,6 +78,7 @@ func runServer(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.HostListen, "host-listen", env("FLINT_HOST_LISTEN", ":9301"), "address host agents connect to (FLINT_HOST_LISTEN)")
 	fs.StringVar(&cfg.HostEndpoint, "host-endpoint", env("FLINT_HOST_ENDPOINT", ""), "URL hosts use to reach --host-listen, put in join tokens (FLINT_HOST_ENDPOINT)")
 	fs.StringVar(&cfg.AdminToken, "admin-token", env("FLINT_ADMIN_TOKEN", ""), "bootstrap admin API token (FLINT_ADMIN_TOKEN)")
+	fs.StringVar(&cfg.SSOConfig, "sso-config", env("FLINT_SSO_CONFIG", ""), "sso.json: sign-in with identity providers, see docs/sso.mdx (FLINT_SSO_CONFIG)")
 	fs.StringVar(&cfg.CPCACert, "cp-ca-cert", env("FLINT_CP_CA_CERT", ""), "control-plane CA certificate file (FLINT_CP_CA_CERT; default: generated, kept in the database)")
 	fs.StringVar(&cfg.CPCAKey, "cp-ca-key", env("FLINT_CP_CA_KEY", ""), "control-plane CA key file (FLINT_CP_CA_KEY)")
 	fs.StringVar(&cfg.HostsCACert, "hosts-ca-cert", env("FLINT_HOSTS_CA_CERT", ""), "hosts CA certificate file (FLINT_HOSTS_CA_CERT)")

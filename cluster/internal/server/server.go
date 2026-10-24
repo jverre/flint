@@ -48,6 +48,9 @@ type Config struct {
 	// "static"), for autoscaling groups whose hosts can't be given a fresh
 	// single-use token each. Rotate it by restarting with a new value.
 	JoinSecret string
+	// SSOConfig is the path of an sso.json (docs/sso.mdx): people sign in to
+	// the web UI and CLI with an identity provider. Optional.
+	SSOConfig string
 
 	LeaseTTL           time.Duration // host lease; a silent host is fenced after this
 	FenceMargin        time.Duration // extra wait after lease expiry before recovering its VMs
@@ -85,6 +88,8 @@ type Server struct {
 
 	leader   bool
 	leaderMu sync.Mutex
+
+	sso *ssoRuntime // nil without SSO
 }
 
 // New connects to the database and object store and loads (or creates) the CAs.
@@ -130,6 +135,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		if err := s.ensureAdminToken(ctx, cfg.AdminToken); err != nil {
 			return nil, err
 		}
+	}
+	if err := s.loadSSO(ctx, cfg.SSOConfig); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
