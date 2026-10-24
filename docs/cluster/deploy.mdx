@@ -59,7 +59,7 @@ resource "aws_launch_template" "host" {
 }
 ```
 
-Servers take `role = "server"`, the `database_url`, `host_endpoint`, `admin_token = module.pki.admin_token`, `join_secret = module.pki.join_secret` and `pki = module.pki` outputs. Put a TCP load balancer in front of the servers' ports 9300 (API) and 9301 (hosts).
+Servers take `role = "server"`, the `database_url`, `host_endpoint`, `admin_token = module.pki.admin_token`, `join_secret = module.pki.join_secret` and `pki = module.pki` outputs. Put a TCP load balancer in front of the servers' ports 9300 (API) and 9301 (hosts). To let people sign in to the web UI and CLI with your identity provider, give every server the same `sso.json` through `FLINT_SSO_CONFIG` (see [Sign-in with SSO](/sso)).
 
 ## By hand
 

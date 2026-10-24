@@ -127,6 +127,12 @@ CREATE TABLE IF NOT EXISTS tokens (
     name        TEXT NOT NULL DEFAULT '',
     created_at  BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sso_codes (
+    code_hash  TEXT PRIMARY KEY,
+    grant_json TEXT NOT NULL,
+    challenge  TEXT NOT NULL,
+    expires_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS join_tokens (
     id          TEXT PRIMARY KEY,
     secret_hash TEXT NOT NULL,
@@ -280,6 +286,8 @@ var addedColumns = []struct{ table, column, def string }{
 	{"hosts", "patch_state", "TEXT NOT NULL DEFAULT '{}'"},
 	{"hosts", "handover_token", "TEXT NOT NULL DEFAULT ''"},
 	{"hosts", "handover_until", "INTEGER NOT NULL DEFAULT 0"},
+	{"tokens", "expires_at", "BIGINT"},                 // NULL: until revoked; set for SSO sessions
+	{"tokens", "identity", "TEXT NOT NULL DEFAULT ''"}, // who signed in, for SSO sessions
 }
 
 func (d *DB) addColumns(ctx context.Context, exec func(context.Context, string, ...any) (sql.Result, error)) error {
