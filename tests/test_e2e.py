@@ -317,7 +317,6 @@ def test_workspace_persists_across_pause_resume(sandbox):
     assert data == b"survives"
 
 
-@pytest.mark.slow
 def test_template_build_and_run(backend_kind, require_sandbox, daemon_only):
     if backend_kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
         pytest.skip("Template builds require a Linux hypervisor")
