@@ -19,6 +19,16 @@ DISK_BPS = _positive_env("FLINT_DISK_BYTES_PER_SECOND", 100 * 1024 * 1024)
 NETWORK_BPS = _positive_env("FLINT_NETWORK_BYTES_PER_SECOND", 12_500_000)
 
 
+def _whole_device(device: int, sysfs: Path = Path("/sys/dev/block")) -> str:
+    """io.max rejects partitions: resolve their parent disk through sysfs."""
+    if not os.major(device):
+        raise RuntimeError("Disk IO limits require a local block-backed filesystem")
+    node = (sysfs / f"{os.major(device)}:{os.minor(device)}").resolve(strict=True)
+    if (node / "partition").exists():
+        node = node.parent
+    return (node / "dev").read_text().strip()
+
+
 def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 128) -> None:
     """Apply limits before the guest runs; absence of cgroup v2 is an error."""
     root = Path("/sys/fs/cgroup")
@@ -36,10 +46,8 @@ def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 1
     (group / "cpu.max").write_text(f"{vcpus * 100000} 100000")
     (group / "memory.max").write_text(str((memory_mib + 256) * 1024 * 1024))
     (group / "pids.max").write_text("512")
-    device = os.stat(rootfs).st_dev
-    if not os.major(device):
-        raise RuntimeError(f"Cannot enforce disk IO limits on the filesystem holding {rootfs}")
-    (group / "io.max").write_text(f"{os.major(device)}:{os.minor(device)} rbps={DISK_BPS} wbps={DISK_BPS}")
+    device = _whole_device(os.stat(rootfs).st_dev)
+    (group / "io.max").write_text(f"{device} rbps={DISK_BPS} wbps={DISK_BPS}")
 
 
 def network_limits(ns_name: str, tap_name: str) -> None:
