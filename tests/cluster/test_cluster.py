@@ -75,7 +75,10 @@ def test_vms_spread_across_hosts_and_work_through_the_gateway(cluster, make_vm):
 
 def test_fork_lands_on_another_host_when_the_source_host_is_full(cluster, hosts, make_vm):
     src = make_vm(on="a")
-    src.commands.run("echo before-fork > /root/state; (sleep 600 &) ; true")
+    # Detach the sleeper's streams: inherited output pipes keep commands.run
+    # waiting until its 60s timeout even after the shell exits.
+    r = src.commands.run("echo before-fork > /root/state; (sleep 600 </dev/null >/dev/null 2>&1 &); true")
+    assert r.exit_code == 0, r
     src_pids = src.commands.run("pgrep -f 'sleep 600'").stdout.split()
     assert src_pids, "background process didn't start"
     cluster.api.patch(f"/v1/hosts/{hosts['a'].host_id}", json={"max_vms": 1})  # a is now full
@@ -96,7 +99,8 @@ def test_fork_lands_on_another_host_when_the_source_host_is_full(cluster, hosts,
 
 def test_paused_vm_resumes_on_another_host(cluster, hosts, make_vm):
     vm = make_vm(on="a")
-    vm.commands.run("echo paused-state > /root/p; (sleep 700 &); true")
+    r = vm.commands.run("echo paused-state > /root/p; (sleep 700 </dev/null >/dev/null 2>&1 &); true")
+    assert r.exit_code == 0, r
     pid = vm.commands.run("pgrep -f 'sleep 700'").stdout.strip()
     vm.pause()
     assert state(vm)["state"] == "Paused"
@@ -229,7 +233,8 @@ def copies(hosts, vm_id: str) -> list[str]:
 
 def test_concurrent_operations_on_one_vm_through_two_replicas_are_serialised(cluster, hosts, make_vm):
     vm = make_vm(on="a")
-    vm.commands.run("echo before > /root/m; (sleep 900 &); true")
+    r = vm.commands.run("echo before > /root/m; (sleep 900 </dev/null >/dev/null 2>&1 &); true")
+    assert r.exit_code == 0, r
     results = {}
 
     def call(name, i, path):
@@ -332,7 +337,8 @@ def test_vmset_keeps_replicas_spread_and_promotes_a_standby_on_failure(cluster, 
 def test_drain_moves_running_vms_with_their_state(cluster, hosts, make_vm):
     vms = [make_vm(on="a") for _ in range(2)]
     for v in vms:
-        v.commands.run(f"echo {v.id} > /root/id; (sleep 800 &); true")
+        r = v.commands.run(f"echo {v.id} > /root/id; (sleep 800 </dev/null >/dev/null 2>&1 &); true")
+        assert r.exit_code == 0, r
     r = cluster.api.post(f"/v1/hosts/{hosts['a'].host_id}/drain")
     assert r.status_code == 200
     wait_for(lambda: hosts["a"].state() == "drained", 60, "host a to drain")
