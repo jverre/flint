@@ -13,7 +13,7 @@ import time
 import httpx
 import pytest
 
-from .conftest import AUTH, BASE_URL, TEST_STATE_DIR, WS_BASE, api
+from .conftest import AUTH, BASE_URL, TEST_STATE_DIR, api
 from flint import Sandbox, Template
 
 

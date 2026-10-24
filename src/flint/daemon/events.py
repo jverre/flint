@@ -3,7 +3,10 @@
 `publish(...)` is safe to call from any thread. Each WebSocket subscriber gets
 a bounded asyncio.Queue; on overflow the oldest event is dropped.
 
-Event types (payload keys other than `type` and `ts`):
+Every event carries the `tenant` it belongs to; `/events` subscribers only
+get their tenants' events.
+
+Event types (payload keys other than `type`, `ts` and `tenant`):
   vm.created           vm: dict
   vm.deleted           vm_id: str
   vm.state_changed     vm_id: str, from: str, to: str
@@ -77,9 +80,30 @@ def get_bus() -> EventBus | None:
 # uses this to forward events to the control plane.
 hooks: list = []
 
+# vm_id -> its tenant ("" if unknown); set by the daemon.
+vm_tenant = lambda _vm_id: ""  # noqa: E731
+
+
+def _tenant_of(payload: dict) -> str:
+    vm = payload.get("vm")
+    if isinstance(vm, dict) and vm.get("tenant"):
+        return vm["tenant"]
+    volume = payload.get("volume")
+    if isinstance(volume, dict) and volume.get("tenant"):
+        return volume["tenant"]
+    vm_id = payload.get("vm_id") or (vm or {}).get("vm_id")
+    if vm_id:
+        try:
+            return vm_tenant(vm_id) or ""
+        except Exception:
+            log.exception("event tenant lookup failed")
+    return ""
+
 
 def publish(event_type: str, **payload) -> None:
     """Publish to the global bus. No-op if the bus is not yet initialized."""
+    if not payload.get("tenant"):
+        payload["tenant"] = _tenant_of(payload)
     for hook in hooks:
         try:
             hook({"type": event_type, "ts": time.time(), **payload})

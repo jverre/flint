@@ -10,7 +10,7 @@ import pytest
 
 from flint import Sandbox, Volume
 
-from .conftest import AUTH, BASE_URL, TEST_PORT, WS_BASE, api
+from .conftest import AUTH, BASE_URL, TEST_PORT, api
 
 # Host-local: inspects one daemon (skipped against a cluster control plane).
 pytestmark = pytest.mark.usefixtures("daemon_only")

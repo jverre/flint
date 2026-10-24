@@ -9,7 +9,7 @@ Opens an interactive terminal session connected to a PTY inside the sandbox. Thi
 
 ## Protocol
 
-1. Open a WebSocket connection to `ws://localhost:9100/vms/{vm_id}/terminal`
+1. Open a WebSocket connection to `ws://localhost:9100/vms/{vm_id}/terminal`, with your token in the `Authorization` header or as `?token=`
 2. The daemon creates a PTY process on the guest agent
 3. Send raw binary frames to send keyboard input
 4. Receive raw binary frames containing terminal output
@@ -20,14 +20,16 @@ There's no framing or encoding - just raw bytes in both directions.
 ## Example
 
 ```python
-import websocket
+import os
 import threading
+import websocket
 
 def on_message(ws, message):
     print(message.decode(), end="", flush=True)
 
 ws = websocket.WebSocketApp(
     "ws://localhost:9100/vms/3f2a1b4c-.../terminal",
+    header={"Authorization": f"Bearer {os.environ['FLINT_API_KEY']}"},
     on_message=on_message
 )
 

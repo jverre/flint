@@ -14,7 +14,7 @@ Returns the raw file contents as bytes.
 **Example**
 
 ```bash
-curl "http://localhost:9100/vms/.../files?path=/etc/hostname"
+curl -H "Authorization: Bearer $FLINT_API_KEY" "http://localhost:9100/vms/.../files?path=/etc/hostname"
 # flint-vm
 ```
 
@@ -44,7 +44,7 @@ Write raw bytes to a file. Parent directories are created automatically.
 **Example**
 
 ```bash
-echo "hello world" | curl -X POST \
+echo "hello world" | curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST \
   "http://localhost:9100/vms/.../files?path=/tmp/hello.txt" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @-

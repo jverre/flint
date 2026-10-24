@@ -39,7 +39,7 @@ Templates work by building a Docker image, extracting the filesystem, and creati
     `POST /templates/build`
 
     ```bash
-    curl -X POST http://localhost:9100/templates/build \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/templates/build \
       -H "Content-Type: application/json" \
       -d '{
         "name": "my-python-env",
@@ -118,7 +118,7 @@ info.status       # "ready"
     `GET /templates`
 
     ```bash
-    curl http://localhost:9100/templates
+    curl -H "Authorization: Bearer $FLINT_API_KEY" http://localhost:9100/templates
     ```
 
     ```json
@@ -139,7 +139,7 @@ info.status       # "ready"
     `DELETE /templates/{template_id}`
 
     ```bash
-    curl -X DELETE http://localhost:9100/templates/tpl_abc123
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X DELETE http://localhost:9100/templates/tpl_abc123
     ```
 
     You can't delete the `"default"` template.

@@ -16,7 +16,7 @@ import uvicorn
 from flint.core.backends import get_host_backend
 from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
-    TEMPLATES_DIR, DEFAULT_TEMPLATE_ID,
+    TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, DAEMON_SOCKET, ADMIN_TOKEN_PATH,
     DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, ERROR_CLEANUP_DELAY,
     WORKSPACE_DIR,
 )
@@ -30,8 +30,29 @@ from flint.core import _nfs_server
 from flint.core._metrics import MetricsSampler
 from flint.core import _logs
 from flint.daemon import events as _events
+from flint.daemon.auth import AuthError, AuthMiddleware, Principal, TokenStore, principal_of
 
 app = FastAPI()
+
+
+def _vm_tenant(vm_id: str) -> str | None:
+    daemon = getattr(app.state, "daemon", None)
+    vm = daemon.manager.get_dict(vm_id) if daemon and daemon.manager else None
+    return vm.get("tenant", "") if vm else None
+
+
+app.add_middleware(
+    AuthMiddleware,
+    tokens=lambda: getattr(getattr(app.state, "daemon", None), "tokens", None),
+    cluster_mode=lambda: bool(getattr(getattr(app.state, "daemon", None), "cluster", None)),
+    vm_tenant=_vm_tenant,
+)
+
+
+@app.exception_handler(AuthError)
+async def _auth_error(_request: Request, e: AuthError):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": e.detail}, status_code=e.status)
 
 
 @app.on_event("startup")
@@ -58,6 +79,16 @@ def _require_manager() -> SandboxManager:
     if daemon.manager is None:
         raise HTTPException(status_code=503, detail="Manager not initialized")
     return daemon.manager
+
+
+def _template_for(principal: Principal, template_id: str) -> dict | None:
+    """A template the caller can see: shared (no tenant) or one of their tenants'."""
+    tmpl = get_template(template_id)
+    if tmpl is None and template_id == DEFAULT_TEMPLATE_ID:
+        return {"template_id": template_id}
+    if tmpl is None or (tmpl.get("tenant") and not principal.can_tenant(tmpl["tenant"])):
+        return None
+    return tmpl
 
 
 def _require_entry(vm_id: str):
@@ -180,8 +211,14 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
     if network_policy is not None:
         _validate_network_policy(network_policy)
     vm_id = data.get("vm_id") or None
-    tenant = data.get("tenant") or tenant
     availability = data.get("availability") or ""
+    tenant = data.get("tenant") or tenant
+    if not daemon.cluster:  # the control plane resolved it already
+        principal = principal_of(request)
+        tenant = principal.resolve_tenant(tenant)
+        tmpl = _template_for(principal, template_id)
+        if tmpl is None or (tmpl.get("tenant") and tmpl["tenant"] != tenant):
+            raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
     snapshot = data.get("snapshot")
     template_snapshot = data.get("template_snapshot")
     if (vm_id or snapshot or template_snapshot) and not daemon.cluster:
@@ -296,11 +333,13 @@ def live_migration(vm_id: str, action: str, body: dict):
 
 
 @app.get("/vms")
-def list_vms():
+def list_vms(request: Request, tenant: str = ""):
     daemon = _get_daemon()
     if not daemon.manager:
         return {"vms": []}
-    entries = daemon.manager.list_dicts()
+    principal = principal_of(request)
+    entries = [d for d in daemon.manager.list_dicts()
+               if principal.can_tenant(d.get("tenant", "")) and (not tenant or d.get("tenant") == tenant)]
     print(f"GET /vms — {len(entries)} VMs")
     return {"vms": entries}
 
@@ -630,10 +669,18 @@ async def events_ws(websocket: WebSocket):
     if bus is None:
         await websocket.close(code=1011, reason="Event bus not initialized")
         return
+    principal = principal_of(websocket)
     await websocket.accept()
     q = bus.subscribe()
+
+    async def send(event: dict) -> None:
+        tenant = event.get("tenant")
+        # An event of no known tenant only goes to callers who see every tenant.
+        if principal.can_tenant(tenant) if tenant else (principal.is_admin or not principal.tenants):
+            await websocket.send_json(event)
+
     try:
-        await _forward(websocket, q, websocket.send_json)
+        await _forward(websocket, q, send)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -671,7 +718,9 @@ _build_threads: dict[str, threading.Thread] = {}
 
 
 @app.post("/templates/build")
-def build_template_endpoint(body: dict):
+def build_template_endpoint(body: dict, request: Request):
+    """Build a template. With ``tenant`` (or a token pinned to one tenant) it
+    belongs to that tenant; without, every tenant can use it."""
     name = body.get("name")
     dockerfile = body.get("dockerfile")
     rootfs_size_mb = body.get("rootfs_size_mb", 500)
@@ -679,16 +728,33 @@ def build_template_endpoint(body: dict):
         raise HTTPException(status_code=400, detail="name and dockerfile are required")
 
     from flint.core._template_build import _slugify
+    from flint.core._template_registry import claim_template
     template_id = _slugify(name)
+    if template_id == DEFAULT_TEMPLATE_ID:
+        raise HTTPException(status_code=400, detail="The default template can't be rebuilt this way")
+    daemon = _get_daemon()
+    tenant = ""
+    if not daemon.cluster:
+        principal = principal_of(request)
+        pinned = principal.tenants and not principal.is_admin
+        tenant = principal.resolve_tenant(body.get("tenant")) if (body.get("tenant") or pinned) else ""
+        existing = get_template(template_id)
+        if existing is not None and existing.get("tenant", "") != tenant:
+            visible = _template_for(principal, template_id) is not None
+            raise HTTPException(status_code=409 if visible else 403,
+                                detail=f"Template '{template_id}' already exists" + ("" if visible else " for another tenant"))
+        claim_template(template_id, name, tenant)
     print(f"POST /templates/build — building {template_id}...")
 
-    daemon = _get_daemon()
     if daemon.cluster:
         daemon.cluster.forget_template(template_id)  # a rebuild gets published again
 
     def _run_build():
         try:
             daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+            if not daemon.cluster:
+                # Builds re-create a template's entry if it went meanwhile: keep the owner.
+                claim_template(template_id, name, tenant)
             print(f"Template {template_id} built successfully")
         except Exception as e:
             print(f"Template {template_id} build failed: {e}")
@@ -702,28 +768,32 @@ def build_template_endpoint(body: dict):
 
 
 @app.get("/templates")
-def list_templates_endpoint():
-    templates = list_templates()
+def list_templates_endpoint(request: Request):
+    principal = principal_of(request)
+    templates = [t for t in list_templates() if not t.get("tenant") or principal.can_tenant(t["tenant"])]
     print(f"GET /templates — {len(templates)} templates")
     return {"templates": templates}
 
 
 @app.get("/templates/{template_id}")
-def get_template_endpoint(template_id: str):
-    tmpl = get_template(template_id)
+def get_template_endpoint(template_id: str, request: Request):
+    tmpl = _template_for(principal_of(request), template_id)
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
     return {"template": tmpl}
 
 
 @app.delete("/templates/{template_id}")
-def delete_template_endpoint(template_id: str):
+def delete_template_endpoint(template_id: str, request: Request):
     print(f"DELETE /templates/{template_id}")
     if template_id == DEFAULT_TEMPLATE_ID:
         raise HTTPException(status_code=400, detail="Cannot delete default template")
-    tmpl = get_template(template_id)
+    principal = principal_of(request)
+    tmpl = _template_for(principal, template_id)
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not tmpl.get("tenant") and principal.tenants and not principal.is_admin:
+        raise HTTPException(status_code=403, detail="Shared templates can only be deleted by an admin")
     daemon = _get_daemon()
     if daemon.cluster:
         daemon.cluster.forget_template(template_id)
@@ -754,41 +824,48 @@ def _volume_call(fn, *args):
         raise HTTPException(status_code=e.status, detail=str(e))
 
 
+def _scope(principal: Principal) -> tuple[str, ...] | None:
+    """The tenants a caller's lookups are limited to (None: every tenant)."""
+    return None if principal.is_admin or not principal.tenants else principal.tenants
+
+
 @app.get("/volumes")
-def list_volumes():
-    return {"volumes": [v.to_dict() for v in _require_volumes().list()]}
+def list_volumes(request: Request, tenant: str = ""):
+    vols = _require_volumes().list(_scope(principal_of(request)))
+    return {"volumes": [v.to_dict() for v in vols if not tenant or v.tenant == tenant]}
 
 
 @app.post("/volumes")
-def create_volume(body: dict):
-    vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"))
+def create_volume(body: dict, request: Request):
+    tenant = principal_of(request).resolve_tenant(body.get("tenant"))
+    vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"), tenant)
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes — created {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 
 @app.post("/volumes/{volume}/snapshot")
-def snapshot_volume(volume: str, body: dict):
+def snapshot_volume(volume: str, body: dict, request: Request):
     """A read-only copy of the volume as it is now."""
-    vol = _volume_call(_require_volumes().snapshot, volume, body.get("name"))
+    vol = _volume_call(_require_volumes().snapshot, volume, body.get("name"), _scope(principal_of(request)))
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes/{volume}/snapshot — {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 
 @app.post("/volumes/{volume}/fork")
-def fork_volume(volume: str, body: dict):
+def fork_volume(volume: str, body: dict, request: Request):
     """A writable copy of the volume as it is now."""
-    vol = _volume_call(_require_volumes().fork, volume, body.get("name"))
+    vol = _volume_call(_require_volumes().fork, volume, body.get("name"), _scope(principal_of(request)))
     _events.publish("volume.created", volume=vol.to_dict())
     print(f"POST /volumes/{volume}/fork — {vol.id} ({vol.name})")
     return {"volume": vol.to_dict()}
 
 
 @app.delete("/volumes/{volume}")
-def delete_volume(volume: str):
-    vol = _volume_call(_require_volumes().delete, volume)
-    _events.publish("volume.deleted", volume_id=vol.id)
+def delete_volume(volume: str, request: Request):
+    vol = _volume_call(_require_volumes().delete, volume, _scope(principal_of(request)))
+    _events.publish("volume.deleted", volume_id=vol.id, tenant=vol.tenant)
     print(f"DELETE /volumes/{vol.id} — deleted")
     return {"ok": True}
 
@@ -821,6 +898,41 @@ def unmount_volume(vm_id: str, path: str):
     _events.publish("volume.detached", vm_id=vm_id, volume_id=m.volume_id, mount_path=m.path)
     _logs.append(vm_id, f"Unmounted {m.path}")
     print(f"DELETE /vms/{vm_id[:8]}/mounts — {m.path}")
+    return {"ok": True}
+
+
+# ── API tokens (admin only) ───────────────────────────────────────────────
+# The same API as the cluster control plane's.
+
+def _require_tokens() -> TokenStore:
+    daemon = _get_daemon()
+    if daemon.tokens is None:
+        raise HTTPException(status_code=503, detail="Tokens not initialized")
+    return daemon.tokens
+
+
+@app.post("/v1/tokens")
+def create_token(body: dict):
+    """Create an ``admin`` or ``service`` token (``tenants`` pins a service
+    token to those tenants). The token is in the answer, and only there."""
+    tenants = body.get("tenants") or []
+    if not isinstance(tenants, list):
+        raise HTTPException(status_code=400, detail="'tenants' must be a list")
+    record, token = _require_tokens().create(body.get("kind") or "service", body.get("name") or "", tenants)
+    print(f"POST /v1/tokens — created {record['kind']} token {record['id']}")
+    return {**record, "token": token}
+
+
+@app.get("/v1/tokens")
+def list_tokens():
+    return {"tokens": _require_tokens().list()}
+
+
+@app.delete("/v1/tokens/{token_id}")
+def revoke_token(token_id: str):
+    if not _require_tokens().revoke(token_id):
+        raise HTTPException(status_code=404, detail="Token not found")
+    print(f"DELETE /v1/tokens/{token_id} — revoked")
     return {"ok": True}
 
 
@@ -906,6 +1018,52 @@ def web_ui(path: str = ""):
     return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
+# ── Listening sockets ────────────────────────────────────────────────────
+
+def _listen_unix(path: str):
+    """The daemon's Unix socket: only its user, and the ``flint`` group if there
+    is one, can connect, and whoever connects is an admin."""
+    import grp
+    import socket
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(path)
+        raise SystemExit(f"Another Flint daemon is listening on {path}")
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+    finally:
+        probe.close()
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)  # never connectable by others, even briefly
+    try:
+        sock.bind(path)
+    finally:
+        os.umask(old_umask)
+    try:
+        os.chown(path, -1, grp.getgrnam("flint").gr_gid)
+        os.chmod(path, 0o660)
+    except (KeyError, PermissionError):
+        os.chmod(path, 0o600)
+    sock.listen(2048)
+    sock.set_inheritable(True)
+    return sock
+
+
+def _listen_tcp(host: str, port: int):
+    import socket
+    sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen(2048)
+    sock.set_inheritable(True)
+    return sock
+
+
 # ── FlintDaemon ──────────────────────────────────────────────────────────
 
 class FlintDaemon:
@@ -921,6 +1079,7 @@ class FlintDaemon:
         self.volumes: Volumes | None = None
         self.metrics: MetricsSampler | None = None
         self.cluster = None  # ClusterAgent when running as a cluster host agent
+        self.tokens: TokenStore | None = None
 
     def kill_vm(self, vm_id: str) -> None:
         """Delete a sandbox (running or paused) and everything it holds."""
@@ -1003,6 +1162,10 @@ class FlintDaemon:
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
+        self.tokens = TokenStore(DAEMON_DB_PATH)
+        from flint.core import config as _cfg
+        if not _cfg.CLUSTER_MODE:  # a host agent's only caller is the control plane, over mTLS
+            self.tokens.ensure_admin_token_file()
         print("State store initialized.")
 
     def _init_manager(self) -> None:
@@ -1010,6 +1173,7 @@ class FlintDaemon:
         self.volumes = Volumes(self._state_store._conn, self.manager, self._state_store)
         self.manager.kill_hooks.append(self._release_mounts)
         self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [], self.backend.usage)
+        _events.vm_tenant = lambda vm_id: (self.manager.get_dict(vm_id) or {}).get("tenant", "")
         _write_state(self)
 
     def _release_mounts(self, vm_id: str) -> None:
@@ -1063,7 +1227,7 @@ class FlintDaemon:
             self.backend.stop_pool()
             if self._state_store:
                 self._state_store.close()
-            for path in (DAEMON_STATE_PATH, DAEMON_PID_PATH):
+            for path in (DAEMON_STATE_PATH, DAEMON_PID_PATH, DAEMON_SOCKET):
                 try:
                     os.unlink(path)
                 except OSError:
@@ -1074,7 +1238,14 @@ class FlintDaemon:
         signal.signal(signal.SIGTERM, _shutdown)
 
     def _serve(self) -> None:
-        print(f"Daemon ready on {DAEMON_HOST}:{DAEMON_PORT} · web UI: http://{DAEMON_HOST}:{DAEMON_PORT}/ui/")
+        if self.cluster:
+            self._serve_cluster()
+            return
+        sockets = [_listen_unix(DAEMON_SOCKET), _listen_tcp(DAEMON_HOST, DAEMON_PORT)]
+        print(f"Daemon ready on {DAEMON_SOCKET} and http://{DAEMON_HOST}:{DAEMON_PORT} (API token required; "
+              f"admin token in {ADMIN_TOKEN_PATH}) · web UI: `flint ui`")
+        # The timeout is a backstop: a stuck handler mustn't keep the daemon alive.
+        server = uvicorn.Server(uvicorn.Config(app, log_level="warning", timeout_graceful_shutdown=5))
 
         # On macOS, the Virtualization.framework needs the main thread's RunLoop
         # to drive VM execution.  Run uvicorn on a background thread and reserve
@@ -1083,22 +1254,11 @@ class FlintDaemon:
             from flint.core.backends.macos_vz import MacOSVirtualizationBackend
 
             if isinstance(self.backend, MacOSVirtualizationBackend):
-                uvicorn_thread = threading.Thread(
-                    target=lambda: uvicorn.run(
-                        app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning",
-                        timeout_graceful_shutdown=5,
-                    ),
-                    daemon=True,
-                )
-                uvicorn_thread.start()
+                threading.Thread(target=lambda: server.run(sockets=sockets), daemon=True).start()
                 self.backend._runtime.run_loop()  # blocks forever
                 return
 
-        if self.cluster:
-            self._serve_cluster()
-            return
-        # The timeout is a backstop: a stuck handler mustn't keep the daemon alive.
-        uvicorn.run(app, host=DAEMON_HOST, port=DAEMON_PORT, log_level="warning", timeout_graceful_shutdown=5)
+        server.run(sockets=sockets)
 
     def _serve_cluster(self) -> None:
         """Serve over mTLS: only the control plane's certificates get in.

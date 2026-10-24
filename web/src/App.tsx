@@ -69,7 +69,7 @@ function Login() {
       }}>
         <Cube s={32} />
         <h1>Sign in to Flint</h1>
-        <p className="mut">This control plane needs an API token. Create one with <code>flint-cluster token create</code> or use the admin token it was started with.</p>
+        <p className="mut">Flint needs an API token. On the daemon's host, <code>flint ui</code> signs you in; <code>flint token create</code> makes more.</p>
         <input type="password" autoFocus placeholder="flint_…" value={tok} onChange={(e) => setTok(e.target.value)} aria-label="API token" />
         {err && <p className="errc">{err}</p>}
         <button className="btn fill" disabled={!tok.trim() || busy}>Sign in</button>
