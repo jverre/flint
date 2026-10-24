@@ -272,8 +272,8 @@ func unmountAndWait(path, dev string) {
 	}
 }
 
-// Delete removes image id (unmounting it first). Its chunks stay in the
-// store; other images may share them.
+// Delete removes image id (unmounting it first), wiping its overlay and the
+// chunks and layers no other image shares (see wipe.go).
 func (m *ImageManager) Delete(id string) error {
 	m.mu.Lock()
 	exported := m.exported[id] != nil
@@ -282,7 +282,26 @@ func (m *ImageManager) Delete(id string) error {
 		return fmt.Errorf("image %s is attached to a sandbox", id)
 	}
 	m.Unmount(id)
-	return os.RemoveAll(m.imageDir(id))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wiped, err := wipeAll(m.imageDir(id))
+	if err != nil {
+		return err
+	}
+	var open []blockstore.Manifest
+	for _, a := range m.attached {
+		open = append(open, a.img.Manifest())
+	}
+	for _, sh := range m.exported {
+		open = append(open, sh.img.Manifest())
+	}
+	n, freed, err := collectGarbage(m.dir, m.store, filepath.Join(m.dir, "store"), open)
+	if err != nil {
+		log.Printf("image %s deleted; collecting unshared chunks failed, they stay: %v", id, err)
+	} else {
+		log.Printf("Deleted image %s: wiped %d bytes of overlay, %d unshared objects (%d bytes)", id, wiped, n, freed)
+	}
+	return nil
 }
 
 // Export lets clientIP attach image imageID over NBD as export name. A
