@@ -43,61 +43,130 @@ def verify_peer(conn: ssl.SSLSocket, expected: str) -> None:
         raise ssl.SSLError("migration peer is not the expected host")
 
 
+_FRAME = 65536  # largest payload per frame
+_IDLE_TIMEOUT = 900.0  # seconds without progress in either direction
+
+
 def relay(left: socket.socket, right: socket.socket) -> None:
-    # TCP half-close cannot be forwarded with SSLSocket.shutdown(SHUT_WR):
-    # that truncates TLS records and discards the reverse-direction response.
-    # Frame each direction independently; a zero frame carries its EOF.
+    """Copy bytes both ways between the TLS socket and the VMM's local one.
+
+    TCP half-close cannot be forwarded with SSLSocket.shutdown(SHUT_WR):
+    that truncates TLS records and discards the reverse-direction response.
+    So each direction is framed (a 4-byte length, then the bytes), and a
+    zero-length frame carries its EOF.
+
+    One thread does everything: an SSL connection must never be read and
+    written from two threads at once (OpenSSL corrupts the stream, "bad
+    record mac"). Both sockets are non-blocking; the loop waits on whichever
+    can make progress.
+    """
+    import selectors
+
     secure = left if isinstance(left, ssl.SSLSocket) else right
     local = right if secure is left else left
-    errors = []
+    secure.setblocking(False)
+    local.setblocking(False)
 
-    def read_exact(size: int) -> bytes:
-        result = bytearray()
-        while len(result) < size:
-            data = secure.recv(size - len(result))
-            if not data:
-                raise ConnectionResetError("truncated TLS migration frame")
-            result.extend(data)
-        return bytes(result)
+    to_secure = bytearray()  # frames waiting to be encrypted and sent
+    to_local = bytearray()  # payload waiting for the VMM
+    frames = bytearray()  # decrypted bytes not yet parsed into frames
+    local_eof = remote_eof = local_closed = False
+    want_write_to_read = False  # an SSL write needs the peer's data first
 
-    def send():
-        try:
-            while data := local.recv(65536):
-                secure.sendall(struct.pack("!I", len(data)) + data)
-            secure.sendall(bytes(4))
-        except OSError as exc:
-            errors.append(exc)
-            # Abort both readers if the local VMM or encrypted stream failed.
-            for conn in (secure, local):
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-    thread = threading.Thread(target=send, daemon=True)
-    thread.start()
+    sel = selectors.DefaultSelector()
     try:
         while True:
-            size = struct.unpack("!I", read_exact(4))[0]
-            if size == 0:
-                local.shutdown(socket.SHUT_WR)
-                break
-            if size > 65536:
-                raise ValueError("oversized TLS migration frame")
-            local.sendall(read_exact(size))
-        thread.join(timeout=5)
-        if thread.is_alive():
-            raise TimeoutError("migration VMM did not finish its stream")
-        if errors:
-            raise errors[0]
-    finally:
-        if thread.is_alive():
-            for conn in (secure, local):
+            progressed = False
+
+            # VMM -> peer: frame what the VMM sent; its EOF becomes a zero frame.
+            if not local_eof and len(to_secure) < 4 * _FRAME:
                 try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
+                    data = local.recv(_FRAME)
+                except BlockingIOError:
                     pass
-            thread.join(timeout=1)
+                else:
+                    to_secure += struct.pack("!I", len(data)) + data if data else bytes(4)
+                    local_eof = not data
+                    progressed = True
+
+            # Peer -> VMM: decrypt what's there (including what OpenSSL buffered).
+            if not remote_eof and len(to_local) < 4 * _FRAME:
+                try:
+                    data = secure.recv(_FRAME)
+                except (ssl.SSLWantReadError, BlockingIOError):
+                    pass
+                except ssl.SSLWantWriteError:
+                    pass
+                else:
+                    if not data:
+                        raise ConnectionResetError("truncated TLS migration frame")
+                    frames += data
+                    progressed = True
+                    while len(frames) >= 4:
+                        size = struct.unpack("!I", frames[:4])[0]
+                        if size > _FRAME:
+                            raise ValueError("oversized TLS migration frame")
+                        if size == 0:
+                            remote_eof = True
+                            del frames[:4]
+                            break
+                        if len(frames) < 4 + size:
+                            break
+                        to_local += frames[4:4 + size]
+                        del frames[:4 + size]
+
+            # Send what's waiting, each way.
+            want_write_to_read = False
+            if to_secure:
+                try:
+                    # Same leading bytes on a retry, as OpenSSL requires.
+                    sent = secure.send(to_secure[:16384])
+                except ssl.SSLWantReadError:
+                    want_write_to_read = True
+                except (ssl.SSLWantWriteError, BlockingIOError):
+                    pass
+                else:
+                    del to_secure[:sent]
+                    progressed = progressed or sent > 0
+            if to_local:
+                try:
+                    sent = local.send(to_local)
+                except BlockingIOError:
+                    pass
+                else:
+                    del to_local[:sent]
+                    progressed = progressed or sent > 0
+            if remote_eof and not to_local and not local_closed:
+                local.shutdown(socket.SHUT_WR)
+                local_closed = True
+                progressed = True
+
+            if local_eof and not to_secure and remote_eof and local_closed:
+                return
+            if progressed or secure.pending():
+                continue
+
+            # Nothing to do now: wait for a socket that can move bytes.
+            interest = {local: 0, secure: 0}
+            if not local_eof and len(to_secure) < 4 * _FRAME:
+                interest[local] |= selectors.EVENT_READ
+            if to_local:
+                interest[local] |= selectors.EVENT_WRITE
+            if (not remote_eof and len(to_local) < 4 * _FRAME) or want_write_to_read:
+                interest[secure] |= selectors.EVENT_READ
+            if to_secure and not want_write_to_read:
+                interest[secure] |= selectors.EVENT_WRITE
+            for sock, events in interest.items():
+                if events:
+                    sel.register(sock, events)
+            try:
+                if not sel.select(_IDLE_TIMEOUT):
+                    raise TimeoutError("migration stream made no progress for 15 minutes")
+            finally:
+                for sock in list(sel.get_map().values()):
+                    sel.unregister(sock.fileobj)
+    finally:
+        sel.close()
 
 
 class MigrationRelay:
