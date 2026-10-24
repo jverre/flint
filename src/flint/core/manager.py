@@ -145,11 +145,11 @@ class SandboxManager:
         return self._backend.checkpoint(entry, snapshot)
 
     def _register_boot(self, boot, template_id: str, network_policy: dict | None, tenant: str, availability: str) -> str:
-        with self._operation_lock(boot.vm_id):
-            return self._register_boot_locked(boot, template_id, network_policy, tenant, availability)
-
-    def _register_boot_locked(self, boot, template_id, network_policy, tenant, availability):
         vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
+        with self._operation_lock(vm_id):
+            return self._register_boot_locked(vm_id, boot, template_id, network_policy, tenant, availability)
+
+    def _register_boot_locked(self, vm_id, boot, template_id, network_policy, tenant, availability):
         agent_url = boot.agent_url
 
         entry = _SandboxEntry(
