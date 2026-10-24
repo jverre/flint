@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import pytest
 
 from flint.core import _wipe
@@ -58,7 +60,17 @@ def test_shared_and_outside_files_are_never_touched(tmp_path):
     os.link(shared, jail / "kernel")  # how read-only artifacts enter a jail
     os.symlink(outside, jail / "planted")  # what a jailed VMM could leave behind
 
-    _wipe.wipe_tree(str(jail), "vm-2")
+    # Another VM can still be running a shared VMM executable at deletion.
+    binary = tmp_path / "shared" / "sleep"
+    shutil.copy2(shutil.which("sleep"), binary)
+    os.link(binary, jail / "vmm")
+    process = subprocess.Popen([str(binary), "60"])
+    try:
+        _wipe.wipe_tree(str(jail), "vm-2")
+        assert process.poll() is None
+    finally:
+        process.kill()
+        process.wait(timeout=5)
 
     assert not os.path.exists(jail)
     with open(shared, "rb") as f:

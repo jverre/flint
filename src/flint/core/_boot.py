@@ -160,7 +160,7 @@ def _boot_from_snapshot(
 
         # 6. Wait for API socket
         with _timed(timings, "wait_api_ready_ms"):
-            _wait_for_api_socket(spec.socket_path_on_host)
+            _wait_for_api_socket(spec.socket_path_on_host, process=process, log_path=log_path)
 
         # 7. Load snapshot (paths are chroot-relative)
         with _timed(timings, "api_snapshot_load_ms"):

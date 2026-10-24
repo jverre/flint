@@ -105,6 +105,12 @@ def _wipe_fd(fd: int) -> int:
 
 def _open_file(name: str, dir_fd: int | None = None) -> int | None:
     try:
+        # Shared VMM executables cannot be opened for writing while another
+        # VM runs them (ETXTBSY). Reject them before opening; _wipe_fd checks
+        # the opened inode again to handle replacement during this check.
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return None
         return os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ELOOP, errno.ENXIO, errno.ENODEV):

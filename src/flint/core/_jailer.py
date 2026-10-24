@@ -68,7 +68,9 @@ def build_jailer_command(spec: JailSpec, *, vcpus: int = 1, memory_mib: int = 12
         "--gid", str(JAILER_GID),
         "--chroot-base-dir", JAILER_BASE_DIR,
         "--cgroup-version", str(JAILER_CGROUP_VER),
-        "--parent-cgroup", JAILER_PARENT_CGROUP,
+        # With no --cgroup properties the jailer joins this existing group
+        # directly. Its parent has controllers delegated and cannot hold tasks.
+        "--parent-cgroup", f"{JAILER_PARENT_CGROUP}/{spec.vm_id}",
         "--netns", f"/var/run/netns/{spec.ns_name}",
         "--",
         "--api-sock", "firecracker.sock",

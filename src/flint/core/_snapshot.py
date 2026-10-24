@@ -61,7 +61,7 @@ def create_golden_snapshot(
             )
         log.info("Golden VM started in ns %s (pid=%d)", ns_name, process.pid)
 
-        _wait_for_api_socket(socket_path)
+        _wait_for_api_socket(socket_path, process=process, log_path=log_path)
         _fc_put(socket_path, "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
         _fc_put(socket_path, "/drives/rootfs", {
             "drive_id": "rootfs", "path_on_host": "rootfs.ext4",

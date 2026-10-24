@@ -339,7 +339,7 @@ class LinuxFirecrackerBackend(HostBackend):
             )
 
         try:
-            _wait_for_api_socket(socket_path)
+            _wait_for_api_socket(socket_path, process=process, log_path=log_path)
             snapshot_body = {
                 "snapshot_path": PAUSE_VMSTATE,
                 "mem_backend": {"backend_type": "File", "backend_path": PAUSE_MEM},

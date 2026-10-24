@@ -271,8 +271,13 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         peer_ip = a.get(a2)["network_address"]
         other_ip = b.get(vm_b)["network_address"]
         assert peer_ip and other_ip and peer_ip != other_ip
-        code, out = run(a, a2, "mkdir -p /tmp/peer-www; echo tenant-a > /tmp/peer-www/index.html; httpd -p 18080 -h /tmp/peer-www")
+        code, out = run(a, a2, "mkdir -p /tmp/peer-www; echo tenant-a > /tmp/peer-www/index.html; "
+                             "cd /tmp/peer-www; nohup python3 -m http.server 18080 >/tmp/peer-http.log 2>&1 </dev/null &")
         assert code == 0, out
+        code, out = run(a, a2, "for i in $(seq 1 50); do "
+                             "wget -q -T1 -O - http://127.0.0.1:18080 && exit 0; sleep .1; done; "
+                             "cat /tmp/peer-http.log; exit 1")
+        assert code == 0 and out.strip() == "tenant-a", out
         code, out = run(a, a1, f"wget -q -T2 -O - http://{peer_ip}:18080")
         assert code != 0, f"same-tenant traffic allowed without opt-in: {out}"
         with _tcp(tok_b) as c:

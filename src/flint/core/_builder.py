@@ -9,6 +9,7 @@ or extracted on the host.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gzip
 import hashlib
 import json
 import os
@@ -92,11 +93,17 @@ def _appliance() -> str:
             return str(path)
         Path(context, "Dockerfile").write_text(_APPLIANCE_DOCKERFILE)
         tag = f"flint-builder:{key}"
+        started = time.monotonic()
+        config.log.info("Builder appliance %s: preparing trusted image", key)
         try:
             subprocess.run(["docker", "build", "-t", tag, context], check=True, capture_output=True, timeout=300)
             _extract_rootfs(tag, str(path) + ".tmp", 4096)
             os.chmod(str(path) + ".tmp", 0o600)
             os.replace(str(path) + ".tmp", path)
+            config.log.info("Builder appliance %s: ready in %.1fs", key, time.monotonic() - started)
+        except subprocess.CalledProcessError as exc:
+            detail = ((exc.stdout or b"") + (exc.stderr or b""))[-4096:].decode(errors="replace")
+            raise RuntimeError(f"Builder appliance preparation failed: {detail}") from exc
         finally:
             subprocess.run(["docker", "image", "rm", tag], capture_output=True, timeout=30)
         return str(path)
@@ -114,6 +121,8 @@ def _vm(kind: str, disk_mb: int):
     marker = _marker(vm_id)
     marker.write_text(json.dumps({"ns": ns, "kind": kind}))
     os.chmod(marker, 0o600)
+    started = time.monotonic()
+    config.log.info("Builder %s: starting %s VM", vm_id, kind)
     try:
         if kind == "linux-firecracker":
             spec = JailSpec(vm_id, ns)
@@ -138,7 +147,7 @@ def _vm(kind: str, disk_mb: int):
             with open(f"{spec.chroot_base}/builder.log", "w") as log:
                 process = subprocess.Popen(build_jailer_command(spec, vcpus=_CPUS, memory_mib=_MEMORY_MIB),
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-            _wait_for_api_socket(spec.socket_path_on_host)
+            _wait_for_api_socket(spec.socket_path_on_host, process=process, log_path=f"{spec.chroot_base}/builder.log")
             requests = [("/machine-config", {"vcpu_count": _CPUS, "mem_size_mib": _MEMORY_MIB}),
                         ("/boot-source", {"kernel_image_path": "vmlinux", "boot_args": config.BOOT_ARGS}),
                         ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": True, "is_read_only": False}),
@@ -163,6 +172,7 @@ def _vm(kind: str, disk_mb: int):
                 os.close(fd)
             ch.vm_boot(jail.socket_path)
         _wait_for_agent(ns, retries=3000)
+        config.log.info("Builder %s: guest ready in %.1fs", vm_id, time.monotonic() - started)
         yield ns
     finally:
         if process:
@@ -192,7 +202,9 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
     if kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
         raise ValueError("Isolated template builds require a Linux hypervisor")
     with _build_slots, _vm(kind, size_mb) as ns:
-        def run(cmd: str, timeout: int = 60):
+        def run(cmd: str, timeout: int = 60, *, stage: str):
+            started = time.monotonic()
+            config.log.info("Builder %s: %s", ns, stage)
             body = json.dumps({"cmd": ["/bin/sh", "-ec", cmd], "timeout": timeout}).encode()
             with _request(ns, "/exec", body, timeout + 10) as response:
                 raw = response.read((1 << 20) + 1)
@@ -200,14 +212,16 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
                     raise RuntimeError("Builder command output exceeded 1 MiB")
                 result = json.loads(raw)
             if result["exit_code"] != 0:
-                raise RuntimeError(f"Template build failed in builder VM: {result.get('stderr', '')[-2000:]}")
+                detail = (result.get("stdout", "") + result.get("stderr", ""))[-4096:]
+                raise RuntimeError(f"Template build failed during {stage}: {detail}")
+            config.log.info("Builder %s: %s completed in %.1fs", ns, stage, time.monotonic() - started)
 
         run("mkdir -p /build /export /run /sys/fs/cgroup; "
             "mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true; "
             "dockerd --storage-driver=vfs --iptables=false --bridge=none --ip-forward=false --ip-masq=false "
-            ">/var/log/docker.log 2>&1 &")
+            ">/var/log/docker.log 2>&1 &", stage="start Docker")
         run("i=0; until docker info >/dev/null 2>&1; do i=$((i+1)); "
-            "if [ $i -ge 60 ]; then cat /var/log/docker.log >&2; exit 1; fi; sleep .5; done")
+            "if [ $i -ge 60 ]; then cat /var/log/docker.log >&2; exit 1; fi; sleep .5; done", stage="wait for Docker")
         for name in ("flintd", "init-net.sh"):
             with _request(ns, f"/files?path=/build/{name}", Path(context, name).read_bytes()) as response:
                 response.read()
@@ -217,23 +231,31 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
         run("DOCKER_BUILDKIT=1 docker build --network=host --no-cache -t artifact /build && "
             "docker create --name artifact artifact >/dev/null && "
             "docker export artifact > /export.tar && tar -xf /export.tar -C /export && "
-            f"truncate -s {size_mb}M /artifact.ext4 && mkfs.ext4 -F -m 0 -d /export /artifact.ext4", _TIMEOUT)
+            f"truncate -s {size_mb}M /artifact.ext4 && mkfs.ext4 -F -m 0 -d /export /artifact.ext4 && "
+            "gzip -1 /artifact.ext4", _TIMEOUT, stage="build and export rootfs")
         expected = size_mb << 20
         tmp = output + ".tmp"
+        started = time.monotonic()
+        config.log.info("Builder %s: downloading rootfs (%d MiB uncompressed)", ns, size_mb)
         try:
-            with _request(ns, "/files?path=/artifact.ext4", timeout=300) as response, open(tmp, "xb") as dest:
+            # Empty ext4 space compresses well: do not send the full logical
+            # disk over the guest's rate-limited link. Decompression remains
+            # bounded by the exact expected artifact size below.
+            with _request(ns, "/files?path=/artifact.ext4.gz", timeout=300) as response, \
+                    gzip.GzipFile(fileobj=response) as artifact, open(tmp, "xb") as dest:
                 left = expected
                 while left:
-                    chunk = response.read(min(left, 1 << 20))
+                    chunk = artifact.read(min(left, 1 << 20))
                     if not chunk:
                         raise RuntimeError("Builder returned a truncated rootfs")
                     dest.write(chunk)
                     left -= len(chunk)
-                if response.read(1):
+                if artifact.read(1):
                     raise RuntimeError("Builder returned an oversized rootfs")
                 dest.flush()
                 os.fsync(dest.fileno())
             os.replace(tmp, output)
+            config.log.info("Builder %s: rootfs downloaded in %.1fs", ns, time.monotonic() - started)
         finally:
             if os.path.exists(tmp):
                 from ._wipe import wipe_tree
