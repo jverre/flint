@@ -284,11 +284,13 @@ on("POST", /^\/v1\/tokens$/, clusterOnly((_m, _q, b) => {
   return json({ id, token: `flint_${id}_${uuid().replace(/-/g, "")}`, kind: t.kind, tenants: t.tenants });
 }));
 on("DELETE", /^\/v1\/tokens\/([^/]+)$/, clusterOnly((m) => { const i = TOKENS.findIndex((t) => t.id === m[1]); if (i >= 0) TOKENS.splice(i, 1); return json({ ok: true }); }));
-on("GET", /^\/v1\/events$/, clusterOnly((_m, q) => {
-  const since = Number(q.get("since") ?? 0);
-  const out = EVENTS.filter((e) => e.seq > since && (!q.get("vm_id") || e.vm_id === q.get("vm_id")) && (!q.get("tenant") || e.tenant === q.get("tenant")) && (!q.get("type") || e.type === q.get("type"))).slice(0, 500);
-  return json({ events: out });
-}));
+const storedEvents = (q: URLSearchParams, vmId = q.get("vm_id")) => {
+  const since = Number(q.get("since") ?? 0), limit = Number(q.get("limit") ?? 500);
+  const out = EVENTS.filter((e) => e.seq > since && (!vmId || e.vm_id === vmId) && (!q.get("tenant") || e.tenant === q.get("tenant")) && (!q.get("type") || e.type === q.get("type"))).slice(0, limit);
+  return json({ events: out, next: out.length ? out[out.length - 1].seq : since });
+};
+on("GET", /^\/v1\/events$/, (_m, q) => storedEvents(q));
+on("GET", /^\/vms\/([^/]+)\/timeline$/, (m, q) => storedEvents(q, m[1]));
 
 export async function mockFetch(method: string, url: string, _headers: Record<string, string>, body?: BodyInit): Promise<Response> {
   const u = new URL(url, location.origin);

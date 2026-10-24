@@ -50,6 +50,7 @@ app.add_middleware(
     tokens=lambda: getattr(getattr(app.state, "daemon", None), "tokens", None),
     cluster_mode=lambda: bool(getattr(getattr(app.state, "daemon", None), "cluster", None)),
     vm_tenant=_vm_tenant,
+    eventlog=lambda: getattr(getattr(app.state, "daemon", None), "eventlog", None),
 )
 
 
@@ -182,8 +183,7 @@ async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes |
     """Async wrapper: runs backend transport in a worker thread."""
     mgr = _require_manager()
     _require_entry(vm_id)
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, mgr.agent_request, vm_id, method, path, body, timeout)
+    return await asyncio.to_thread(mgr.agent_request, vm_id, method, path, body, timeout)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -287,12 +287,11 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         )
 
     # Run in executor to avoid blocking the event loop (create can take 10s+ on failure)
-    loop = asyncio.get_event_loop()
     # The control plane enforces a cluster's quotas.
     reservation = daemon.quotas.reserve(tenant, lambda: _usage(tenant), _one_vm()) if not daemon.cluster else contextlib.nullcontext()
     try:
         with reservation:
-            vm_id = await loop.run_in_executor(None, _create)
+            vm_id = await asyncio.to_thread(_create)  # to_thread keeps the caller (eventlog.actor)
     except QuotaExceeded:
         raise
     except _Unfenced as e:
@@ -435,7 +434,7 @@ async def pause_vm(vm_id: str, request: Request):
                 raise
 
     try:
-        snap = await asyncio.get_event_loop().run_in_executor(None, _pause)
+        snap = await asyncio.to_thread(_pause)
     except Exception as e:
         log.exception("POST /vms/%s/pause — failed", vm_id[:8])
         print(f"POST /vms/{vm_id[:8]}/pause — failed: {e}")
@@ -489,8 +488,8 @@ async def checkpoint_vm(vm_id: str, request: Request):
     if not data.get("snapshot_id"):
         raise HTTPException(status_code=400, detail="snapshot_id is required")
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: daemon.cluster.checkpoint(
+        result = await asyncio.to_thread(
+            lambda: daemon.cluster.checkpoint(
                 vm_id, data["snapshot_id"], data.get("kind") or "checkpoint",
                 parent=data.get("parent") or "", upload=data.get("upload") or "sync",
             ),
@@ -554,12 +553,37 @@ def get_network_policy(vm_id: str):
 
 # ── Guest agent proxy endpoints ───────────────────────────────────────────
 
+def _command_text(body: bytes) -> str:
+    """The command an exec or process request runs, for its event (``sh -c`` scripts as is)."""
+    import shlex
+    try:
+        cmd = json.loads(body).get("cmd") or []
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(cmd, list):
+        return str(cmd)[:500]
+    if len(cmd) >= 3 and cmd[1] == "-c" and cmd[0].endswith("sh"):
+        return str(cmd[2])[:500]
+    return shlex.join(str(c) for c in cmd)[:500]
+
+
 @app.post("/vms/{vm_id}/exec")
 async def exec_command(vm_id: str, request: Request):
-    """Proxy POST /exec to the guest agent."""
+    """Proxy POST /exec to the guest agent, and record it as a ``vm.exec`` event."""
     print(f"POST /vms/{vm_id[:8]}/exec")
     body = await request.body()
+    t0 = time.monotonic()
     status, resp_body = await _agent_request_async(vm_id, "POST", "/exec", body)
+    event = {"vm_id": vm_id, "cmd": _command_text(body), "duration_ms": round((time.monotonic() - t0) * 1000, 1)}
+    try:
+        result = json.loads(resp_body) if status == 200 else {}
+        event.update(exit_code=result.get("exit_code"), stdout_tail=str(result.get("stdout", ""))[-256:],
+                     stderr_tail=str(result.get("stderr", ""))[-256:])
+    except ValueError:
+        pass
+    if status != 200:
+        event["error"] = resp_body[:256].decode(errors="replace")
+    _events.publish("vm.exec", **event)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
@@ -569,6 +593,12 @@ async def create_process(vm_id: str, request: Request):
     print(f"POST /vms/{vm_id[:8]}/processes")
     body = await request.body()
     status, resp_body = await _agent_request_async(vm_id, "POST", "/processes", body)
+    if status == 200:
+        try:
+            pid = json.loads(resp_body).get("pid")
+        except ValueError:
+            pid = None
+        _events.publish("vm.process_started", vm_id=vm_id, cmd=_command_text(body), pid=pid)
     return Response(content=resp_body, status_code=status, media_type="application/json")
 
 
@@ -943,6 +973,47 @@ def unmount_volume(vm_id: str, path: str):
     return {"ok": True}
 
 
+# ── Stored events and the audit log ───────────────────────────────────────
+
+def _require_eventlog():
+    daemon = _get_daemon()
+    if daemon.eventlog is None:
+        raise HTTPException(status_code=503, detail="Event log not initialized")
+    return daemon.eventlog
+
+
+@app.get("/v1/events")
+def list_events(request: Request, since: int = 0, vm_id: str = "", tenant: str = "", type: str = "",
+                actor: str = "", limit: int = 500):
+    """Stored events after ``since`` (a ``seq``), oldest first, of the caller's
+    tenants. ``next`` is the ``since`` for the following page."""
+    events = _require_eventlog().query(since=since, tenants=_scope(principal_of(request)), tenant=tenant,
+                                       vm_id=vm_id, type=type, actor=actor, limit=limit)
+    return {"events": events, "next": events[-1]["seq"] if events else since}
+
+
+@app.get("/vms/{vm_id}/timeline")
+def vm_timeline(vm_id: str, request: Request, since: int = 0, limit: int = 1000):
+    """Everything that happened to a VM: lifecycle, execs, mounts, with who did it."""
+    if _require_manager().get_dict(vm_id) is None:
+        raise HTTPException(status_code=404, detail="VM not found")
+    events = _require_eventlog().query(since=since, tenants=_scope(principal_of(request)), vm_id=vm_id, limit=limit)
+    return {"events": events, "next": events[-1]["seq"] if events else since}
+
+
+@app.get("/v1/audit")
+def audit_log(since: int = 0, limit: int = 500):
+    """The audit log (admin only): every API call that changed something, hash-chained."""
+    entries = _require_eventlog().audit_entries(since, limit)
+    return {"entries": entries, "next": entries[-1]["seq"] if entries else since}
+
+
+@app.get("/v1/audit/verify")
+def audit_verify():
+    """Recompute the audit chain; ``ok`` is false, with where, if an entry was changed or removed."""
+    return _require_eventlog().verify_audit()
+
+
 # ── API tokens (admin only) ───────────────────────────────────────────────
 # The same API as the cluster control plane's.
 
@@ -1146,6 +1217,7 @@ class FlintDaemon:
         self.metrics: MetricsSampler | None = None
         self.cluster = None  # ClusterAgent when running as a cluster host agent
         self.tokens: TokenStore | None = None
+        self.eventlog = None  # eventlog.EventLog
         self.quotas: Quotas | None = None
 
     def kill_vm(self, vm_id: str) -> None:
@@ -1250,6 +1322,9 @@ class FlintDaemon:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
         self.tokens = TokenStore(DAEMON_DB_PATH)
+        from flint.daemon.eventlog import EventLog
+        self.eventlog = EventLog(DAEMON_DB_PATH)
+        _events.sink = self.eventlog.record
         self.quotas = Quotas(DAEMON_DB_PATH)
         from flint.core import config as _cfg
         if not _cfg.CLUSTER_MODE:  # a host agent's only caller is the control plane, over mTLS

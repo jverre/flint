@@ -488,6 +488,7 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 	rule := matchRule(s.sso.cfg.Rules, who)
 	if rule == nil {
 		log.Printf("SSO %s: %s has no access (no rule matches)", pid, who.name())
+		s.auditSignIn(r, "anonymous", who.name(), "/auth/callback/"+pid, 403)
 		shown := firstNonEmpty(who.Email, who.Login, who.Subject)
 		ssoPage(w, 403, "No access", shown+" isn't allowed to use this Flint. Ask its admin to add a rule for you.")
 		return
@@ -509,14 +510,23 @@ func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, fmt.Sprintf("http://127.0.0.1:%d/callback?%s", st.CLIPort, url.Values{"code": {code}}.Encode()), http.StatusFound)
 		return
 	}
-	_, token, expires, err := s.createSession(r.Context(), rule.Kind, rule.Tenants, who.name(), ttl)
+	sid, token, expires, err := s.createSession(r.Context(), rule.Kind, rule.Tenants, who.name(), ttl)
 	if err != nil {
 		ssoPage(w, 500, "Sign-in failed", err.Error())
 		return
 	}
+	s.auditSignIn(r, "token:"+sid, who.name(), "/auth/callback/"+pid, 302)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", Expires: time.UnixMilli(expires),
 		HttpOnly: true, Secure: s.sso.secure(), SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, st.Next, http.StatusFound)
+}
+
+// auditSignIn records a sign-in (or a refused one) in the audit log.
+func (s *Server) auditSignIn(r *http.Request, actor, who, path string, status int) {
+	if err := s.appendAudit(r.Context(), auditEntry{Actor: actor, ActorName: who, Method: r.Method,
+		Path: path, Status: status}); err != nil {
+		log.Printf("audit: sign-in of %s: %v", who, err)
+	}
 }
 
 func nonNil(v []string) []string {
@@ -646,11 +656,12 @@ func (s *Server) handleSSOCLIExchange(w http.ResponseWriter, r *http.Request) {
 		TTLms    int64    `json:"ttl_ms"`
 	}
 	json.Unmarshal([]byte(grantJSON), &grant)
-	_, token, exp, err := s.createSession(r.Context(), grant.Kind, grant.Tenants, grant.Identity, time.Duration(grant.TTLms)*time.Millisecond)
+	sid, token, exp, err := s.createSession(r.Context(), grant.Kind, grant.Tenants, grant.Identity, time.Duration(grant.TTLms)*time.Millisecond)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.auditSignIn(r, "token:"+sid, grant.Identity, "/auth/cli/exchange", 200)
 	writeJSON(w, 200, map[string]any{"token": token, "kind": grant.Kind, "tenants": nonNil(grant.Tenants),
 		"identity": grant.Identity, "expires_at": float64(exp) / 1000})
 }
