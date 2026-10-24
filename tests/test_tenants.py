@@ -259,6 +259,54 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
         vm_b = b.create()["vm_id"]
         vms.append(vm_b)
 
+        # Inspect the real host processes, then run a probe with a proxy's
+        # identity and namespaces: guest-facing parsers must have no host
+        # authority even if their interpreter were compromised.
+        import sqlite3
+        from pathlib import Path
+        from flint.core._identities import identity
+        import subprocess
+        with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
+            namespace = db.execute("SELECT ns_name FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()[0]
+            peer_directory = db.execute("SELECT vm_dir FROM sandboxes WHERE vm_id = ?", (vm_b,)).fetchone()[0]
+        proxy_uid = identity("proxy:" + namespace)[0]
+        workload_uids = {os.stat(f"/proc/{client.get(vm)['pid']}").st_uid
+                         for client, vm in ((a, a1), (a, a2), (b, vm_b))}
+        assert len(workload_uids) == 3 and proxy_uid not in workload_uids
+        proxies = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if proc.stat().st_uid == proxy_uid:
+                    proxies.append(proc)
+            except FileNotFoundError:
+                continue
+        assert proxies, "credential proxy has no dedicated unprivileged process"
+        proxy = proxies[0]
+        status = dict(line.split(":", 1) for line in (proxy / "status").read_text().splitlines() if ":" in line)
+        assert int(status["CapEff"], 16) == int(status["CapPrm"], 16) == int(status["CapBnd"], 16) == 0
+        assert status["NoNewPrivs"].strip() == "1" and not status["Groups"].strip()
+        environment = {entry.partition(b"=")[0] for entry in (proxy / "environ").read_bytes().split(b"\0")}
+        assert not {b"FLINT_SECRET_KEY", b"R2_SECRET_ACCESS_KEY", b"FLINT_STATE_DIR"} & environment
+        probe = r'''
+import os,subprocess,sys
+assert os.getuid()!=0
+for path in sys.argv[1:]:
+ try:
+  with open(path,"rb"): pass
+ except (FileNotFoundError,PermissionError): pass
+ else: raise AssertionError("proxy could read host resource: "+path)
+assert subprocess.run(["ip","link","add","flint-forbidden","type","dummy"],capture_output=True).returncode!=0
+print("proxy cannot read host resources or change its network")
+'''
+        checked = subprocess.run(["nsenter", f"--target={proxy.name}", "--mount", "--net", "--pid",
+            f"--root=/proc/{proxy.name}/root", "--wdns=/", "--", "setpriv",
+            f"--reuid={proxy_uid}", f"--regid={proxy_uid}", "--clear-groups", "--bounding-set=-all",
+            "--no-new-privs", "/usr/bin/python3", "-c", probe,
+            os.path.join(TEST_STATE_DIR, "secret.key"), os.path.join(TEST_STATE_DIR, "runtime.sock"),
+            os.path.join(TEST_STATE_DIR, "r2nfs.sock"),
+            os.path.join(peer_directory, "rootfs.ext4")], capture_output=True, text=True, timeout=10)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+
         def run(client, vm, cmd, timeout=60):
             r = client.exec_command(vm, cmd, timeout=timeout)
             return r["exit_code"], r["stdout"] + r["stderr"]

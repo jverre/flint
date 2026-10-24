@@ -76,7 +76,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         for tool in ("setpriv", "chroot"):
             if not shutil.which(tool):
                 problems.append(f"{tool} not found on PATH (needed to jail cloud-hypervisor)")
-        for tool in ("nft", "tc"):
+        for tool in ("nft", "tc", "bwrap", "setpriv"):
             if not shutil.which(tool):
                 problems.append(f"{tool} is required for workload isolation")
         return problems
@@ -320,7 +320,7 @@ class LinuxCloudHypervisorBackend(HostBackend):
         net = None
         try:
             if pool:
-                disk = pool.create(vm_id,os.path.join(src_dir,"rootfs.ext4"),_cfg.CH_UID)
+                disk = pool.create(vm_id,os.path.join(src_dir,"rootfs.ext4"),jail.identity[0])
                 with open(f"{jail.base}/shared-rootfs","x") as marker:
                     marker.write(pool.pool_id)
                 pool.attach(vm_id,jail.host_path(JAIL_ROOTFS),expected=disk)

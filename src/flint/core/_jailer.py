@@ -7,16 +7,21 @@ from dataclasses import dataclass
 
 from .config import (
     JAILER_BINARY, FIRECRACKER_BINARY, JAILER_BASE_DIR,
-    JAILER_UID, JAILER_GID, JAILER_CGROUP_VER, JAILER_SHARED_DIR, JAILER_PARENT_CGROUP,
+    JAILER_CGROUP_VER, JAILER_SHARED_DIR, JAILER_PARENT_CGROUP,
 )
 from ._artifacts import link_into, shared_readonly
 from ._jailfs import own
+from ._identities import vm_identity, release
 
 
 @dataclass
 class JailSpec:
     vm_id: str
     ns_name: str
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return vm_identity(self.vm_id)
 
     @property
     def chroot_base(self) -> str:
@@ -35,13 +40,13 @@ def stage_private_file(src: str, dest_name: str, spec: JailSpec) -> str:
     """Move a VM-owned writable file (e.g. a pool rootfs) into the chroot. Returns dest path."""
     dest = f"{spec.chroot_root}/{dest_name}"
     link_into(src, dest)
-    make_private(dest)
+    make_private(dest, spec.vm_id)
     return dest
 
 
-def make_private(path: str) -> None:
+def make_private(path: str, vm_id: str) -> None:
     """Hand a per-VM file to the jailed VMM. Copies of read-only golden files inherit 0444."""
-    own(path, JAILER_UID, JAILER_GID, 0o600)
+    own(path, *vm_identity(vm_id), 0o600)
 
 
 def stage_shared_file(src: str, dest_name: str, spec: JailSpec) -> str:
@@ -64,8 +69,8 @@ def build_jailer_command(spec: JailSpec, *, vcpus: int = 1, memory_mib: int = 12
         JAILER_BINARY,
         "--id", spec.vm_id,
         "--exec-file", FIRECRACKER_BINARY,
-        "--uid", str(JAILER_UID),
-        "--gid", str(JAILER_GID),
+        "--uid", str(spec.identity[0]),
+        "--gid", str(spec.identity[1]),
         "--chroot-base-dir", JAILER_BASE_DIR,
         "--cgroup-version", str(JAILER_CGROUP_VER),
         # With no --cgroup properties the jailer joins this existing group
@@ -93,3 +98,4 @@ def cleanup_jailer(chroot_base: str, vm_id: str) -> None:
             cgroup_path = f"/sys/fs/cgroup/{controller}/{JAILER_PARENT_CGROUP}/{vm_id}"
             if os.path.isdir(cgroup_path):
                 shutil.rmtree(cgroup_path, ignore_errors=True)
+    release("vm:" + vm_id)

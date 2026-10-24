@@ -14,7 +14,8 @@ import os
 import subprocess
 import uuid
 
-from .config import CH_UID, GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC
+from .config import GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC
+from ._identities import vm_identity
 from ._netns import BLOCKED_EGRESS, _setup_veth_pair, _delete_netns
 
 
@@ -138,7 +139,7 @@ class MigrationNetwork:
                 "tap",
                 "vnet_hdr",
                 "user",
-                str(CH_UID),
+                str(vm_identity(self.vm_id)[0]),
             )
             self._ns(ns, "ip", "link", "set", "tap0", "address", HOST_TAP_MAC)
             self._ns(ns, "ip", "addr", "add", f"{HOST_IP}/30", "dev", "tap0")

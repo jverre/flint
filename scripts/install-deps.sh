@@ -26,9 +26,9 @@ error() { printf "  [x] %s\n" "$*" >&2; exit 1; }
 # Native nftables and tc are part of the isolation boundary.
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
-  apt-get install -y -qq nftables iproute2
-elif ! command -v nft >/dev/null 2>&1 || ! command -v tc >/dev/null 2>&1; then
-  error "Install nftables and iproute2 before starting Flint"
+  apt-get install -y -qq nftables iproute2 bubblewrap util-linux
+elif ! command -v nft >/dev/null 2>&1 || ! command -v tc >/dev/null 2>&1 || ! command -v bwrap >/dev/null 2>&1 || ! command -v setpriv >/dev/null 2>&1; then
+  error "Install nftables, iproute2, bubblewrap and util-linux before starting Flint"
 fi
 
 # Detect architecture

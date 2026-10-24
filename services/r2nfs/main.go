@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"unicode"
 
@@ -261,7 +262,21 @@ func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager, i
 	mux := http.NewServeMux()
 	registerMgmtRoutes(mux, exports, volumes, images)
 	log.Printf("Management API on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	var listener net.Listener
+	var err error
+	if path, unix := strings.CutPrefix(addr, "unix:"); unix {
+		// The runtime alone manages volumes. Loopback TCP would also be
+		// reachable by a compromised, unprivileged public API process.
+		mask := syscall.Umask(0077)
+		listener, err = net.Listen("unix", path)
+		syscall.Umask(mask)
+	} else {
+		listener, err = net.Listen("tcp", addr)
+	}
+	if err != nil {
+		log.Fatalf("management listener: %v", err)
+	}
+	if err := http.Serve(listener, mux); err != nil {
 		log.Fatalf("Management API error: %v", err)
 	}
 }

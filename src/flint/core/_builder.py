@@ -127,7 +127,7 @@ def _vm(kind: str, disk_mb: int):
         if kind == "linux-firecracker":
             spec = JailSpec(vm_id, ns)
             os.makedirs(spec.chroot_root)
-            os.chown(spec.chroot_root, config.JAILER_UID, config.JAILER_GID)
+            os.chown(spec.chroot_root, *spec.identity)
             rootfs = f"{spec.chroot_root}/rootfs.ext4"
         else:
             from ._ch_jail import ChJail
@@ -135,7 +135,7 @@ def _vm(kind: str, disk_mb: int):
             jail.prepare()
             rootfs = jail.host_path("/rootfs.ext4")
         sparse_copy(source, rootfs)
-        make_private(rootfs) if spec else jail.give("/rootfs.ext4")
+        make_private(rootfs, vm_id) if spec else jail.give("/rootfs.ext4")
         # Allocate enough sparse space for Docker's vfs copies, export and output.
         with open(rootfs, "r+b") as f:
             f.truncate(max(12288, disk_mb * 4 + 4096) * (1 << 20))

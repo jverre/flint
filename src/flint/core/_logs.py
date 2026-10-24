@@ -70,6 +70,7 @@ class LogBus:
 
 
 _bus: LogBus | None = None
+hooks: list = []  # runtime -> unprivileged API notification channel
 
 
 def init_bus(loop: asyncio.AbstractEventLoop) -> LogBus:
@@ -83,7 +84,10 @@ def get_bus() -> LogBus | None:
 
 
 def append(vm_id: str, line: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    formatted = f"[{ts}] {line}"
+    for hook in hooks:
+        hook(vm_id, formatted)
     bus = _bus
     if bus is not None:
-        ts = time.strftime("%H:%M:%S")
-        bus.append(vm_id, f"[{ts}] {line}")
+        bus.append(vm_id, formatted)

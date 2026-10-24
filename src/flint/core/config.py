@@ -104,8 +104,7 @@ DAEMON_DB_PATH = f"{STATE_DIR}/flint.db"
 JAILER_BINARY      = os.environ.get("FLINT_JAILER_BINARY", "jailer")
 FIRECRACKER_BINARY = os.environ.get("FLINT_FIRECRACKER_BINARY", "/usr/local/bin/firecracker")
 JAILER_BASE_DIR    = os.environ.get("FLINT_JAILER_BASE_DIR", "/srv/jailer")
-JAILER_UID         = int(os.environ.get("FLINT_JAILER_UID", "1000"))
-JAILER_GID         = int(os.environ.get("FLINT_JAILER_GID", "1000"))
+# Host process identities are allocated per resource by _identities.py.
 JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
 # Pool entries and shared read-only artifacts (snapshots, kernel, VMM binary)
 # live on the jailer's filesystem so they can be hard-linked into each chroot.
@@ -132,7 +131,6 @@ CH_BINARY         = os.environ.get("FLINT_CH_BINARY", "/usr/local/bin/cloud-hype
 CH_CPU_COUNT      = int(os.environ.get("FLINT_CH_CPU_COUNT", "1"))
 CH_MEMORY_BYTES   = int(os.environ.get("FLINT_CH_MEMORY_BYTES", str(128 * 1024 * 1024)))
 CH_GOLDEN_DIR     = os.environ.get("FLINT_CH_GOLDEN_DIR", f"{DATA_DIR}/.golden-ch")
-CH_UID            = int(os.environ.get("FLINT_CH_UID", str(JAILER_UID)))
 
 # ── macOS Virtualization.framework backend ───────────────────────────────
 VZ_KERNEL_PATH = os.environ.get("FLINT_VZ_KERNEL_PATH", os.path.join(DATA_DIR, "vz", "vmlinux"))
@@ -199,6 +197,7 @@ R2_CACHE_DIR = os.environ.get("FLINT_R2_CACHE_DIR", os.path.join(STATE_DIR, "r2-
 R2_CACHE_SIZE_MB = int(os.environ.get("FLINT_R2_CACHE_SIZE_MB", "1024"))
 R2NFS_PORT = int(os.environ.get("FLINT_R2NFS_PORT", "2049"))
 R2NFS_MGMT_PORT = int(os.environ.get("FLINT_R2NFS_MGMT_PORT", "9200"))
+R2NFS_MGMT_SOCKET = os.path.join(STATE_DIR, "r2nfs.sock")
 # Sandboxes attach exclusive volumes (read-write) and snapshots of them
 # (read-only) over NBD from the same server.
 NBD_PORT = int(os.environ.get("FLINT_NBD_PORT", "10809"))

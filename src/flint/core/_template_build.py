@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 
 from .config import log, TEMPLATES_DIR, KERNEL_PATH, BOOT_ARGS, GUEST_MAC
 from ._snapshot import create_golden_snapshot
-from ._template_registry import register_template_artifact, update_template_artifact_status
-
-
-def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug or "template"
+from ._template_registry import register_template_artifact, update_template_artifact_status, _slugify
 
 
 def _generate_dockerfile(base_image: str, steps: list[dict], flint_injection: bool = True) -> str:

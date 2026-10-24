@@ -37,9 +37,7 @@ from flint.core.config import (
     GOLDEN_DIR,
     GOLDEN_TAP,
     GUEST_IP,
-    JAILER_GID,
     JAILER_PARENT_CGROUP,
-    JAILER_UID,
     TEMPLATES_DIR,
     log,
 )
@@ -64,7 +62,7 @@ class LinuxFirecrackerBackend(HostBackend):
             problems.append(f"jailer binary not found (searched PATH and {JAILER_BINARY})")
         if not os.path.exists(KERNEL_PATH):
             problems.append(f"kernel image not found at {KERNEL_PATH}")
-        for tool in ("nft", "tc"):
+        for tool in ("nft", "tc", "bwrap", "setpriv"):
             if not shutil.which(tool):
                 problems.append(f"{tool} is required for workload isolation")
         return problems
@@ -220,7 +218,8 @@ class LinuxFirecrackerBackend(HostBackend):
             if not have_base:
                 # Pool miss at create: build the base now (slower, same result).
                 # The VMM has run guest code, so don't trust paths in its jail.
-                copy_within(os.path.join(entry.vm_dir, "mem"), pause_mem, JAILER_UID, JAILER_GID)
+                from flint.core._identities import vm_identity
+                copy_within(os.path.join(entry.vm_dir, "mem"), pause_mem, *vm_identity(entry.vm_id))
             resp = _fc_put(entry.socket_path, "/snapshot/create", {
                 "snapshot_type": "Diff",
                 "snapshot_path": PAUSE_VMSTATE,
@@ -263,13 +262,13 @@ class LinuxFirecrackerBackend(HostBackend):
         spec = JailSpec(vm_id=vm_id, ns_name="")
         cleanup_jailer(spec.chroot_base, vm_id)  # a stale jail from an earlier life of this ID
         os.makedirs(spec.chroot_root)
-        os.chown(spec.chroot_root, JAILER_UID, JAILER_GID)
+        os.chown(spec.chroot_root, *spec.identity)
         net = None
         try:
             for name in self._STATE_FILES:
                 dest = os.path.join(spec.chroot_root, name)
                 os.rename(os.path.join(src_dir, name), dest)
-                make_private(dest)
+                make_private(dest, vm_id)
             net = acquire_netns("fc-", lambda _ns: GOLDEN_TAP, allow_internet_access, use_pool=use_pool)
             row = {
                 "vm_id": vm_id, "vm_dir": spec.chroot_root, "ns_name": net.ns_name,

@@ -415,7 +415,51 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// Keep replaced metadata reachable until it is wiped. Otherwise a reader
+	// holding the old inode can still read it after the image is deleted.
+	retired := ""
+	if _, err := os.Lstat(path); err == nil {
+		link, err := os.CreateTemp(filepath.Dir(path), ".retired-*")
+		if err != nil {
+			return err
+		}
+		retired = link.Name()
+		if err := link.Close(); err != nil {
+			return err
+		}
+		if err := os.Remove(retired); err != nil {
+			return err
+		}
+		if err := os.Link(path, retired); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		if retired != "" {
+			_ = os.Remove(retired) // old inode is still reachable at path
+		}
+		return err
+	}
+	if retired != "" {
+		// Commit the replacement name before erasing the old inode. A crash
+		// must not roll back to metadata that has already been zeroed.
+		directory, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		err = directory.Sync()
+		directory.Close()
+		if err != nil {
+			return err
+		}
+		if _, err := WipePrivateFile(retired); err != nil {
+			return err // retain the name so image deletion can retry the wipe
+		}
+		return os.Remove(retired)
+	}
+	return nil
 }
 
 // References returns the store keys an image with manifest m needs: its
