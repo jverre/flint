@@ -160,23 +160,21 @@ class MigrationNetwork:
             self._sysctls(ns)
             # No NAT or stateful filtering here. The anchored gateway admits
             # replies; the migrated namespace need not carry conntrack state.
-            rules = [
-                "*filter",
-                ":INPUT DROP [0:0]",
-                ":FORWARD DROP [0:0]",
-                ":OUTPUT ACCEPT [0:0]",
-                "-A INPUT -i lo -j ACCEPT",
-                "-A INPUT -i tap0 -j ACCEPT",
-                f"-A FORWARD -i uplink0 -o tap0 -d {GUEST_IP}/32 -j ACCEPT",
-            ]
-            for cidr in BLOCKED_EGRESS:
-                rules.append(f"-A FORWARD -i tap0 -d {cidr} -j DROP")
-                rules.append(f"-A OUTPUT -o uplink0 -d {cidr} -j DROP")
-            if internet:
-                rules.append(
-                    f"-A FORWARD -i tap0 -o uplink0 -s {GUEST_IP}/32 -j ACCEPT"
-                )
-            self._ns(ns, "iptables-restore", input="\n".join(rules + ["COMMIT", ""]))
+            blocked = "{ " + ", ".join(BLOCKED_EGRESS) + " }"
+            rules = f'''table inet flint_migration {{
+              chain input {{ type filter hook input priority filter; policy drop;
+                iifname {{ "lo", "tap0" }} accept
+              }}
+              chain forward {{ type filter hook forward priority filter; policy drop;
+                iifname "uplink0" oifname "tap0" ip daddr {GUEST_IP} accept
+                iifname "tap0" ip daddr {blocked} drop
+                {f'iifname "tap0" oifname "uplink0" ip saddr {GUEST_IP} accept' if internet else ''}
+              }}
+              chain output {{ type filter hook output priority filter; policy accept;
+                oifname "uplink0" ip daddr {blocked} drop
+              }}
+            }}\n'''
+            self._ns(ns, "nft", "-f", "-", input=rules)
             return ns, "tap0"
         except Exception:
             _delete_netns(ns)
@@ -227,32 +225,19 @@ class MigrationNetwork:
                 self.local_ip,
                 "self",
             )
-            rules = [
-                "*filter",
-                ":INPUT DROP [0:0]",
-                ":FORWARD DROP [0:0]",
-                ":OUTPUT ACCEPT [0:0]",
-                f"-A FORWARD -i {veth} -o uplink0 -d {GUEST_IP}/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-            ]
-            rules += [
-                f"-A FORWARD -i uplink0 -d {cidr} -j DROP" for cidr in BLOCKED_EGRESS
-            ]
-            if internet:
-                rules.append(
-                    f"-A FORWARD -i uplink0 -o {veth} -s {GUEST_IP}/32 -j ACCEPT"
-                )
-            rules += [
-                "COMMIT",
-                "*nat",
-                ":PREROUTING ACCEPT [0:0]",
-                ":INPUT ACCEPT [0:0]",
-                ":OUTPUT ACCEPT [0:0]",
-                ":POSTROUTING ACCEPT [0:0]",
-                f"-A POSTROUTING -s {GUEST_IP}/32 -o {veth} -j MASQUERADE",
-                "COMMIT",
-                "",
-            ]
-            self._ns(ns, "iptables-restore", input="\n".join(rules))
+            blocked = "{ " + ", ".join(BLOCKED_EGRESS) + " }"
+            rules = f'''table inet flint_gateway {{
+              chain input {{ type filter hook input priority filter; policy drop; }}
+              chain forward {{ type filter hook forward priority filter; policy drop;
+                iifname "{veth}" oifname "uplink0" ip daddr {GUEST_IP} ct state established,related accept
+                iifname "uplink0" ip daddr {blocked} drop
+                {f'iifname "uplink0" oifname "{veth}" ip saddr {GUEST_IP} accept' if internet else ''}
+              }}
+              chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+                ip saddr {GUEST_IP} oifname "{veth}" masquerade
+              }}
+            }}\n'''
+            self._ns(ns, "nft", "-f", "-", input=rules)
             return address
         except Exception:
             _delete_netns(ns)

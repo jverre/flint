@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,20 +50,25 @@ func wipeFile(path string) (int64, error) {
 
 // wipeAll wipes every file under dir, then removes it.
 func wipeAll(dir string) (int64, error) {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil // retry after the overlay was removed but collection failed
+	} else if err != nil {
+		return 0, err
+	}
 	var total int64
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		n, werr := wipeFile(path)
 		total += n
-		if werr != nil {
-			log.Printf("wiping %s: %v", path, werr)
-		}
-		return nil
+		return werr
 	})
-	if rerr := os.RemoveAll(dir); err == nil {
-		err = rerr
+	if err == nil {
+		err = os.RemoveAll(dir)
 	}
 	return total, err
 }
@@ -124,7 +128,7 @@ func collectGarbage(imagesDir string, store blockstore.Store, storeDir string, e
 			path := filepath.Join(dir, o.Name())
 			n, werr := wipeFile(path)
 			if werr != nil {
-				log.Printf("wiping %s: %v", path, werr)
+				return removed, freed, werr
 			}
 			if err := os.Remove(path); err != nil {
 				return removed, freed, err

@@ -56,7 +56,10 @@ def stage_shared_file(src: str, dest_name: str, spec: JailSpec) -> str:
     return dest
 
 
-def build_jailer_command(spec: JailSpec) -> list[str]:
+def build_jailer_command(spec: JailSpec, *, vcpus: int = 1, memory_mib: int = 128) -> list[str]:
+    from ._limits import cgroup_limits
+    cgroup_limits(f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{spec.vm_id}",
+                  f"{spec.chroot_root}/rootfs.ext4", vcpus=vcpus, memory_mib=memory_mib)
     return [
         JAILER_BINARY,
         "--id", spec.vm_id,
@@ -80,7 +83,7 @@ def cleanup_jailer(chroot_base: str, vm_id: str) -> None:
     if JAILER_CGROUP_VER == 2:
         cgroup_path = f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{vm_id}"
         if os.path.isdir(cgroup_path):
-            shutil.rmtree(cgroup_path, ignore_errors=True)
+            os.rmdir(cgroup_path)
     else:
         for controller in ("cpu", "memory", "blkio", "devices", "pids"):
             cgroup_path = f"/sys/fs/cgroup/{controller}/{JAILER_PARENT_CGROUP}/{vm_id}"

@@ -297,7 +297,7 @@ func (m *ImageManager) Delete(id string) error {
 	}
 	n, freed, err := collectGarbage(m.dir, m.store, filepath.Join(m.dir, "store"), open)
 	if err != nil {
-		log.Printf("image %s deleted; collecting unshared chunks failed, they stay: %v", id, err)
+		return fmt.Errorf("image %s: collecting unshared chunks failed; retry deletion: %w", id, err)
 	} else {
 		log.Printf("Deleted image %s: wiped %d bytes of overlay, %d unshared objects (%d bytes)", id, wiped, n, freed)
 	}

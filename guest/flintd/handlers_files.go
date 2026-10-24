@@ -15,7 +15,7 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
 		return
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if os.IsNotExist(err) {
@@ -24,8 +24,18 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
 		return
 	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		http.Error(w, `{"error":"not a regular file"}`, http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(data)
+	if st.Size() == 0 { // procfs reports zero size for files such as /proc/meminfo.
+		io.Copy(w, f)
+		return
+	}
+	http.ServeContent(w, r, st.Name(), st.ModTime(), f)
 }
 
 func handleFileWrite(w http.ResponseWriter, r *http.Request) {

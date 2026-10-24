@@ -266,6 +266,33 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
                                "'http://169.254.169.254/metadata/instance?api-version=2021-02-01'")
         assert code != 0, f"a1 got cloud metadata through its proxy: {out}"
 
+        # Default deny includes real guest services and the two control ports.
+        peer_ip = a.get(a2)["network_address"]
+        other_ip = b.get(vm_b)["network_address"]
+        assert peer_ip and other_ip and peer_ip != other_ip
+        code, out = run(a, a2, "mkdir -p /tmp/peer-www; echo tenant-a > /tmp/peer-www/index.html; httpd -p 18080 -h /tmp/peer-www")
+        assert code == 0, out
+        code, out = run(a, a1, f"wget -q -T2 -O - http://{peer_ip}:18080")
+        assert code != 0, f"same-tenant traffic allowed without opt-in: {out}"
+        with _tcp(tok_b) as c:
+            assert c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": True}).status_code == 403
+        with _tcp(tok_a) as c:
+            c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": True}).raise_for_status()
+            assert c.get(f"/v1/tenants/{ta}/network").json()["allow_same_tenant"] is True
+        code, out = run(a, a1, f"wget -q -T3 -O - http://{peer_ip}:18080")
+        assert code == 0 and out.strip() == "tenant-a", out
+        for target in (f"{peer_ip} 5000", f"{peer_ip} {PROXY_PORT}", f"{other_ip} 18080"):
+            code, out = run(a, a1, f"nc -w2 {target} </dev/null")
+            assert code != 0, f"peer opt-in exposed another tenant or control port: {target}: {out}"
+        a.pause(a2)
+        a.resume(a2)
+        code, out = run(a, a1, f"wget -q -T3 -O - http://{peer_ip}:18080")
+        assert code == 0 and out.strip() == "tenant-a", out
+        with _tcp(tok_a) as c:
+            c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": False}).raise_for_status()
+        code, out = run(a, a1, f"wget -q -T2 -O - http://{peer_ip}:18080")
+        assert code != 0, f"traffic still allowed after revocation: {out}"
+
         # Credentials: injected on a1's HTTPS, never inside a1, not readable, not b's.
         code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
         assert code == 0, out
@@ -283,9 +310,30 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         assert "x-flint-auth" not in json.loads(out)["headers"], out
         assert b.get(a1) is None
 
-        # Deleting a1 wipes it, and only a's event stream hears of it.
-        a.kill(vms.pop(0))
-        _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
+        # Hold the real disk/snapshot inodes open across deletion, so an
+        # unlink without wiping cannot satisfy the exit criterion.
+        import sqlite3
+        from pathlib import Path
+        a.pause(a1)
+        with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
+            vm_dir, chroot = db.execute("SELECT vm_dir, chroot_base FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()
+        root = Path(chroot or vm_dir)
+        private = [p for p in root.rglob("*") if not p.is_symlink() and p.is_file()
+                   and p.stat().st_nlink == 1 and p.stat().st_size > 0]
+        assert any("pause" in str(p) for p in private), "no private pause snapshot was exercised"
+        held = [p.open("rb") for p in private]
+        try:
+            a.kill(a1)
+            vms.remove(a1)
+            wiped = _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
+            assert wiped["files"] > 0 and wiped["bytes"] > 0, wiped
+            assert not root.exists(), f"deleted VM files remain under {root}"
+            for stream in held:
+                while chunk := stream.read(1 << 20):
+                    assert chunk.count(0) == len(chunk), f"data left in deleted file {stream.name}"
+        finally:
+            for stream in held:
+                stream.close()
         b_mark = b.create()["vm_id"]  # once b hears of its own VM, it would have heard of a1 before
         vms.append(b_mark)
         _wait_for(events_b, lambda e: e.get("type") == "vm.created" and e["vm"]["vm_id"] == b_mark, "b's own event")

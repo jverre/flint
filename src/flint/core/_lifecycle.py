@@ -82,5 +82,4 @@ class LifecycleManager:
                 try:
                     self._manager.kill(vm_id)
                 except Exception:
-                    # If kill fails, just mark as dead
-                    self._store.transition_state(vm_id, SandboxState.DEAD, detail="error cleanup failed")
+                    log.exception("[%s] cleanup failed; retaining resource for retry", sid)

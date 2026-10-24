@@ -50,9 +50,32 @@ class SandboxManager:
         self._backend = backend
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
+        self._delete_lock = threading.RLock()
+        self._network_lock = threading.RLock()
         self._state_store = state_store
         # Called with the sandbox ID just before a sandbox is killed.
         self.kill_hooks: list[Callable[[str], None]] = []
+
+    def refresh_tenant_networks(self) -> None:
+        if not self._backend.kind.startswith("linux-") or not self._state_store:
+            return
+        from ._netns import configure_tenant_peers
+        with self._network_lock:
+            groups: dict[tuple[str, str], list[str]] = {}
+            for row in self._state_store.list_active():
+                if not row.get("ns_name") or row["state"] == SandboxState.ERROR.value:
+                    continue
+                tenant = row.get("tenant") or "default"
+                key = ("tenant", tenant) if self._state_store.tenant_network(tenant) else ("vm", row["ns_name"])
+                groups.setdefault(key, []).append(row["ns_name"])
+            configure_tenant_peers(list(groups.values()))
+
+    def set_tenant_network(self, tenant: str, enabled: bool) -> None:
+        if not self._backend.kind.startswith("linux-") or config.CLUSTER_MODE:
+            raise ValueError("Tenant networking requires a single Linux host")
+        with self._network_lock:
+            self._state_store.set_tenant_network(tenant, enabled)
+            self.refresh_tenant_networks()
 
     def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None, vm_id: str | None = None, tenant: str = "", availability: str = "") -> str:
         """Start an interactive VM from a template snapshot. Returns the vm_id.
@@ -126,7 +149,7 @@ class SandboxManager:
             ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
             timings=boot.timings,
             network_policy=network_policy,
-            tenant=tenant,
+            tenant=tenant or "default",
             availability=availability,
         )
 
@@ -167,7 +190,7 @@ class SandboxManager:
                 chroot_base=boot.chroot_base,
                 backend_kind=entry.backend_kind,
                 backend_meta_json=entry.backend_metadata,
-                tenant=tenant,
+                tenant=tenant or "default",
                 availability=availability,
             )
 
@@ -183,6 +206,8 @@ class SandboxManager:
                 self.kill(vm_id)
                 raise
 
+        self.refresh_tenant_networks()
+
         total_ms = (time.monotonic() - boot.t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
         log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
@@ -190,16 +215,24 @@ class SandboxManager:
         return vm_id
 
     def kill(self, sandbox_id: str) -> None:
+        with self._delete_lock:
+            self._kill(sandbox_id)
+
+    def _kill(self, sandbox_id: str) -> None:
         with self._lock:
-            entry = self._sandboxes.pop(sandbox_id, None)
+            entry = self._sandboxes.get(sandbox_id)
+        if entry:
+            entry.state = SandboxState.ERROR
+            entry.agent_healthy = False
+        if self._state_store:
+            self._state_store.transition_state(sandbox_id, SandboxState.ERROR, detail="deletion pending")
+        # Revoke peer ACLs before releasing a bridge address for reuse.
+        self.refresh_tenant_networks()
         for hook in self.kill_hooks:
-            try:
-                hook(sandbox_id)
-            except Exception:
-                log.exception("[%s] kill hook failed", sandbox_id[:8])
+            hook(sandbox_id)
         if not entry:
             row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
-            if row and row["state"] == SandboxState.PAUSED.value:
+            if row and row["state"] in (SandboxState.PAUSED.value, SandboxState.ERROR.value):
                 self._backend.discard_paused(row)
                 self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
                 self._report_wiped(sandbox_id)
@@ -212,10 +245,21 @@ class SandboxManager:
             except Exception:
                 pass
 
-        self._backend.kill(entry)
+        try:
+            self._backend.kill(entry)
+        except Exception as exc:
+            entry.state = SandboxState.ERROR
+            entry.agent_healthy = False
+            if self._state_store:
+                self._state_store.transition_state(sandbox_id, SandboxState.ERROR, detail=str(exc))
+            raise
+
+        with self._lock:
+            self._sandboxes.pop(sandbox_id, None)
 
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
+        self.refresh_tenant_networks()
         self._report_wiped(sandbox_id)
 
     @staticmethod
@@ -311,6 +355,8 @@ class SandboxManager:
         if network_policy:
             self._apply_network_policy(entry, network_policy)
 
+        self.refresh_tenant_networks()
+
         log.debug("[%s] resumed", sandbox_id[:8])
         return sandbox_id
 
@@ -380,6 +426,7 @@ class SandboxManager:
             "timeout_seconds": None,
             "timeout_policy": row.get("timeout_policy"),
             "tenant": row.get("tenant") or "",
+            "network_address": json.loads(row.get("backend_meta_json") or "{}").get("veth_ip", ""),
             "availability": row.get("availability") or "",
         }
 

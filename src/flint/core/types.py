@@ -94,5 +94,6 @@ class _SandboxEntry:
             "timeout_seconds": self.timeout_seconds,
             "timeout_policy": self.timeout_policy,
             "tenant": self.tenant,
+            "network_address": self.backend_metadata.get("veth_ip", ""),
             "availability": self.availability,
         }

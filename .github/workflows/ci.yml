@@ -198,6 +198,11 @@ jobs:
           sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/ --ignore=tests/cluster -v -m "not slow" 2>&1 | tee /tmp/pytest.log
           exit ${PIPESTATUS[0]}
         timeout-minutes: 10
+      - name: Verify isolated template build and boot
+        if: matrix.suite == 'daemon'
+        run: |
+          sudo -E env "PATH=$PATH" "FLINT_BACKEND=${FLINT_BACKEND}" uv run python -m pytest tests/test_e2e.py::test_template_build_and_run -v
+        timeout-minutes: 20
       - name: Run cluster tests
         if: matrix.suite == 'cluster'
         run: |

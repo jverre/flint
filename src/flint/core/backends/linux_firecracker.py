@@ -64,6 +64,9 @@ class LinuxFirecrackerBackend(HostBackend):
             problems.append(f"jailer binary not found (searched PATH and {JAILER_BINARY})")
         if not os.path.exists(KERNEL_PATH):
             problems.append(f"kernel image not found at {KERNEL_PATH}")
+        for tool in ("nft", "tc"):
+            if not shutil.which(tool):
+                problems.append(f"{tool} is required for workload isolation")
         return problems
 
     def template_artifact_valid(self, template_dir: str) -> bool:

@@ -275,7 +275,7 @@ class DaemonClient:
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
         resp = self._http.post(
             "/templates/build",
-            json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb},
+            json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb, **({"tenant": self._tenant} if self._tenant else {})},
             timeout=600.0,
         )
         _raise_for_status(resp)
@@ -303,6 +303,11 @@ class DaemonClient:
         resp = self._http.get("/volumes")
         _raise_for_status(resp)
         return resp.json()["volumes"]
+
+    def configure_tenant_network(self, tenant: str, *, allow_same_tenant: bool) -> dict:
+        resp = self._http.put(f"/v1/tenants/{tenant}/network", json={"allow_same_tenant": allow_same_tenant})
+        _raise_for_status(resp)
+        return resp.json()
 
     def create_volume(self, name: str, size_gib: int | None = None) -> dict:
         body: dict = {"name": name}

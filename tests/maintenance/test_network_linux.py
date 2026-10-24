@@ -269,3 +269,77 @@ open(sys.argv[1],"w").write(json.dumps({"requests":len(pauses),"resets":0,"failu
         subprocess.run(
             ["ip", "addr", "del", "198.18.0.1/32", "dev", "lo"], capture_output=True
         )
+
+
+def test_single_host_tenant_boundaries_and_peer_opt_in():
+    """Exercise nftables, NAT and control-port exclusions with real TCP stacks."""
+    from flint.core import _netns as net
+    from flint.core._limits import network_limits
+    from flint.core.config import GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC, BRIDGE_IP, PROXY_PORT
+
+    guests = []
+    servers = []
+    namespaces = ["fc-a0000001", "ch-a0000002", "fc-b0000001"]
+    addresses = []
+    errors = []
+
+    def connects(guest, address, port):
+        result = subprocess.run(["ip", "netns", "exec", guest, "python", "-c",
+            "import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),.5); s.close()",
+            address, str(port)], capture_output=True, timeout=3)
+        errors[:] = [result.stderr.decode()]
+        return result.returncode == 0
+
+    try:
+        net.ensure_host_firewall()
+        for i, namespace in enumerate(namespaces):
+            address = net._setup_netns_pyroute2(namespace, "tap0")
+            addresses.append(address)
+            guest = f"guest-{i}"
+            guests.append(guest)
+            run("ip", "netns", "add", guest)
+            ns(namespace, "ip", "link", "del", "tap0")
+            ns(namespace, "ip", "link", "add", "tap0", "type", "veth", "peer", "name", "eth0")
+            ns(namespace, "ip", "link", "set", "eth0", "netns", guest)
+            ns(namespace, "ip", "link", "set", "tap0", "address", HOST_TAP_MAC, "up")
+            ns(namespace, "ip", "addr", "add", HOST_IP + "/30", "dev", "tap0")
+            ns(guest, "ip", "link", "set", "eth0", "address", GUEST_MAC, "up")
+            ns(guest, "ip", "link", "set", "lo", "up")
+            ns(guest, "ip", "addr", "add", GUEST_IP + "/30", "dev", "eth0")
+            ns(guest, "ip", "route", "add", "default", "via", HOST_IP)
+            network_limits(namespace, "tap0")
+            for port in (18080, 5000, PROXY_PORT):
+                servers.append(subprocess.Popen(["ip", "netns", "exec", guest, "python", "-c",
+                    "import socket,sys\ns=socket.socket(); s.bind((sys.argv[1],int(sys.argv[2]))); s.listen()\n"
+                    "while True:\n c,a=s.accept(); c.close()", GUEST_IP, str(port)], stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.PIPE))
+            deadline = time.monotonic() + 5
+            while not connects(guest, GUEST_IP, 18080) and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert connects(guest, GUEST_IP, 18080), (errors, ns(guest, "ss", "-ltnp"), ns(guest, "ip", "addr"))
+        assert not connects(guests[0], addresses[1], 18080)
+        assert not connects(guests[0], addresses[2], 18080)
+        net.configure_tenant_peers([namespaces[:2], namespaces[2:]])
+        assert connects(guests[0], addresses[1], 18080), "opted-in peers could not connect"
+        assert connects(guests[1], addresses[0], 18080), "peer replies/routing failed"
+        assert not connects(guests[0], addresses[2], 18080), "cross-tenant connection accepted"
+        assert not connects(guests[2], addresses[0], 18080), "cross-tenant ingress accepted"
+        for port in (5000, PROXY_PORT):
+            assert not connects(guests[0], addresses[1], port), "peer exposed a control port"
+        for ip in (BRIDGE_IP, "169.254.169.254", "192.168.0.1"):
+            assert not connects(guests[0], ip, 18080)
+        net.configure_tenant_peers([[n] for n in namespaces])
+        assert not connects(guests[0], addresses[1], 18080), "revoked network still connected"
+        # Rules are replaced atomically and idempotently, including proxy redirects.
+        net._setup_proxy_redirect(namespaces[0])
+        net._setup_proxy_redirect(namespaces[0])
+        net._remove_proxy_redirect(namespaces[0])
+        net.ensure_host_firewall()
+    finally:
+        for proc in servers:
+            proc.terminate()
+            proc.wait(timeout=5)
+        for namespace in namespaces:
+            net._delete_netns(namespace)
+        for guest in guests:
+            run("ip", "netns", "del", guest)

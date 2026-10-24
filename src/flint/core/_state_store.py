@@ -75,6 +75,7 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        self._conn.execute("CREATE TABLE IF NOT EXISTS tenant_networks (tenant TEXT PRIMARY KEY, allow_same_tenant INTEGER NOT NULL DEFAULT 0)")
         # It holds token hashes and sealed credentials: the daemon's user only.
         for path in (db_path, db_path + "-wal", db_path + "-shm"):
             if os.path.exists(path):
@@ -129,6 +130,17 @@ class StateStore:
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._conn.execute("VACUUM")
 
+    @_locked
+    def tenant_network(self, tenant: str) -> bool:
+        row = self._conn.execute("SELECT allow_same_tenant FROM tenant_networks WHERE tenant = ?", (tenant,)).fetchone()
+        return bool(row and row[0])
+
+    @_locked
+    def set_tenant_network(self, tenant: str, enabled: bool) -> None:
+        self._conn.execute("INSERT INTO tenant_networks VALUES (?, ?) ON CONFLICT(tenant) DO UPDATE SET allow_same_tenant=excluded.allow_same_tenant", (tenant, int(enabled)))
+        self._conn.commit()
+
+    @_locked
     def insert_sandbox(
         self,
         vm_id: str,

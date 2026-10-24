@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pytest
 
 from flint.core import _wipe
 
@@ -31,6 +32,22 @@ def test_private_files_are_wiped_before_removal(tmp_path, monkeypatch):
     assert seen["disk"].count(0) == len(seen["disk"]), "data left in the file when it was removed"
     assert _wipe.take("vm-1")["files"] == 1
     assert _wipe.take("vm-1") == {"files": 0, "bytes": 0}
+
+    # A failed durability check keeps the resource, so callers cannot report
+    # successful deletion and lose the only path with which to retry it.
+    retry = _write(tmp_path / "retry" / "rootfs.ext4", b"private" * 1000)
+    real_sync = _wipe.os.fsync
+    def unavailable(_fd):
+        raise OSError("storage unavailable")
+    monkeypatch.setattr(_wipe.os, "fsync", unavailable)
+    with pytest.raises(_wipe.WipeError, match="retained for retry"):
+        _wipe.wipe_tree(str(tmp_path / "retry"), "vm-retry")
+    assert os.path.exists(retry)
+    assert _wipe.take("vm-retry") == {"files": 0, "bytes": 0}
+    monkeypatch.setattr(_wipe.os, "fsync", real_sync)
+    monkeypatch.setattr(_wipe.shutil, "rmtree", real_rmtree)
+    _wipe.wipe_tree(str(tmp_path / "retry"), "vm-retry")
+    assert not os.path.exists(retry)
 
 
 def test_shared_and_outside_files_are_never_touched(tmp_path):

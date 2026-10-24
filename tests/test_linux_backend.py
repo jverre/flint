@@ -60,3 +60,16 @@ def test_vmm_runs_unprivileged_in_its_jail(sandbox, backend_kind):
     assert "0" not in status["Groups"].split(), status["Groups"]
     assert int(status["CapEff"], 16) == 0 and int(status["CapPrm"], 16) == 0, (status["CapEff"], status["CapPrm"])
     assert status["NoNewPrivs"].strip() == "1"
+
+    # These are live kernel limits on the VMM, not configuration promises.
+    from pathlib import Path
+    from flint.core import config
+    from flint.core._limits import DISK_BPS
+    if backend_kind == "linux-cloud-hypervisor":
+        group = Path(ChJail(sandbox.id).cgroup)
+    else:
+        group = Path("/sys/fs/cgroup") / config.JAILER_PARENT_CGROUP / sandbox.id
+    assert "max" not in (group / "cpu.max").read_text()
+    assert "max" not in (group / "memory.max").read_text()
+    limits = (group / "io.max").read_text()
+    assert f"rbps={DISK_BPS}" in limits and f"wbps={DISK_BPS}" in limits, limits

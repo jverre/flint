@@ -42,6 +42,10 @@ _lock = threading.Lock()
 _totals: dict[str, dict[str, int]] = {}  # vm_id -> {"files", "bytes"} wiped so far
 
 
+class WipeError(RuntimeError):
+    """Data could not be wiped. Keep the resource so deletion can be retried."""
+
+
 def _punch_hole(fd: int, length: int) -> bool:
     if length == 0:
         return True
@@ -91,17 +95,21 @@ def _wipe_fd(fd: int) -> int:
         return 0
     held = st.st_blocks * 512
     if held == 0:
+        os.fsync(fd)
         return 0
     if not (_punch_hole(fd, st.st_size) and not _has_data(fd, st.st_size)):
         _overwrite(fd, st.st_size)
+    os.fsync(fd)
     return held
 
 
 def _open_file(name: str, dir_fd: int | None = None) -> int | None:
     try:
         return os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
-    except OSError:
-        return None  # a symlink, a socket, gone, ...
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ELOOP, errno.ENXIO, errno.ENODEV):
+            return None  # gone, a symlink, socket or device
+        raise
 
 
 def wipe_file(path: str) -> int:
@@ -130,10 +138,12 @@ def wipe_tree(path: str, vm_id: str = "") -> None:
     try:
         if os.path.isdir(path) and not os.path.islink(path):
             root_dev = os.lstat(path).st_dev
-            for _dirpath, dirnames, filenames, dir_fd in os.fwalk(path, follow_symlinks=False):
+            def failed(exc):
+                raise exc
+
+            for _dirpath, dirnames, filenames, dir_fd in os.fwalk(path, follow_symlinks=False, onerror=failed):
                 if os.fstat(dir_fd).st_dev != root_dev:
-                    dirnames[:] = []  # never wipe inside a mount
-                    continue
+                    raise WipeError(f"Refusing to wipe mounted filesystem under {path}")
                 for name in filenames:
                     fd = _open_file(name, dir_fd)
                     if fd is None:
@@ -148,15 +158,17 @@ def wipe_tree(path: str, vm_id: str = "") -> None:
         else:
             wiped = wipe_file(path)
             files = 1 if wiped else 0
-    except Exception:
-        log.exception("wipe of %s failed; removing it anyway", path)
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path, ignore_errors=True)  # fd-based too: doesn't follow swapped symlinks
-    else:
-        try:
+    except Exception as exc:
+        raise WipeError(f"Wipe failed for {path}; retained for retry: {exc}") from exc
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)  # fd-based too: doesn't follow swapped symlinks
+        else:
             os.unlink(path)
-        except OSError:
-            pass
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise WipeError(f"Removal failed for {path}; retry deletion: {exc}") from exc
     if vm_id:
         with _lock:
             t = _totals.setdefault(vm_id, {"files": 0, "bytes": 0})

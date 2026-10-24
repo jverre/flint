@@ -186,11 +186,11 @@ def test_compute_network_has_no_nat_and_keeps_egress_isolation(monkeypatch):
     monkeypatch.setattr(network, "run", run)
     net = MigrationNetwork(VM, 42, "10.90.0.1", "10.90.0.2", mtu=1500)
     assert net.setup_compute(True) == (net.namespace, "tap0")
-    rules = next(body for argv, body in calls if argv[-1] == "iptables-restore")
-    assert "MASQUERADE" not in rules
-    assert "conntrack" not in rules
-    assert "169.254.0.0/16 -j DROP" in rules
-    assert "-s 172.16.0.2/32 -j ACCEPT" in rules
+    rules = next(body for argv, body in calls if argv[-3:] == ("nft", "-f", "-"))
+    assert "masquerade" not in rules
+    assert "ct state" not in rules
+    assert "169.254.0.0/16" in rules
+    assert 'ip saddr 172.16.0.2 accept' in rules
 
 
 def test_gateway_does_not_redirect_on_destination_prepare(tmp_path, monkeypatch):
