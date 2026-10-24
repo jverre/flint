@@ -27,6 +27,7 @@ type Principal struct {
 	Kind     string
 	Tenants  []string // empty = any tenant (service tokens)
 	Identity string   // "provider:email" for an SSO session (sso.go)
+	Name     string   // the token's name
 }
 
 func (p *Principal) IsAdmin() bool { return p.Kind == KindAdmin }
@@ -60,10 +61,10 @@ func parseToken(tok string) (id, secret string, ok bool) {
 }
 
 type tokenRow struct {
-	kind, hash, identity string
-	tenants              []string
-	expires              int64 // unix ms; 0 = until revoked
-	loaded               time.Time
+	kind, hash, identity, name string
+	tenants                    []string
+	expires                    int64 // unix ms; 0 = until revoked
+	loaded                     time.Time
 }
 
 var tokenCache sync.Map // id -> tokenRow
@@ -140,8 +141,8 @@ func (s *Server) authenticateToken(ctx context.Context, tok string) (*Principal,
 	} else {
 		var tenants string
 		var expires sql.NullInt64
-		err := s.db.QueryRow(ctx, `SELECT kind, secret_hash, tenants, expires_at, identity FROM tokens WHERE id = ?`, id).
-			Scan(&row.kind, &row.hash, &tenants, &expires, &row.identity)
+		err := s.db.QueryRow(ctx, `SELECT kind, secret_hash, tenants, expires_at, identity, name FROM tokens WHERE id = ?`, id).
+			Scan(&row.kind, &row.hash, &tenants, &expires, &row.identity, &row.name)
 		if isNotFound(err) {
 			return nil, errBadToken
 		}
@@ -159,7 +160,7 @@ func (s *Server) authenticateToken(ctx context.Context, tok string) (*Principal,
 	if row.expires != 0 && row.expires < nowMs() {
 		return nil, errBadToken
 	}
-	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants, Identity: row.identity}, nil
+	return &Principal{TokenID: id, Kind: row.kind, Tenants: row.tenants, Identity: row.identity, Name: row.name}, nil
 }
 
 type ctxKey int
@@ -192,7 +193,7 @@ func (s *Server) requireAuth(admin bool, h http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusForbidden, "admin token required")
 			return
 		}
-		h(w, r.WithContext(context.WithValue(r.Context(), principalKey, p)))
+		s.withAudit(w, r, p, h)
 	}
 }
 

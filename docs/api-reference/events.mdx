@@ -1,0 +1,54 @@
+---
+title: "Events and audit"
+description: "What happened to every VM, who caused it, and a tamper-evident log of every change."
+---
+
+Flint keeps every lifecycle change and action as an **event**, and every API call that changed something as an **audit entry**. Both say who caused it. The single daemon and a cluster's control plane serve the same API.
+
+## Events
+
+Each event has a `type`, a `ts` (Unix seconds), a `seq` (its position, for paging), its `tenant` and `vm_id` when it has them, and:
+
+| Field | Meaning |
+|-------|---------|
+| `actor` | Who caused it: `token:<id>` (an API token or sign-in session), `socket` (the daemon's Unix socket), `host:<id>` (a cluster host on its own), or `system` (Flint itself) |
+| `actor_name` | The token's name, or who signed in |
+
+Types include `vm.created`, `vm.state_changed`, `vm.paused`, `vm.resumed`, `vm.deleted`, `vm.wiped`, `vm.exec` (with `cmd`, `exit_code`, `duration_ms`, and the last 256 characters of `stdout_tail` and `stderr_tail`), `vm.process_started` and the `volume.*` events.
+
+`GET /v1/events` returns stored events, oldest first. Filters: `since` (a `seq`), `vm_id`, `tenant`, `type`, `actor`, `limit` (up to 5000). Pass the answer's `next` as `since` to get the next page. A token pinned to tenants only gets theirs.
+
+`GET /vms/{vm_id}/timeline` returns one VM's events, even after it was deleted.
+
+`WS /events` streams new events live. Tenant-pinned tokens receive only their tenants' events; `?tenant=` narrows the stream to one tenant. Use the stored-events endpoint for the other filters and for reconnecting after a gap.
+
+```bash
+flint events --vm 3f2a1b4c-...          # a VM's timeline
+flint events --type vm.exec -f          # follow every exec
+```
+
+The single daemon keeps events for 7 days.
+
+## Audit log
+
+Every authenticated API call that changes something (any method but `GET`, `HEAD` and `OPTIONS`), every terminal opened and every sign-in that reaches access-rule evaluation adds an entry. Sign-ins denied by an access rule are recorded too. Fields: `seq`, `ts_ms`, `actor`, `actor_name`, `method`, `path`, `status`, `tenant` (for a VM's path) and `request_id` (the `X-Request-Id` header of authenticated API responses). Request bodies, query strings and bearer tokens are never recorded in audit entries. Exec events do include command text and output tails, which may contain sensitive data; restrict access to the event database and API accordingly.
+
+Entries form a hash chain, so removing or editing one shows:
+
+```text
+hash = sha256(prev_hash ␟ seq ␟ ts_ms ␟ actor ␟ actor_name ␟ method ␟ path ␟ status ␟ tenant ␟ request_id)
+```
+
+where `␟` is the unit separator (`\x1f`), numbers are in decimal, and the text is UTF-8. The first entry's `prev_hash` is 64 zeros.
+
+Admin only:
+
+- `GET /v1/audit?since=&limit=`: entries, with `prev_hash` and `hash`, and `next`.
+- `GET /v1/audit/verify`: recomputes the chain. `{"ok": true, "count": ..., "last_hash": ...}`, or `{"ok": false, "broken_at": <seq>, "why": ...}`.
+
+```bash
+flint audit
+flint audit --verify
+```
+
+Keep a copy of `last_hash` somewhere else from time to time: anyone who can rewrite the whole database could rebuild the chain after it, but not one that matches a hash you kept. The single daemon keeps 90 days of entries.

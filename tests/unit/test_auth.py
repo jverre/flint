@@ -40,7 +40,7 @@ def test_tenant_names_are_checked():
 def test_tokens_authenticate_until_revoked(tmp_path):
     store = TokenStore(os.path.join(tmp_path, "flint.db"))
     record, token = store.create(SERVICE, "ci", ["acme"])
-    assert store.authenticate(token) == Principal(SERVICE, ("acme",), record["id"])
+    assert store.authenticate(token) == Principal(SERVICE, ("acme",), record["id"], name="ci")
     assert store.authenticate(token[:-1] + ("x" if token[-1] != "x" else "y")) is None
     assert store.authenticate("not-a-token") is None
     assert all("secret" not in t and token not in str(t) for t in store.list())

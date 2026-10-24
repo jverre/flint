@@ -92,6 +92,10 @@ flint quota show acme
 | `POST /v1/tokens` | Create an API token (admin) |
 | `GET /v1/tokens` | List API tokens (admin) |
 | `DELETE /v1/tokens/{id}` | Revoke an API token (admin) |
+| `GET /v1/events` | Stored events, with who caused them ([Events](/api-reference/events)) |
+| `GET /vms/{vm_id}/timeline` | One VM's events |
+| `GET /v1/audit` | The audit log (admin) |
+| `GET /v1/audit/verify` | Check the audit log's hash chain (admin) |
 | `PUT /v1/tenants/{tenant}/quota` | Set a tenant's limits (admin) |
 | `GET /v1/tenants/{tenant}/quota` | A tenant's limits and use |
 

@@ -53,6 +53,9 @@ func (s *Server) apiHandler() http.Handler {
 
 	mux.HandleFunc("GET /events", auth(s.handleEventsWS))
 	mux.HandleFunc("GET /v1/events", auth(s.handleEventsList))
+	mux.HandleFunc("GET /vms/{id}/timeline", auth(s.handleTimeline))
+	mux.HandleFunc("GET /v1/audit", admin(s.handleAuditList))
+	mux.HandleFunc("GET /v1/audit/verify", admin(s.handleAuditVerify))
 
 	mux.HandleFunc("POST /templates/build", auth(s.handleBuildTemplate))
 	mux.HandleFunc("GET /templates", auth(s.handleListTemplates))
@@ -461,6 +464,11 @@ func (s *Server) handleGateway(w http.ResponseWriter, r *http.Request) {
 			q.Del("token")
 			pr.Out.URL.RawQuery = q.Encode()
 			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("Cookie") // a browser's session is the control plane's, not the host's
+			// The host records who the call is for in its events (vm.exec, ...).
+			actor, name := actorOf(r.Context())
+			pr.Out.Header.Set("X-Flint-Actor", actor)
+			pr.Out.Header.Set("X-Flint-Actor-Name", name)
 			pr.Out.Host = target.Host
 		},
 		Transport:     s.agents.Transport,

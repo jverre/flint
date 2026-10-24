@@ -120,25 +120,29 @@ const evColor = (t: string) => (t.includes("lost") || t.includes("crash") || t.i
 function evText(e: FlintEvent): string {
   const t = e.type.replace(/^vm\./, "");
   const x = e as Record<string, unknown>;
-  if (t === "moved") return `Moved ${x.from_host ?? "?"} → ${x.to_host ?? "?"}${x.reason ? ` (${x.reason})` : ""}`;
-  if (t === "state_changed") return `State ${pretty(String(x.from ?? "?")).toLowerCase()} → ${pretty(String(x.to ?? "?")).toLowerCase()}`;
-  if (t === "lost" && x.reason) return `Lost: ${x.reason}`;
-  return pretty(t);
+  let text = pretty(t);
+  if (t === "moved") text = `Moved ${x.from_host ?? "?"} → ${x.to_host ?? "?"}${x.reason ? ` (${x.reason})` : ""}`;
+  else if (t === "state_changed") text = `State ${pretty(String(x.from ?? "?")).toLowerCase()} → ${pretty(String(x.to ?? "?")).toLowerCase()}`;
+  else if (t === "lost" && x.reason) text = `Lost: ${x.reason}`;
+  else if (t === "exec") text = `$ ${String(x.cmd ?? "").split("\n")[0].slice(0, 60)} → ${x.exit_code ?? "error"}`;
+  // Who did it, when a person or token did (not Flint itself).
+  const who = String(x.actor_name || (x.actor && !["system", "socket"].includes(String(x.actor)) ? x.actor : ""));
+  return who ? `${text} · ${who.replace(/^[a-z]+:/, "")}` : text;
 }
 
 function useVmEvents(id: string) {
   const cluster = useIsCluster();
   const live = useEvents().events;
   const hist = useQuery<FlintEvent[]>({
-    queryKey: ["vm-events", id], enabled: cluster, retry: false, staleTime: Infinity,
+    queryKey: ["vm-events", id], retry: false, staleTime: Infinity,
     queryFn: async () => {
-      // /v1/events is oldest-first with a 500 cap: page forward (bounded) so the newest are included.
-      let since = 0, all: (FlintEvent & { seq?: number })[] = [];
+      // The timeline is oldest-first, a page at a time: page forward (bounded) so the newest are included.
+      let since = 0, all: FlintEvent[] = [];
       for (let i = 0; i < 6; i++) {
-        const r = await api.get<{ events: (FlintEvent & { seq?: number })[] }>("/v1/events", { query: { vm_id: id, since } });
+        const r = await api.get<{ events: FlintEvent[]; next: number }>(`/vms/${id}/timeline`, { query: { since, limit: 1000 } });
         all = all.concat(r.events);
-        if (r.events.length < 500) break;
-        since = Math.max(...r.events.map((e) => e.seq ?? 0));
+        if (r.events.length < 1000) break;
+        since = r.next;
       }
       return all;
     },

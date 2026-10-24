@@ -47,7 +47,7 @@ provider and built-in tenant-aware observability in open source.
 | 2 | **Guest agent** (`flintd`): exec, PTY, files, processes | Exists |
 | 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Single host done except IO/network rate limits and same-tenant opt-in, see [01](01-tenant-isolation.md) |
 | 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, admin/service tokens and `tenant` exist ([03](03-cluster.md)). No checked-in OpenAPI spec; resources are flat, not `metadata/spec/status` (only VM sets are declarative). The single daemon has a trusted Unix socket, admin/service tokens on TCP, and a `tenant` on every VM, volume and template |
-| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: the cluster persists tenant-tagged events (`/v1/events`), without `actor` and not as an audit log. The single daemon's events are tenant-tagged and scoped, but in memory only. No exec events, no export |
+| 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: daemon and cluster persist tenant-tagged events with `actor`, exec details, per-VM timelines and a hash-chained admin audit log. CLI and dashboard read stored history. Export remains |
 | 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist; Terraform deploys clusters. Web UI at `/ui` on the daemon and the control plane (#31). No TypeScript SDK, MCP server or workload/admin Terraform provider |
 | 7 | **Day-2 ops**: rolling updates with health gates, host cordon/drain, live migration, backups | Cordon, drain, migration (snapshot-based) and VM-set rolling updates exist ([03](03-cluster.md)); no health gates, backups or live migration |
 
@@ -89,7 +89,8 @@ Details in [02-api-and-surfaces.md](02-api-and-surfaces.md).
 - Freeze the OpenAPI spec; resources follow `metadata/spec/status`.
   *Not started.*
 - Persist events as a per-VM timeline and an append-only audit log.
-  *Partial: the cluster persists tenant-tagged events; no actor or audit log.*
+  *Done for daemon and cluster: tenant + actor, exec events, timeline endpoint,
+  hash-chained audit log, CLI and dashboard history. Export remains.*
 - Per-VM, short-lived direct-access tokens (terminal, files, exposed ports).
   *Not started.*
 - Generate the TypeScript SDK and an MCP server from the spec. *Not started.*
@@ -129,8 +130,8 @@ Details in [03-cluster.md](03-cluster.md).
 ## Where to start
 
 Phase 1 is done apart from the open items listed under it. Template builds
-in a VM are the next isolation gap, then rate limits. Phase 2 starts with the OpenAPI spec and the
-persisted audit log.
+in a VM are the next isolation gap, then rate limits. Phase 2's persisted
+events and audit log are implemented; the OpenAPI contract is next.
 
 ## Non-goals for now
 

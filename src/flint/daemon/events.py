@@ -3,7 +3,8 @@
 `publish(...)` is safe to call from any thread. Each WebSocket subscriber gets
 a bounded asyncio.Queue; on overflow the oldest event is dropped.
 
-Every event carries the `tenant` it belongs to; `/events` subscribers only
+Every event carries the `tenant` it belongs to, the `actor` that caused it
+(see eventlog.py) and, once stored, its `seq`; `/events` subscribers only
 get their tenants' events.
 
 Event types (payload keys other than `type`, `ts` and `tenant`):
@@ -13,6 +14,7 @@ Event types (payload keys other than `type`, `ts` and `tenant`):
   vm.paused            vm_id: str
   vm.resumed           vm: dict
   vm.wiped             vm_id: str, files: int, bytes: int  (its files were wiped before removal)
+  vm.exec              vm_id: str, cmd: str, exit_code: int, duration_ms: float, stdout_tail, stderr_tail
   volume.created       volume: dict
   volume.deleted       volume_id: str
   volume.attached      vm_id: str, volume_id: str, mount_path: str
@@ -41,8 +43,7 @@ class EventBus:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._queues.discard(q)
 
-    def publish(self, event_type: str, **payload) -> None:
-        event = {"type": event_type, "ts": time.time(), **payload}
+    def publish(self, event: dict) -> None:
         try:
             self._loop.call_soon_threadsafe(self._fanout, event)
         except RuntimeError:
@@ -84,6 +85,9 @@ hooks: list = []
 # vm_id -> its tenant ("" if unknown); set by the daemon.
 vm_tenant = lambda _vm_id: ""  # noqa: E731
 
+# Stores an event and returns its seq; set by the daemon (eventlog.EventLog.record).
+sink = None
+
 
 def _tenant_of(payload: dict) -> str:
     vm = payload.get("vm")
@@ -105,11 +109,22 @@ def publish(event_type: str, **payload) -> None:
     """Publish to the global bus. No-op if the bus is not yet initialized."""
     if not payload.get("tenant"):
         payload["tenant"] = _tenant_of(payload)
+    if not payload.get("actor"):
+        from flint.daemon.eventlog import actor
+        payload["actor"], name = actor.get()
+        if name:
+            payload["actor_name"] = name
+    event = {"type": event_type, "ts": time.time(), **payload}
+    if sink is not None:
+        try:
+            event["seq"] = sink(event)
+        except Exception:
+            log.exception("storing event %s failed", event_type)
     for hook in hooks:
         try:
-            hook({"type": event_type, "ts": time.time(), **payload})
+            hook(event)
         except Exception:
             log.exception("event hook failed")
     bus = _bus
     if bus is not None:
-        bus.publish(event_type, **payload)
+        bus.publish(event)
