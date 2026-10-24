@@ -182,3 +182,32 @@ def test_volumes_belong_to_a_tenant(tenants, require_sandbox):
                 api.delete(f"{BASE_URL}/vms/{vm_b}")
             for vol in reversed(created):
                 api.delete(f"{BASE_URL}/volumes/{vol}")
+
+
+def test_a_tenant_over_its_quota_is_refused(tenants, require_sandbox):
+    (ta, tok_a), (_, tok_b) = tenants["a"], tenants["b"]
+    a, b = DaemonClient(TCP_URL, api_key=tok_a), DaemonClient(TCP_URL, api_key=tok_b)
+    with _tcp(tok_a) as c:
+        assert c.put(f"/v1/tenants/{ta}/quota", json={"max_vms": 1}).status_code == 403  # admins set quotas
+    resp = api.put(f"{BASE_URL}/v1/tenants/{ta}/quota", json={"max_vms": 1})
+    assert resp.status_code == 200, resp.text
+    vms = []
+    try:
+        vms.append(a.create()["vm_id"])
+        with pytest.raises(httpx.HTTPStatusError) as e:
+            a.create()
+        assert e.value.response.status_code == 429, e.value.response.text
+        assert "quota" in e.value.response.json()["detail"], e.value.response.text
+        vms.append(b.create()["vm_id"])  # another tenant isn't limited by it
+
+        with _tcp(tok_a) as c:
+            q = c.get(f"/v1/tenants/{ta}/quota").json()
+            assert (q["vms"], q["max_vms"]) == (1, 1), q
+            assert q["vcpus"] >= 1 and q["memory_mib"] >= 128, q
+
+        # Deleting the VM frees its place.
+        a.kill(vms.pop(0))
+        vms.append(a.create()["vm_id"])
+    finally:
+        for vm in vms:
+            api.delete(f"{BASE_URL}/vms/{vm}")

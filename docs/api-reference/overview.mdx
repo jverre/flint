@@ -44,6 +44,17 @@ The same API: `POST /v1/tokens` (`{"kind", "name", "tenants"}`, answers with the
 
 A volume can only be mounted into a VM of its own tenant, and a VM can only boot a shared template (built without a tenant, like `default`) or one of its own tenant's.
 
+## Quotas
+
+An admin can limit what each tenant holds on the host. Every VM counts, paused ones included; `0` means no limit.
+
+```bash
+flint quota set acme --max-vms 20 --max-vcpus 20 --max-memory-mib 4096 --max-volume-gib 100
+flint quota show acme
+```
+
+`PUT /v1/tenants/{tenant}/quota` sets some of `max_vms`, `max_vcpus`, `max_memory_mib` and `max_volume_gib` (the others stay). `GET /v1/tenants/{tenant}/quota` returns the limits and what the tenant uses now (`vms`, `vcpus`, `memory_mib`, `volume_gib`); a service token can read its own tenants'. A create that would go over a limit answers `429` and says which limit.
+
 ## Endpoints
 
 | Endpoint | Description |
@@ -79,6 +90,8 @@ A volume can only be mounted into a VM of its own tenant, and a VM can only boot
 | `POST /v1/tokens` | Create an API token (admin) |
 | `GET /v1/tokens` | List API tokens (admin) |
 | `DELETE /v1/tokens/{id}` | Revoke an API token (admin) |
+| `PUT /v1/tenants/{tenant}/quota` | Set a tenant's limits (admin) |
+| `GET /v1/tenants/{tenant}/quota` | A tenant's limits and use |
 
 ## Error responses
 
@@ -98,4 +111,5 @@ Common status codes:
 | `401` | No API token, or not a valid one |
 | `403` | The token can't do this (an admin-only endpoint, or another tenant) |
 | `404` | Sandbox or template not found (or another tenant's) |
+| `429` | The tenant is at its quota |
 | `503` | Guest agent unreachable |

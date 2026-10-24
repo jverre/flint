@@ -199,6 +199,10 @@ class LinuxCloudHypervisorBackend(HostBackend):
             },
         )
 
+    def vm_resources(self) -> tuple[int, int]:
+        from flint.core.config import CH_CPU_COUNT, CH_MEMORY_BYTES
+        return CH_CPU_COUNT, CH_MEMORY_BYTES >> 20
+
     def kill(self, entry: _SandboxEntry) -> None:
         ns_name = entry.ns_name or (entry.backend_metadata or {}).get("ns_name") or _ch_ns_name(entry.vm_id)
         socket_path = entry.socket_path or (entry.backend_metadata or {}).get("api_socket") or ""
