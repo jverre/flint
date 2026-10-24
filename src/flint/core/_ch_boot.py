@@ -38,6 +38,7 @@ from ._netns import (
     open_tap_fd,
 )
 from ._netns_pool import acquire_netns
+from ._wipe import wipe_tree
 from ._pool import _claim_pool_entry
 from .config import (
     CH_CPU_COUNT,
@@ -322,13 +323,13 @@ def ch_pause_vm(vm_id: str) -> str:
     try:
         _ch.vm_snapshot(jail.socket_path, "file:///pause.tmp")
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        wipe_tree(staging, vm_id)
         try:
             _ch.vm_resume(jail.socket_path)
         except Exception:
             pass
         raise
-    shutil.rmtree(pause_dir, ignore_errors=True)
+    wipe_tree(pause_dir, vm_id)  # the previous pause's memory
     os.rename(staging, pause_dir)
     return pause_dir
 

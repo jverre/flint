@@ -6,7 +6,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable
 
-from . import _secrets
+from . import _secrets, _wipe
 from .backends.base import HostBackend
 from . import config
 from .config import log, DEFAULT_TEMPLATE_ID
@@ -202,6 +202,7 @@ class SandboxManager:
             if row and row["state"] == SandboxState.PAUSED.value:
                 self._backend.discard_paused(row)
                 self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
+                self._report_wiped(sandbox_id)
             return
 
         # Stop credential proxy before tearing down the VM
@@ -215,6 +216,18 @@ class SandboxManager:
 
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
+        self._report_wiped(sandbox_id)
+
+    @staticmethod
+    def _report_wiped(sandbox_id: str) -> None:
+        """Publish ``vm.wiped``: proof that the sandbox's files were wiped before removal."""
+        wiped = _wipe.take(sandbox_id)
+        log.info("[%s] wiped %d files (%d bytes)", sandbox_id[:8], wiped["files"], wiped["bytes"])
+        try:
+            from flint.daemon.events import publish
+            publish("vm.wiped", vm_id=sandbox_id, files=wiped["files"], bytes=wiped["bytes"])
+        except Exception:
+            pass
 
     def pause(self, sandbox_id: str) -> None:
         """Pause a running sandbox: snapshot state to disk, kill process."""
