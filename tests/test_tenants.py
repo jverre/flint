@@ -236,6 +236,7 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
     for events, ws in ((events_a, ws_a), (events_b, ws_b)):
         threading.Thread(target=_collect, args=(events, ws), daemon=True).start()
     vms: list[str] = []
+    volumes: list[str] = []
     try:
         a1 = a.create(network_policy=policy)["vm_id"]
         vms.append(a1)
@@ -310,6 +311,39 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         assert "x-flint-auth" not in json.loads(out)["headers"], out
         assert b.get(a1) is None
 
+        # Storage ownership is enforced even for an admin attaching a volume.
+        with _tcp(tok_a) as c:
+            response = c.post("/volumes", json={"name": "isolation-data", "size_gib": 1})
+            response.raise_for_status()
+            volume = response.json()["volume"]
+            volumes.append(volume["id"])
+        assert volume["tenant"] == ta, volume
+        api.post(f"{BASE_URL}/vms/{a1}/mounts", json={"volume": volume["id"], "path": "/mnt/private"}).raise_for_status()
+        code, out = run(a, a1, "echo tenant-a-data > /mnt/private/marker; sync")
+        assert code == 0, out
+        assert api.post(f"{BASE_URL}/vms/{vm_b}/mounts", json={"volume": volume["id"], "path": "/mnt/stolen"}).status_code == 404
+        with _tcp(tok_b) as c:
+            assert volume["id"] not in {v["id"] for v in c.get("/volumes").json()["volumes"]}
+            assert c.post(f"/volumes/{volume['id']}/snapshot", json={"name": "stolen"}).status_code == 404
+        api.delete(f"{BASE_URL}/vms/{a1}/mounts", params={"path": "/mnt/private"}).raise_for_status()
+        from pathlib import Path
+        from flint.core._nfs_server import IMAGES_DIR, VOLUMES_DIR
+        volume_dir = Path(IMAGES_DIR if volume["kind"] == "image" else VOLUMES_DIR) / volume["id"]
+        volume_files = [p.open("rb") for p in volume_dir.rglob("*") if p.is_file() and not p.is_symlink()
+                        and p.stat().st_nlink == 1 and p.stat().st_size > 0]
+        assert volume_files, f"no on-disk volume files exercised under {volume_dir}"
+        try:
+            with _tcp(tok_a) as c:
+                c.delete(f"/volumes/{volume['id']}").raise_for_status()
+            volumes.remove(volume["id"])
+            assert not volume_dir.exists()
+            for stream in volume_files:
+                while chunk := stream.read(1 << 20):
+                    assert chunk.count(0) == len(chunk), f"data left in deleted volume file {stream.name}"
+        finally:
+            for stream in volume_files:
+                stream.close()
+
         # Hold the real disk/snapshot inodes open across deletion, so an
         # unlink without wiping cannot satisfy the exit criterion.
         import sqlite3
@@ -352,3 +386,5 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         ws_b.close()
         for vm in vms:
             api.delete(f"{BASE_URL}/vms/{vm}")
+        for volume_id in volumes:
+            api.delete(f"{BASE_URL}/volumes/{volume_id}")
