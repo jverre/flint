@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID, JAILER_UID, JAILER_GID
+from .config import log, GOLDEN_DIR, GOLDEN_TAP, DEFAULT_TEMPLATE_ID
 from ._netns import _delete_netns
 from ._netns_pool import acquire_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok, _wait_for_agent
@@ -99,7 +99,7 @@ def _boot_from_snapshot(
     try:
         # 1. Create chroot root directory
         os.makedirs(spec.chroot_root, exist_ok=True)
-        os.chown(spec.chroot_root, JAILER_UID, JAILER_GID)
+        os.chown(spec.chroot_root, *spec.identity)
 
         # 2. Stage rootfs into chroot
         with _timed(timings, "copy_rootfs_ms"):
@@ -123,7 +123,7 @@ def _boot_from_snapshot(
             elif not os.path.exists(f"{spec.chroot_root}/rootfs.ext4"):
                 rootfs_dest = f"{spec.chroot_root}/rootfs.ext4"
                 sparse_copy(f"{snapshot_dir}/rootfs.ext4", rootfs_dest)
-                make_private(rootfs_dest)
+                make_private(rootfs_dest, vm_id)
             # The vmstate bakes in the absolute drive path from when the snapshot was
             # created (e.g. /microvms/.golden/rootfs.ext4). Firecracker running inside
             # the jailer chroot resolves absolute symlink targets relative to the chroot

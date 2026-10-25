@@ -491,13 +491,13 @@ def _current_ch_version(binary: str) -> str | None:
 def _install_isolation_tools() -> None:
     if platform.system() != "Linux":
         return
-    if shutil.which("nft") and shutil.which("tc"):
+    if all(shutil.which(tool) for tool in ("nft", "tc", "bwrap", "setpriv")):
         return
     if shutil.which("apt-get"):
         subprocess.run(["apt-get", "update", "-qq"], check=True)
-        subprocess.run(["apt-get", "install", "-y", "-qq", "nftables", "iproute2"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "nftables", "iproute2", "bubblewrap", "util-linux"], check=True)
     else:
-        raise RuntimeError("Install nftables and iproute2 before starting Flint")
+        raise RuntimeError("Install nftables, iproute2, bubblewrap and util-linux before starting Flint")
 
 
 def install_cloud_hypervisor(version: str = "latest", install_dir: str = "/usr/local/bin") -> None:

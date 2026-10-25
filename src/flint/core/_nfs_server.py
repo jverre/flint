@@ -9,8 +9,11 @@ mounts, and replays its registrations, which is idempotent.
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import signal
+import socket
+import stat
 import subprocess
 import time
 import urllib.error
@@ -35,22 +38,22 @@ class NfsServerError(RuntimeError):
 
 
 def _mgmt(method: str, path: str, body: dict | None = None, timeout: float = 5) -> dict:
-    url = f"http://127.0.0.1:{config.R2NFS_MGMT_PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
+    conn = http.client.HTTPConnection("r2nfs", timeout=timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        try:
-            detail = json.loads(detail).get("error", detail)
-        except (ValueError, AttributeError):
-            pass
-        raise NfsServerError(detail.strip()) from None
+        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.sock.settimeout(timeout)
+        conn.sock.connect(config.R2NFS_MGMT_SOCKET)
+        conn.request(method, path, data, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        value = response.read()
+        if response.status >= 400:
+            raise NfsServerError(value.decode(errors="replace").strip())
+        return json.loads(value or b"{}")
     except OSError as e:
         raise NfsServerError(f"NFS server unreachable: {e}") from None
+    finally:
+        conn.close()
 
 
 def health() -> dict | None:
@@ -73,8 +76,8 @@ def ensure_running() -> None:
         _stop_recorded()
         if health():
             raise NfsServerError(
-                f"Another NFS server is on 127.0.0.1:{config.R2NFS_MGMT_PORT} serving "
-                f"{current.get('volumes_dir')!r}; stop it or set FLINT_R2NFS_MGMT_PORT/FLINT_R2NFS_PORT"
+                f"Another NFS server is on {config.R2NFS_MGMT_SOCKET} serving "
+                f"{current.get('volumes_dir')!r}; stop it or select another state directory"
             )
 
     binary = os.path.realpath(BINARY)
@@ -87,7 +90,7 @@ def ensure_running() -> None:
     cmd = [
         binary,
         f"--listen={config.BRIDGE_IP}:{config.R2NFS_PORT}",
-        f"--mgmt=127.0.0.1:{config.R2NFS_MGMT_PORT}",
+        f"--mgmt=unix:{config.R2NFS_MGMT_SOCKET}",
         f"--volumes-dir={VOLUMES_DIR}",
         f"--images-dir={IMAGES_DIR}",
         f"--nbd-listen={config.BRIDGE_IP}:{config.NBD_PORT}",
@@ -106,6 +109,10 @@ def ensure_running() -> None:
         env["R2_ACCESS_KEY_ID"] = config.R2_ACCESS_KEY_ID
         env["R2_SECRET_ACCESS_KEY"] = config.R2_SECRET_ACCESS_KEY
 
+    if os.path.lexists(config.R2NFS_MGMT_SOCKET):
+        if not stat.S_ISSOCK(os.lstat(config.R2NFS_MGMT_SOCKET).st_mode):
+            raise NfsServerError("Management socket path is not a socket")
+        os.unlink(config.R2NFS_MGMT_SOCKET)
     log.info("Starting NFS server: %s", " ".join(cmd))
     with open(_LOG_PATH, "ab") as log_fd:
         proc = subprocess.Popen(

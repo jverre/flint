@@ -6,10 +6,16 @@ import functools
 import fcntl
 import json
 import os
+import re
 import threading
 import time
 
 from .config import log, TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, GOLDEN_DIR
+
+
+def _slugify(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "template"
 
 
 def _registry_path() -> str:

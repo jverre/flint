@@ -24,7 +24,7 @@ from flint.core.config import (
 from flint.core.manager import SandboxManager
 from flint.core.types import SandboxState
 from flint.core._template_registry import (
-    list_templates, get_template, delete_template as _delete_template,
+    list_templates as _local_list_templates, get_template as _local_get_template, delete_template as _delete_template,
 )
 from flint.core._volumes import DEFAULT_SIZE_GIB, Volumes, VolumeError
 from flint.core._quotas import QuotaExceeded, Quotas, Usage
@@ -83,6 +83,18 @@ def _get_daemon() -> FlintDaemon:
     if daemon is None:
         raise HTTPException(status_code=503, detail="Daemon not initialized")
     return daemon
+
+
+def get_template(template_id: str):
+    daemon = getattr(app.state, "daemon", None)
+    runtime = getattr(daemon, "runtime", None)
+    return runtime.request("template.get", template_id=template_id) if runtime else _local_get_template(template_id)
+
+
+def list_templates():
+    daemon = getattr(app.state, "daemon", None)
+    runtime = getattr(daemon, "runtime", None)
+    return runtime.request("template.list") if runtime else _local_list_templates()
 
 
 def _require_manager() -> SandboxManager:
@@ -163,12 +175,17 @@ def _write_state(daemon: FlintDaemon) -> None:
     same time. The lock keeps them from sharing the temp file, and because the
     snapshot is taken inside it, the last write always holds the latest state.
     """
+    if getattr(daemon, "runtime", None):
+        daemon.runtime.request("state.write")
+        return
     with _state_write_lock:
         state = {
             "pid": os.getpid(),
             "started_at": daemon.started_at,
             "golden_snapshot_ready": daemon.golden_ready,
             "vms": {},
+            "api_pid": getattr(daemon, "_api_pid", os.getpid()),
+            "api_uid": getattr(daemon, "_api_uid", os.geteuid()),
         }
         if daemon.manager:
             for d in daemon.manager.list_dicts():
@@ -800,7 +817,7 @@ def _start_template_build(body: dict, request: Request):
     if not name or not dockerfile:
         raise HTTPException(status_code=400, detail="name and dockerfile are required")
 
-    from flint.core._template_build import _slugify
+    from flint.core._template_registry import _slugify
     from flint.core._template_registry import claim_template, update_template_artifact_status
     template_id = _slugify(name)
     if template_id == DEFAULT_TEMPLATE_ID:
@@ -817,6 +834,9 @@ def _start_template_build(body: dict, request: Request):
             visible = _template_for(principal, template_id) is not None
             raise HTTPException(status_code=409 if visible else 403,
                                 detail=f"Template '{template_id}' already exists" + ("" if visible else " for another tenant"))
+        if getattr(daemon, "runtime", None):
+            return daemon.runtime.request("template.build", name=name, dockerfile=dockerfile,
+                                          rootfs_size_mb=rootfs_size_mb, tenant=tenant)
     from flint.core._build_job import Admission, BuildBusy
     try:
         admission = Admission()
@@ -895,6 +915,8 @@ def _delete_template_endpoint(template_id: str, request: Request):
     if not tmpl.get("tenant") and principal.tenants and not principal.is_admin:
         raise HTTPException(status_code=403, detail="Shared templates can only be deleted by an admin")
     daemon = _get_daemon()
+    if getattr(daemon, "runtime", None):
+        return daemon.runtime.request("template.delete", template_id=template_id)
     if daemon.cluster:
         daemon.cluster.forget_template(template_id)
     daemon.backend.delete_template_artifact(template_id, tmpl)
@@ -940,7 +962,8 @@ def create_volume(body: dict, request: Request):
     tenant = principal_of(request).resolve_tenant(body.get("tenant"))
     from flint.core import _nfs_server
     size = body.get("size_gib") if isinstance(body.get("size_gib"), int) else 0
-    if _nfs_server.images_available():
+    runtime = getattr(_get_daemon(), "runtime", None)
+    if (runtime.request("info")["image_volumes"] if runtime else _nfs_server.images_available()):
         size = size or DEFAULT_SIZE_GIB
     with _get_daemon().quotas.reserve(tenant, lambda: _usage(tenant), Usage(volume_gib=size)):
         vol = _volume_call(_require_volumes().create, body.get("name"), body.get("size_gib"), tenant)
@@ -1161,11 +1184,17 @@ def _load_config_overrides() -> dict:
 
 @app.get("/config")
 def get_config():
+    runtime = getattr(_get_daemon(), "runtime", None)
+    if runtime:
+        return runtime.request("config.get")
     return {"config": _current_config_view(), "overrides": _load_config_overrides()}
 
 
 @app.patch("/config")
 def patch_config(body: dict):
+    runtime = getattr(_get_daemon(), "runtime", None)
+    if runtime:
+        return runtime.request("config.set", body=body)
     from flint.core.config import CONFIG_FIELDS, CONFIG_OVERRIDES_PATH
     overrides = _load_config_overrides()
     for k, v in body.items():
@@ -1306,7 +1335,10 @@ class FlintDaemon:
         self._init_storage()
         self._start_pool()
         self._init_state_store()
-        self._init_sso()
+        # Linux's public HTTP/SSO parser is exec'd under an isolated identity.
+        # Cluster agents retain their internal, mTLS-only worker interface.
+        if not self.backend.kind.startswith("linux-"):
+            self._init_sso()
         self._init_manager()
         self._recover_sandboxes()
         self.volumes.replay()
@@ -1327,6 +1359,21 @@ class FlintDaemon:
 
     def _init_dirs(self) -> None:
         os.makedirs(DAEMON_DIR, exist_ok=True)
+        if self.backend.kind.startswith("linux-"):
+            import fcntl
+            self._daemon_lock = os.open(os.path.join(DAEMON_DIR, "daemon.lock"),
+                                        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(self._daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit("Another Flint runtime owns this state directory")
+            def close_in_helper():
+                # A namespace helper must not keep the daemon lease alive
+                # after its supervisor exits or crashes.
+                if self._daemon_lock is not None:
+                    os.close(self._daemon_lock)
+                    self._daemon_lock = None
+            os.register_at_fork(after_in_child=close_in_helper)
 
     def _write_pid(self) -> None:
         with open(DAEMON_PID_PATH, "w") as f:
@@ -1382,13 +1429,16 @@ class FlintDaemon:
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
         self._state_store = StateStore(DAEMON_DB_PATH)
-        self.tokens = TokenStore(DAEMON_DB_PATH)
+        from flint.core import config as _cfg
+        separate_auth = self.backend.kind.startswith("linux-") and not _cfg.CLUSTER_MODE
+        migrated = os.path.isfile(os.path.join(DAEMON_DIR, "api", "flint.db"))
+        self.tokens = None if separate_auth and migrated else TokenStore(DAEMON_DB_PATH)
         from flint.daemon.eventlog import EventLog
         self.eventlog = EventLog(DAEMON_DB_PATH)
         _events.sink = self.eventlog.record
         self.quotas = Quotas(DAEMON_DB_PATH)
         from flint.core import config as _cfg
-        if not _cfg.CLUSTER_MODE:  # a host agent's only caller is the control plane, over mTLS
+        if not _cfg.CLUSTER_MODE and self.tokens:  # a host agent's only caller is the control plane, over mTLS
             self.tokens.ensure_admin_token_file()
         print("State store initialized.")
 
@@ -1415,6 +1465,16 @@ class FlintDaemon:
             return
         if self.backend.kind.startswith("linux-"):
             from flint.core._builder import cleanup_abandoned_builders
+            from flint.core._identities import vm_identity
+            for row in self._state_store.list_active():
+                if row["state"] not in ("Running", "Paused") or not os.path.isdir(row["vm_dir"]):
+                    continue
+                owner = os.stat(row["vm_dir"], follow_symlinks=False)
+                if (owner.st_uid, owner.st_gid) != vm_identity(row["vm_id"]):
+                    raise RuntimeError(
+                        f"VM {row['vm_id']} uses a legacy host identity. Finish, export or delete "
+                        "existing VMs with the previous Flint release before upgrading this worker."
+                    )
             from flint.core._build_job import recover_builds
             from flint.core._proxy import cleanup_abandoned_proxies
             cleanup_abandoned_proxies()
@@ -1426,11 +1486,13 @@ class FlintDaemon:
         if self.backend.kind.startswith("linux-"):
             from flint.core._netns import reconcile_namespace
             for row in self._state_store.list_active():
-                if row["state"] in ("Running", "Paused"):
-                    reconcile_namespace(row["ns_name"])
-                    entry = self.manager.get_entry(row["vm_id"])
+                if row["state"] not in ("Running", "Paused"):
+                    continue
+                reconcile_namespace(row["ns_name"], proxy=bool(row.get("network_policy_json")))
+                if row["state"] == "Running":
                     policy = self._state_store.get_network_policy(row["vm_id"])
-                    if entry and policy:
+                    entry = self.manager.get_entry(row["vm_id"])
+                    if policy and entry:
                         entry.network_policy = json.loads(policy)
                         self.manager._apply_network_policy(entry, entry.network_policy)
         self.manager.refresh_tenant_networks()
@@ -1458,8 +1520,19 @@ class FlintDaemon:
         print("Lifecycle manager started.")
 
     def _install_signal_handlers(self) -> None:
+        owner_pid = os.getpid()
         def _shutdown(signum, frame):
+            # pyroute2 can fork namespace helpers from worker threads. Their
+            # termination must not run the supervisor's shutdown routine or
+            # signal the API process whose handle they inherited.
+            if os.getpid() != owner_pid:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+                return
             print("\nShutting down (VMs will keep running)...")
+            process = getattr(self, "_api_process", None)
+            if process is not None and process.poll() is None:
+                process.terminate()
             if self._health_monitor:
                 self._health_monitor.stop()
             if self._lifecycle_manager:
@@ -1488,6 +1561,10 @@ class FlintDaemon:
     def _serve(self) -> None:
         if self.cluster:
             self._serve_cluster()
+            return
+        if self.backend.kind.startswith("linux-"):
+            from .supervisor import serve
+            serve(self)
             return
         sockets = [_listen_unix(DAEMON_SOCKET), _listen_tcp(DAEMON_HOST, DAEMON_PORT)]
         print(f"Daemon ready on {DAEMON_SOCKET} and http://{DAEMON_HOST}:{DAEMON_PORT} (API token required; "

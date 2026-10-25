@@ -7,7 +7,7 @@ import uuid
 
 from .config import (
     log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
-    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, JAILER_UID, JAILER_GID, JAILER_SHARED_DIR,
+    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, JAILER_SHARED_DIR,
 )
 from ._netns import _delete_netns, _setup_netns_pyroute2, _enter_netns, _restore_netns
 from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok
@@ -47,10 +47,10 @@ def create_golden_snapshot(
     _delete_netns(ns_name)
     try:
         os.makedirs(spec.chroot_root)
-        os.chown(spec.chroot_root, JAILER_UID, JAILER_GID)
+        os.chown(spec.chroot_root, *spec.identity)
         os.link(shared_readonly(KERNEL_PATH, JAILER_SHARED_DIR), f"{spec.chroot_root}/vmlinux")
         sparse_copy(source_rootfs, f"{spec.chroot_root}/rootfs.ext4")
-        make_private(f"{spec.chroot_root}/rootfs.ext4")
+        make_private(f"{spec.chroot_root}/rootfs.ext4", spec.vm_id)
 
         # The golden VM needs no internet; it only has to bring flintd up.
         _setup_netns_pyroute2(ns_name, tap_name, internet=False)

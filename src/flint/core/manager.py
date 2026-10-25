@@ -275,6 +275,7 @@ class SandboxManager:
             self.refresh_tenant_networks()
             if entry and entry.proxy:
                 entry.proxy.stop()
+                entry.proxy = None
             elif self._backend.kind.startswith("linux-"):
                 from ._proxy import stop_namespace_proxy
                 stop_namespace_proxy(entry.ns_name if entry else row.get("ns_name", ""))
@@ -538,8 +539,15 @@ class SandboxManager:
         reject the connection. Idempotent, and the guest disk keeps it across
         pause/resume. Only the public certificate leaves the host.
         """
-        with open(proxy.ca_cert_path) as f:
-            cert = f.read().strip()
+        # The proxy owns its CA directory. Never follow a certificate symlink
+        # it could plant to make the root supervisor read a host secret.
+        from ._jailfs import _open_nofollow
+        import stat
+        fd = _open_nofollow(proxy.ca_cert_path, os.O_RDONLY, (stat.S_IFREG,))
+        with os.fdopen(fd) as f:
+            cert = f.read(65537).strip()
+        if len(cert) > 65536:
+            raise ValueError("Proxy CA certificate is too large")
         script = (
             'mkdir -p /etc/ssl/certs && cd /etc/ssl/certs || exit 1\n'
             '[ "$(cat flint-proxy-ca.pem 2>/dev/null)" = "$1" ] && exit 0\n'

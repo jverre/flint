@@ -67,7 +67,7 @@ Snapshot-restore Linux backend. Each sandbox restores the template's golden snap
 Cloud-Hypervisor ships no jailer, so Flint jails it to the same standard as Firecracker:
 
 - one chroot per VM at `$FLINT_JAILER_BASE_DIR/cloud-hypervisor/<id>/root` (the jailer's layout);
-- runs as `FLINT_CH_UID` (defaults to the jailer uid) with no supplementary groups, no capabilities and `no_new_privs`;
+- runs as a persistent identity allocated to that VM, with no supplementary groups, no capabilities and `no_new_privs`;
 - its own cgroup (`/sys/fs/cgroup/cloud-hypervisor/<id>`) and CH's `--seccomp true`;
 - inside the chroot, only the VMM binary, the kernel and golden snapshot files (shared, root-owned, read-only), the VM's own disk, and `/dev/kvm` + `/dev/urandom`. There's no `/proc` and no `/dev/net/tun`: the daemon opens the TAP and passes the fd, so the VMM never holds `CAP_NET_ADMIN` (which would let it rewrite its namespace's firewall).
 
@@ -76,6 +76,10 @@ Golden snapshots are taken by a jailed VMM as well, since template images are te
 On both Linux backends, the daemon treats a jail as hostile once its VMM has run guest code: the VMM owns its chroot and could have swapped any entry for a symlink. Host-side access to jail paths goes through `flint.core._jailfs`, which never follows the last path component. That covers connecting to the API socket, copying snapshot files out, and changing ownership.
 
 Preflight checks: the `cloud-hypervisor` binary, a kernel image, and `setpriv` + `chroot` (util-linux and coreutils) for the jail.
+
+Both Linux backends also require Bubblewrap (`bwrap`) for the public API and
+credential proxy isolation. `flint install-deps` installs it on apt-based hosts.
+See [Host privileges](/architecture/security#host-privileges) for the process boundary.
 
 ### macOS Virtualization.framework (`macos-vz` / `darwin-vz`)
 

@@ -228,8 +228,10 @@ class MigrationRelay:
     def sender(self, unix_path: str, address: str, port: int, target_host: str) -> None:
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(unix_path)
-        os.chown(unix_path, config.CH_UID, config.CH_UID)
-        os.chmod(unix_path, 0o600)
+        # This socket is inside the source VMM's private jail.
+        owner = os.stat(os.path.dirname(unix_path))
+        os.chown(unix_path, owner.st_uid, owner.st_gid, follow_symlinks=False)
+        os.chmod(unix_path, 0o600, follow_symlinks=False)
         self.listener.listen(1)
         self.listener.settimeout(30)
 

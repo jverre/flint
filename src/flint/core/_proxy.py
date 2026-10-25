@@ -21,8 +21,10 @@ import time
 from pathlib import Path
 import select
 
-from .config import log, HOST_IP, PROXY_PORT, PROXY_CA_DIR, STATE_DIR, _DATA_KEY
+from .config import log, HOST_IP, PROXY_PORT, STATE_DIR, _DATA_KEY
 from ._netns import _popen_in_ns
+from ._confinement import parser_command, supervised_spawn
+from ._identities import identity, release
 
 # The proxy's rules hold credentials in plaintext, so they stay in memory
 # (/run is a tmpfs) and readable by root only.
@@ -40,7 +42,7 @@ def stop_namespace_proxy(ns_name: str) -> None:
     stop_processes(str(group))
     if group.exists():
         group.rmdir()
-    for path in Path(_RULES_DIR).glob(ns_name + "-*.json*"):
+    for path in Path(_RULES_DIR).glob(ns_name + "-*"):
         wipe_tree(str(path))
 
 
@@ -86,11 +88,12 @@ def cleanup_abandoned_proxies() -> None:
     wipe_tree(_RULES_DIR)
 
 
-def _write_rules(path: str, rules: dict) -> None:
+def _write_rules(path: str, rules: dict, uid: int, gid: int) -> None:
     """Write rules atomically, never readable by anyone but the daemon's user."""
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
+        os.fchown(f.fileno(), uid, gid)
         json.dump(rules, f)
     os.replace(tmp, path)
 
@@ -101,62 +104,58 @@ def _mitmdump() -> str:
     return beside if os.path.exists(beside) else (shutil.which("mitmdump") or "mitmdump")
 
 
-def _ensure_confdir() -> str:
-    """Ensure the mitmproxy confdir exists. Returns the directory path.
-
-    mitmproxy auto-generates its CA certificate and key on first run
-    inside this directory. No manual certificate generation needed.
-    """
-    os.makedirs(PROXY_CA_DIR, exist_ok=True)
-    return PROXY_CA_DIR
-
-
 class CredentialProxy:
     """Manages a credential injection proxy for a single sandbox."""
-
-    # The CA's public certificate (mitmproxy-ca.pem next to it holds the key).
-    ca_cert_path = os.path.join(PROXY_CA_DIR, "mitmproxy-ca-cert.pem")
 
     def __init__(self, ns_name: str) -> None:
         self.ns_name = ns_name
         self._process: subprocess.Popen | None = None
         self._rules_file: str | None = None
+        self._directory: str | None = None
+        self.ca_cert_path = ""
+        self.uid, self.gid = identity("proxy:" + ns_name)
 
     def start(self, rules: dict) -> None:
         """Start the mitmdump proxy subprocess in the sandbox's network namespace."""
-        confdir = _ensure_confdir()
-
         os.makedirs(_RULES_DIR, mode=0o700, exist_ok=True)
         os.chmod(_RULES_DIR, 0o700)
-        fd, rules_path = tempfile.mkstemp(prefix=f"{self.ns_name}-", suffix=".json", dir=_RULES_DIR)
-        os.close(fd)
-        _write_rules(rules_path, rules)
+        directory = tempfile.mkdtemp(prefix=f"{self.ns_name}-", dir=_RULES_DIR)
+        self._directory = directory
+        os.chmod(directory, 0o555)
+        confdir = os.path.join(directory, "conf")
+        os.mkdir(confdir, 0o700)
+        os.chown(confdir, self.uid, self.gid)
+        self.ca_cert_path = os.path.join(confdir, "mitmproxy-ca-cert.pem")
+        rules_path = os.path.join(directory, "rules.json")
+        _write_rules(rules_path, rules, self.uid, self.gid)
         self._rules_file = rules_path
 
         # Launch mitmdump in transparent mode inside the netns
         addon_script = os.path.join(os.path.dirname(__file__), "_proxy_server.py")
+        shutil.copyfile(addon_script, os.path.join(directory, "addon.py"))
+        os.chmod(os.path.join(directory, "addon.py"), 0o444)
         cmd = [
             _mitmdump(),
             "--mode", "transparent",
             # Only the guest-facing TAP address: the bridge side must never reach it.
             "--listen-host", HOST_IP,
             "--listen-port", str(PROXY_PORT),
-            "--set", f"confdir={confdir}",
+            "--set", "confdir=/proxy/conf",
             "--set", "connection_strategy=lazy",
-            "-s", addon_script,
+            "-s", "/proxy/addon.py",
             "-q",  # quiet — suppress console output
         ]
 
-        env = os.environ.copy()
-        env["FLINT_PROXY_RULES"] = rules_path
-
-        self._process = _popen_in_ns(
-            self.ns_name, cmd,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
+        # The parent directory is root-only; the jail sees just this proxy's
+        # rules and CA. No daemon environment or shared CA private key enters it.
+        cmd = parser_command(self.uid, self.gid, readonly={directory: "/proxy"},
+                             writable={confdir: "/proxy/conf"},
+                             command=["/usr/bin/env", "FLINT_PROXY_RULES=/proxy/rules.json", *cmd])
         try:
+            self._process = supervised_spawn(lambda: _popen_in_ns(
+                self.ns_name, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            ))
             from ._limits import attach_process
             attach_process(str(Path(_CGROUP_ROOT) / self.ns_name), self._process.pid)
             self._wait_listening()
@@ -189,17 +188,18 @@ class CredentialProxy:
             try:
                 self._process.send_signal(signal.SIGTERM)
                 self._process.wait(timeout=3)
-            except Exception:
-                try:
-                    self._process.kill()
-                    self._process.wait(timeout=2)
-                except Exception:
-                    pass
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=2)
             log.info("[%s] Credential proxy stopped", self.ns_name)
             self._process = None
-        if self._rules_file:
+        if self._directory:
+            from ._wipe import wipe_tree
+            wipe_tree(self._directory)
+            self._directory = None
             self._rules_file = None
         stop_namespace_proxy(self.ns_name)
+        release("proxy:" + self.ns_name)
 
     def update_rules(self, rules: dict) -> None:
         """Update the proxy rules by rewriting the rules file.
@@ -207,5 +207,5 @@ class CredentialProxy:
         The addon watches the file mtime for changes on each request.
         """
         if self._rules_file:
-            _write_rules(self._rules_file, rules)
+            _write_rules(self._rules_file, rules, self.uid, self.gid)
             log.info("[%s] Credential proxy rules updated", self.ns_name)

@@ -84,7 +84,6 @@ def test_migration_bytes_cross_mutually_authenticated_tls(tmp_path, monkeypatch)
         return ctx
 
     monkeypatch.setattr(transport, "context", context)
-    monkeypatch.setattr(os, "chown", lambda *args: None)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dest_path = str(tmp_path / "receive.sock")
     listener.bind(dest_path)

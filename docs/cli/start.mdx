@@ -52,8 +52,26 @@ sudo flint start &
 
 The daemon will write its PID to `$FLINT_STATE_DIR/flintd.pid` so you can find it later.
 
+## Upgrading from shared workload identities
+
+<Warning>
+Finish, export or delete running and paused VMs with the previous release
+before upgrading a worker to per-VM identities. Flint refuses to adopt a VM
+whose jail still belongs to the old shared user. It cannot change the UID of
+an already-running hypervisor safely.
+</Warning>
+
+Stop the previous `r2nfs` process after its VMs have been removed, then build
+or install the new server binary. Storage management now uses a root-only
+`r2nfs.sock` in the state directory. The old loopback management listener is
+not adopted.
+
+Existing API tokens are migrated into the API service's private database on
+first start. The original `admin.token` discovery path is preserved. VM state
+and sealed network policies stay in the runtime's database.
+
 ## Notes
 
-- On Linux, the daemon needs to run as root (or with `CAP_NET_ADMIN` and access to `/dev/kvm`) because it creates network namespaces and TAP devices.
+- On Linux, start the supervisor as root. It owns privileged VM operations and launches the public API under a separate unprivileged identity. Bubblewrap and util-linux are required; `flint install-deps` installs them on apt-based hosts. See [Host privileges](/architecture/security#host-privileges).
 - On macOS, the daemon re-execs itself under a Python binary signed with the Virtualization entitlement on first run.
 - If the daemon crashes and restarts, it will attempt to recover any sandboxes that were running at the time using its SQLite state store. Each backend implements its own reattach logic.

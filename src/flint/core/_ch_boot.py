@@ -44,7 +44,6 @@ from .config import (
     CH_CPU_COUNT,
     CH_MEMORY_BYTES,
     CH_GOLDEN_DIR,
-    CH_UID,
     DEFAULT_TEMPLATE_ID,
     GUEST_MAC,
     SOURCE_ROOTFS,
@@ -129,7 +128,7 @@ def _restore(jail: ChJail, ns_name: str, tap_name: str, jail_snapshot_dir: str) 
     from ._jailfs import copy_within
     path = jail.host_path(jail_snapshot_dir + "/config.json")
     # Golden config is an immutable hard link shared with other VMs.
-    copy_within(path, path, CH_UID, CH_UID)
+    copy_within(path, path, *jail.identity)
     with open(path) as stream:
         vm_config = json.load(stream)
     for disk in vm_config.get("disks", []):
@@ -205,7 +204,7 @@ def ch_boot(
     try:
         jail.prepare()
         if pool:
-            maintenance["root_disk"] = pool.create(vm_id, rootfs_src, CH_UID)
+            maintenance["root_disk"] = pool.create(vm_id, rootfs_src, jail.identity[0])
             # Marker is outside the chroot, inaccessible to the VMM.
             with open(f"{jail.base}/shared-rootfs", "x") as marker:
                 marker.write(pool.pool_id)

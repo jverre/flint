@@ -19,6 +19,43 @@ A **tenant** is an isolation group, such as one of your customers. Your backend 
 
 This is what holds on a single host, with the Firecracker and Cloud Hypervisor backends on Linux. The macOS backend is for development: it has no bridge network or credential proxy.
 
+### Host privileges
+
+On Linux, `flint start` supervises two processes. The privileged runtime owns
+VM lifecycle, namespaces, firewall rules, cgroups and storage. The public API,
+SSO and UI server runs under a separate numeric identity in an isolated
+filesystem, with no capabilities or supplementary groups and `no_new_privs`.
+The command and SDK stay the same.
+
+The API talks to the runtime over a private Unix socket. The runtime checks
+the connecting process's UID and accepts a fixed set of resource operations.
+It resolves host paths from its own state. Guest-agent connections are passed
+as file descriptors, so the API parses guest HTTP and WebSocket responses
+without entering a host network namespace. Storage management uses a
+separate root-only Unix socket, not an unauthenticated loopback TCP port.
+
+Each credential proxy runs under its own identity and parses guest traffic
+inside an isolated filesystem. It sees its own rules and private CA, the
+Python runtime and public TLS roots. It cannot see the daemon's database,
+master key, storage management socket, another proxy's credentials or the
+daemon's environment. Pausing or deleting a VM stops its proxy; recovery
+recreates it from the stored policy.
+
+VMs, builder VMs, proxies and the public API have distinct persistent numeric
+identities, chosen from UIDs/GIDs `1000000` through `1000999999`.
+Assignments are stable across restarts and hosts; collisions with another
+resource, a host account or a range in `/etc/subuid` or `/etc/subgid` are
+rejected. Keep allocated IDs reserved while their workloads exist. The old `FLINT_JAILER_UID`,
+`FLINT_JAILER_GID` and `FLINT_CH_UID` overrides are no longer used.
+
+The runtime remains trusted and privileged. Compromising the API can still
+abuse the VM and volume operations it is allowed to request. This separation
+limits host authority; it does not make an API compromise harmless. Cluster
+host agents retain their internal mTLS interface, while the cluster control
+plane already runs as an unprivileged service.
+
+### Workload boundaries
+
 | Boundary | What holds |
 |----------|------------|
 | **VM ↔ host** | Each VMM runs jailed: its own chroot, an unprivileged user with `no_new_privs`, seccomp, its own cgroup, and only the devices it needs (`/dev/kvm`, `/dev/urandom`, and `/dev/net/tun` for Firecracker). |

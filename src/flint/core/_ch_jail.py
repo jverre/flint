@@ -6,7 +6,7 @@ cloud-hypervisor ships no jailer, so Flint builds one from standard tools:
   namespace);
 - ``setpriv --no-new-privs`` stops it regaining privileges through exec;
 - ``chroot --userspec`` confines it to ``<JAILER_BASE_DIR>/cloud-hypervisor/<id>/root``
-  as ``CH_UID`` with no supplementary groups and no capabilities.
+  as its own numeric workload identity with no supplementary groups or capabilities.
 
 The chroot holds only what the VMM needs: its binary, the kernel and golden
 snapshot files (shared, root-owned, read-only), the VM's private disk, and
@@ -29,6 +29,7 @@ from . import config
 from . import _cloud_hypervisor as _ch
 from ._artifacts import shared_readonly
 from ._jailfs import own
+from ._identities import vm_identity, release
 from .config import JAILER_BASE_DIR, JAILER_SHARED_DIR, log
 
 CH_JAIL_DIR = f"{JAILER_BASE_DIR}/cloud-hypervisor"
@@ -44,6 +45,10 @@ JAIL_SOCKET = "/ch.sock"
 @dataclass(frozen=True)
 class ChJail:
     vm_id: str
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return vm_identity(self.vm_id)
 
     @property
     def base(self) -> str:
@@ -71,22 +76,22 @@ class ChJail:
     def prepare(self) -> None:
         """Create the chroot with the VMM binary, kernel and device nodes."""
         os.makedirs(f"{self.root}/dev", exist_ok=True)
-        os.chown(self.root, config.CH_UID, config.CH_UID)
+        os.chown(self.root, *self.identity)
         kvm = self.host_path("/dev/kvm")
         os.mknod(kvm, 0o600 | stat.S_IFCHR, os.makedev(10, 232))
-        os.chown(kvm, config.CH_UID, config.CH_UID)
+        os.chown(kvm, *self.identity)
         os.mknod(self.host_path("/dev/urandom"), 0o444 | stat.S_IFCHR, os.makedev(1, 9))
         if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
             os.mkdir(self.host_path("/dev/net"))
             os.mknod(self.host_path("/dev/net/tun"), 0o600 | stat.S_IFCHR, os.makedev(10, 200))
-            os.chown(self.host_path("/dev/net/tun"), config.CH_UID, config.CH_UID)
+            os.chown(self.host_path("/dev/net/tun"), *self.identity)
         os.link(shared_readonly(_ch_binary(), JAILER_SHARED_DIR, mode=0o555), self.host_path(JAIL_BINARY))
         os.link(shared_readonly(config.KERNEL_PATH, JAILER_SHARED_DIR), self.host_path(JAIL_KERNEL))
 
     def give(self, jail_path: str) -> str:
         """Make a file or directory in the chroot owned and writable by the VMM. Returns its host path."""
         path = self.host_path(jail_path)
-        own(path, config.CH_UID, config.CH_UID, 0o700 if os.path.isdir(path) else 0o600)
+        own(path, *self.identity, 0o700 if os.path.isdir(path) else 0o600)
         return path
 
     def link_shared(self, src: str, jail_path: str) -> None:
@@ -99,11 +104,11 @@ class ChJail:
             os.unlink(self.socket_path)
         except FileNotFoundError:
             pass
-        uid = config.CH_UID
+        uid, _ = self.identity
         cmd = [
             "ip", "netns", "exec", ns_name,
             "setpriv", "--no-new-privs", "--",
-            "chroot", f"--userspec={uid}:{uid}", f"--groups={uid}", self.root,
+            "chroot", f"--userspec={uid}:{uid}", "--groups=", self.root,
             JAIL_BINARY, "--api-socket", f"path={JAIL_SOCKET}", "--seccomp", "true",
         ]
         with open(self.log_path, "a") as log_fd:
@@ -148,6 +153,7 @@ class ChJail:
             os.rmdir(self.cgroup)
         except OSError:
             pass
+        release("vm:" + self.vm_id)
 
 
 def _ch_binary() -> str:
