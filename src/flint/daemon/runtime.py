@@ -22,7 +22,7 @@ from flint.core import config
 from flint.core._netns import _enter_netns, _restore_netns
 from flint.core._quotas import Usage
 from . import events
-from .runtime_protocol import receive, send
+from .runtime_protocol import MAX_RESPONSE, receive, send
 
 
 class Runtime:
@@ -310,7 +310,14 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self):
         conn, runtime = self.request, self.server.runtime
         _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != runtime.uid or not self.server._slots.acquire(blocking=False):
+        if uid != runtime.uid:
+            return
+        if not self.server._slots.acquire(blocking=False):
+            try:
+                send(conn, {"error": {"kind": "RuntimeError", "detail": "The runtime is busy; retry later",
+                                      "status": 503, "headers": {"Retry-After": "1"}}})
+            except OSError:
+                pass
             return
         try:
             conn.settimeout(5)
@@ -326,7 +333,10 @@ class _Handler(socketserver.BaseRequestHandler):
                     with value:
                         send(conn, {"value": None}, value.fileno())
                 else:
-                    send(conn, {"value": _json_value(value)})
+                    try:
+                        send(conn, {"value": _json_value(value)}, limit=MAX_RESPONSE)
+                    except ValueError as exc:  # raised before anything is written
+                        raise RuntimeError("Response too large; request fewer items") from exc
             except Exception as exc:
                 status = getattr(exc, "status_code", getattr(exc, "status", None))
                 detail = getattr(exc, "detail", str(exc))

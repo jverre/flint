@@ -7,9 +7,11 @@ import socket
 import struct
 
 MAX_FRAME = 4 << 20
+# Responses come from the trusted runtime and may carry long event pages.
+MAX_RESPONSE = 64 << 20
 
 
-def receive(sock: socket.socket) -> tuple[dict, int | None]:
+def receive(sock: socket.socket, limit: int = MAX_FRAME) -> tuple[dict, int | None]:
     header, ancillary, flags, _ = sock.recvmsg(
         4, socket.CMSG_SPACE(4), socket.MSG_WAITALL | getattr(socket, "MSG_CMSG_CLOEXEC", 0)
     )
@@ -23,7 +25,7 @@ def receive(sock: socket.socket) -> tuple[dict, int | None]:
         if len(header) != 4 or flags & socket.MSG_CTRUNC or len(received) > 1:
             raise ValueError("Invalid runtime frame")
         length, = struct.unpack("!I", header)
-        if not 0 < length <= MAX_FRAME:
+        if not 0 < length <= limit:
             raise ValueError("Runtime frame exceeds limit")
         payload = bytearray()
         while len(payload) < length:
@@ -42,9 +44,9 @@ def receive(sock: socket.socket) -> tuple[dict, int | None]:
         raise
 
 
-def send(sock: socket.socket, value: dict, fd: int | None = None) -> None:
+def send(sock: socket.socket, value: dict, fd: int | None = None, limit: int = MAX_FRAME) -> None:
     payload = json.dumps(value, allow_nan=False).encode()
-    if len(payload) > MAX_FRAME:
+    if len(payload) > limit:
         raise ValueError("Runtime frame exceeds limit")
     ancillary = [] if fd is None else [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
     header = struct.pack("!I", len(payload))
@@ -62,7 +64,7 @@ class RuntimeClient:
             conn.settimeout(180)
             conn.connect(self.path)
             send(conn, {"operation": operation, "arguments": arguments, "actor": list(actor.get())})
-            result, fd = receive(conn)
+            result, fd = receive(conn, MAX_RESPONSE)
         if "error" in result:
             if fd is not None:
                 import os

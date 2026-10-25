@@ -206,8 +206,9 @@ class Frontend:
         return self.runtime.request("vm.kill", vm_id=vm_id)
 
     def notifications(self):
+        import time
         from . import events
-        from flint.core import _logs
+        from flint.core import _logs, config
         cursor = 0
         while True:
             try:
@@ -218,10 +219,14 @@ class Frontend:
                     elif item["kind"] == "log" and _logs.get_bus():
                         data = item["value"]
                         _logs.get_bus().append(data["vm_id"], data["line"])
-            except (OSError, RuntimeError):
+            except OSError:
                 # The API cannot continue safely if its supervisor is gone.
                 import os
                 os._exit(1)
+            except Exception:
+                # A busy runtime or a bad page must not end event delivery.
+                config.log.exception("Runtime notification poll failed; retrying")
+                time.sleep(1)
 
 
 def main():
