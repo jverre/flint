@@ -183,6 +183,9 @@ def update_template_artifact_status(template_id: str, backend_kind: str, status:
     if error is not None:
         artifact["error"] = error[-4096:]
         entry["error"] = error[-4096:]
+    elif status == "building":
+        artifact.pop("error", None)
+        entry.pop("error", None)
     artifacts[backend_kind] = artifact
     entry["artifacts"] = artifacts
     # Same as register_template_artifact: the template's status follows its

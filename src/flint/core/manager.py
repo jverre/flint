@@ -276,6 +276,9 @@ class SandboxManager:
             if entry and entry.proxy:
                 entry.proxy.stop()
                 entry.proxy = None
+            elif self._backend.kind.startswith("linux-"):
+                from ._proxy import stop_namespace_proxy
+                stop_namespace_proxy(entry.ns_name if entry else row.get("ns_name", ""))
             for hook in self.kill_hooks:
                 hook(sandbox_id)
             if entry:

@@ -234,9 +234,10 @@ class Runtime:
             self._builds[template_id] = thread
             try:
                 thread.start()
-            except Exception:
+            except Exception as exc:
                 admission.release()
                 self._builds.pop(template_id, None)
+                update_template_artifact_status(template_id, self.daemon.backend.kind, "failed", error=str(exc))
                 raise
         return {"template_id": template_id, "status": "building"}
 

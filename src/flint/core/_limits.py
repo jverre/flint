@@ -147,16 +147,16 @@ def network_limits(ns_name: str, tap_name: str) -> None:
                              "burst", "131072", "latency", "50ms"], check=True, capture_output=True)
     subprocess.run(prefix + ["qdisc", "replace", "dev", tap_name, "handle", "ffff:", "ingress"],
                    check=True, capture_output=True)
-    current = subprocess.run(prefix + ["-j", "filter", "show", "dev", tap_name, "parent", "ffff:"],
-                             check=True, capture_output=True, text=True)
-    priorities = {item["pref"] for item in json.loads(current.stdout)}
-    priority = next(p for p in range(1, len(priorities) + 2) if p not in priorities)
-    # matchall cannot replace an existing classifier on supported kernels.
-    # Install the new ceiling before removing the previous one, including
-    # when recovering a VM or retrying an interrupted reconciliation.
-    subprocess.run(prefix + ["filter", "add", "dev", tap_name, "parent", "ffff:", "protocol", "all",
-                             "pref", str(priority), "matchall", "action", "police", "rate", rate,
+    # matchall rejects replacement even with a stable handle. Use a u32
+    # catch-all with an explicit handle so recovery can update it atomically.
+    subprocess.run(prefix + ["filter", "replace", "dev", tap_name, "parent", "ffff:", "protocol", "all",
+                             "pref", "2", "handle", "800::1", "u32", "match", "u32", "0", "0",
+                             "action", "police", "rate", rate,
                              "burst", "131072", "conform-exceed", "drop"], check=True, capture_output=True)
-    for previous in sorted(priorities):
-        subprocess.run(prefix + ["filter", "delete", "dev", tap_name, "parent", "ffff:",
-                                 "pref", str(previous)], check=True, capture_output=True)
+    # Upgrade the original rule only after its replacement is enforcing the
+    # ceiling. Removing it first would briefly leave a live guest unpoliced.
+    legacy = subprocess.run(prefix + ["-j", "filter", "show", "dev", tap_name, "parent", "ffff:", "pref", "1"],
+                            check=True, capture_output=True, text=True)
+    if any(rule.get("kind") == "matchall" for rule in json.loads(legacy.stdout)):
+        subprocess.run(prefix + ["filter", "del", "dev", tap_name, "parent", "ffff:", "protocol", "all",
+                                 "pref", "1", "matchall"], check=True, capture_output=True)

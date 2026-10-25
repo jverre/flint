@@ -284,6 +284,9 @@ func (m *ImageManager) Delete(id string) error {
 	m.Unmount(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := blockstore.PrepareDelete(m.imageDir(id)); err != nil {
+		return err
+	}
 	wiped, err := wipeAll(m.imageDir(id))
 	if err != nil {
 		return err

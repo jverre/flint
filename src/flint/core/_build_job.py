@@ -175,6 +175,7 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
     from ._template_registry import register_template_artifact, update_template_artifact_status
     from ._wipe import wipe_tree
     from ._limits import cgroup_limits
+    from ._netns import _allocate_veth_ip, _release_veth_ip
     template_id = _slugify(name)
     job = _root() / uuid.uuid4().hex
     job.mkdir(mode=0o700)
@@ -182,9 +183,13 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
     group = f"/sys/fs/cgroup/flint-builds/{job.name}"
     stage = Path(config.TEMPLATES_DIR) / (".build-" + job.name)
     retired = stage.with_name(".retired-" + job.name)
+    # Only this process's allocator knows the bridge IPs of live sandboxes.
+    reservation = "build-" + job.name
+    veth_ip = _allocate_veth_ip(reservation)
     try:
         cgroup_limits(group, config.STATE_DIR, vcpus=2, memory_mib=2048, vmm_disk_limit=True)
-        env = {**os.environ, "FLINT_BUILD_JOB": job.name, "FLINT_BUILD_PARENT": str(os.getpid())}
+        env = {**os.environ, "FLINT_BUILD_JOB": job.name, "FLINT_BUILD_PARENT": str(os.getpid()),
+               "FLINT_BUILD_VETH_IP": veth_ip}
         with (job / "worker.log").open("wb") as log:
             result = _supervise([sys.executable, "-m", __name__],
                                 json.dumps({"kind": kind, "name": name, "dockerfile": dockerfile,
@@ -195,6 +200,7 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
                 log.seek(max(0, log.tell() - 4096))
                 raise RuntimeError(log.read().decode(errors="replace"))
         _cleanup(job)
+        _release_veth_ip(reservation)
         destination = Path(config.TEMPLATES_DIR) / template_id
         if destination.exists():
             os.replace(destination, retired)
@@ -212,8 +218,10 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
             wipe_tree(str(stage))
             wipe_tree(str(retired))
         except Exception:
+            # The builder namespace may still hold the IP: keep it reserved.
             _atomic(job / "job.json", {"kind": kind, "template_id": template_id, "cleanup_pending": True})
             raise
+        _release_veth_ip(reservation)
         _finish(job)
         raise
 

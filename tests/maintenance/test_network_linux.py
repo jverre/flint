@@ -308,6 +308,8 @@ def test_single_host_tenant_boundaries_and_peer_opt_in():
             ns(guest, "ip", "addr", "add", GUEST_IP + "/30", "dev", "eth0")
             ns(guest, "ip", "route", "add", "default", "via", HOST_IP)
             network_limits(namespace, "tap0")
+            # Recovery reconciles the live TAP without tearing its rules down.
+            network_limits(namespace, "tap0")
             for port in (18080, 5000, PROXY_PORT):
                 servers.append(subprocess.Popen(["ip", "netns", "exec", guest, "python", "-c",
                     "import socket,sys\ns=socket.socket(); s.bind((sys.argv[1],int(sys.argv[2]))); s.listen()\n"

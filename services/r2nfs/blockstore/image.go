@@ -399,6 +399,26 @@ func writeJSON(path string, v any) error {
 }
 
 func writeFileAtomic(path string, data []byte) error {
+	// Keep replaced metadata reachable until it is wiped. Otherwise a final
+	// flush can unlink an old bitmap which deletion can no longer discard.
+	retired := path + ".retired"
+	if old, err := os.Stat(retired); err == nil {
+		current, currentErr := os.Stat(path)
+		if currentErr != nil && !errors.Is(currentErr, fs.ErrNotExist) {
+			return currentErr
+		}
+		if currentErr != nil || !os.SameFile(old, current) {
+			if _, err := WipeFile(retired); err != nil {
+				return err
+			}
+		}
+		// A crash before rename may leave an alias of the still-live file.
+		if err := os.Remove(retired); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -415,51 +435,30 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	// Keep replaced metadata reachable until it is wiped. Otherwise a reader
-	// holding the old inode can still read it after the image is deleted.
-	retired := ""
-	if _, err := os.Lstat(path); err == nil {
-		link, err := os.CreateTemp(filepath.Dir(path), ".retired-*")
-		if err != nil {
-			return err
-		}
-		retired = link.Name()
-		if err := link.Close(); err != nil {
-			return err
-		}
-		if err := os.Remove(retired); err != nil {
-			return err
-		}
-		if err := os.Link(path, retired); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if err := os.Link(path, retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		if retired != "" {
-			_ = os.Remove(retired) // old inode is still reachable at path
-		}
 		return err
 	}
-	if retired != "" {
-		// Commit the replacement name before erasing the old inode. A crash
-		// must not roll back to metadata that has already been zeroed.
-		directory, err := os.Open(filepath.Dir(path))
-		if err != nil {
-			return err
-		}
-		err = directory.Sync()
-		directory.Close()
-		if err != nil {
-			return err
-		}
-		if _, err := WipePrivateFile(retired); err != nil {
-			return err // retain the name so image deletion can retry the wipe
-		}
-		return os.Remove(retired)
+	if err := dir.Sync(); err != nil {
+		return err
 	}
-	return nil
+	if _, err := WipeFile(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return dir.Sync()
 }
 
 // References returns the store keys an image with manifest m needs: its

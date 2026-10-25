@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
+import select
 
 from .config import log, HOST_IP, PROXY_PORT, STATE_DIR, _DATA_KEY
 from ._netns import _popen_in_ns
@@ -27,14 +29,63 @@ from ._identities import identity, release
 # The proxy's rules hold credentials in plaintext, so they stay in memory
 # (/run is a tmpfs) and readable by root only.
 _RULES_DIR = f"/run/flint/proxy-{_DATA_KEY}" if os.path.isdir("/run") else os.path.join(STATE_DIR, "proxy-rules")
+_CGROUP_ROOT = f"/sys/fs/cgroup/flint-proxies-{_DATA_KEY}"
 
 
-def cleanup_abandoned() -> None:
-    """The daemon lock is held and old proxies died with their supervisor."""
-    from pathlib import Path
+def stop_namespace_proxy(ns_name: str) -> None:
+    """Release a namespace's proxy even when its Python handle was lost."""
+    if not ns_name:
+        return
+    from ._limits import stop_processes
     from ._wipe import wipe_tree
-    for directory in Path(_RULES_DIR).glob("*"):
-        wipe_tree(str(directory))
+    group = Path(_CGROUP_ROOT) / ns_name
+    stop_processes(str(group))
+    if group.exists():
+        group.rmdir()
+    for path in Path(_RULES_DIR).glob(ns_name + "-*"):
+        wipe_tree(str(path))
+
+
+def cleanup_abandoned_proxies() -> None:
+    """Stop this daemon's old proxies before recovering their VM policies.
+
+    The rules-file identity check also handles upgrades from proxies which
+    predate cgroup ownership, without signalling a reused PID or another
+    daemon/container's process.
+    """
+    rules = Path(_RULES_DIR)
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        fd = None
+        try:
+            fd = os.pidfd_open(int(proc.name))
+            env = (proc / "environ").read_bytes().split(b"\0")
+            value = next((e.split(b"=", 1)[1] for e in env if e.startswith(b"FLINT_PROXY_RULES=")), None)
+            if value is None:
+                continue
+            path = Path(os.fsdecode(value))
+            if path.parent != rules:
+                continue
+            if not os.path.samestat(path.stat(), (proc / "root" / str(path).lstrip("/")).stat()):
+                continue
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+            poll = select.poll()
+            poll.register(fd, select.POLLIN)
+            if not poll.poll(10000):
+                raise RuntimeError("Credential proxy has not stopped; retaining its rules")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        finally:
+            if fd is not None:
+                os.close(fd)
+    root = Path(_CGROUP_ROOT)
+    if root.exists():
+        for group in root.iterdir():
+            if group.is_dir():
+                stop_namespace_proxy(group.name)
+    from ._wipe import wipe_tree
+    wipe_tree(_RULES_DIR)
 
 
 def _write_rules(path: str, rules: dict, uid: int, gid: int) -> None:
@@ -105,6 +156,8 @@ class CredentialProxy:
                 self.ns_name, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
             ))
+            from ._limits import attach_process
+            attach_process(str(Path(_CGROUP_ROOT) / self.ns_name), self._process.pid)
             self._wait_listening()
         except Exception:
             self.stop()
@@ -145,6 +198,7 @@ class CredentialProxy:
             wipe_tree(self._directory)
             self._directory = None
             self._rules_file = None
+        stop_namespace_proxy(self.ns_name)
         release("proxy:" + self.ns_name)
 
     def update_rules(self, rules: dict) -> None:

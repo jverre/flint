@@ -818,7 +818,7 @@ def _start_template_build(body: dict, request: Request):
         raise HTTPException(status_code=400, detail="name and dockerfile are required")
 
     from flint.core._template_registry import _slugify
-    from flint.core._template_registry import claim_template
+    from flint.core._template_registry import claim_template, update_template_artifact_status
     template_id = _slugify(name)
     if template_id == DEFAULT_TEMPLATE_ID:
         raise HTTPException(status_code=400, detail="The default template can't be rebuilt this way")
@@ -847,6 +847,9 @@ def _start_template_build(body: dict, request: Request):
             claim_template(template_id, name, tenant)
         else:
             daemon.cluster.forget_template(template_id)
+        # A polling client must see this attempt before its worker starts,
+        # rather than returning the previous attempt's ready/failed result.
+        update_template_artifact_status(template_id, daemon.backend.kind, "building")
     except Exception:
         admission.release()
         raise
@@ -858,6 +861,7 @@ def _start_template_build(body: dict, request: Request):
                 daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
             print(f"Template {template_id} built successfully")
         except Exception as e:
+            update_template_artifact_status(template_id, daemon.backend.kind, "failed", error=str(e))
             print(f"Template {template_id} build failed: {e}")
             log.exception("Template build failed: %s", template_id)
         finally:
@@ -868,8 +872,9 @@ def _start_template_build(body: dict, request: Request):
     try:
         t.start()
         _build_threads[template_id] = t
-    except Exception:
+    except Exception as exc:
         admission.release()
+        update_template_artifact_status(template_id, daemon.backend.kind, "failed", error=str(exc))
         raise
 
     return {"template_id": template_id, "status": "building"}
@@ -1460,7 +1465,6 @@ class FlintDaemon:
             return
         if self.backend.kind.startswith("linux-"):
             from flint.core._builder import cleanup_abandoned_builders
-            from flint.core._proxy import cleanup_abandoned
             from flint.core._identities import vm_identity
             for row in self._state_store.list_active():
                 if row["state"] not in ("Running", "Paused") or not os.path.isdir(row["vm_dir"]):
@@ -1471,8 +1475,9 @@ class FlintDaemon:
                         f"VM {row['vm_id']} uses a legacy host identity. Finish, export or delete "
                         "existing VMs with the previous Flint release before upgrading this worker."
                     )
-            cleanup_abandoned()
             from flint.core._build_job import recover_builds
+            from flint.core._proxy import cleanup_abandoned_proxies
+            cleanup_abandoned_proxies()
             recover_builds()
             cleanup_abandoned_builders()
         from flint.core._recovery import RecoveryEngine

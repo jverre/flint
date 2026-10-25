@@ -17,7 +17,6 @@ import (
 // blocks, with zeros written instead where that isn't supported.
 // Objects already pushed to a remote store are not removed from it.
 
-// wipeFile discards the data of the regular file at path, in place.
 func wipeFile(path string) (int64, error) {
 	return blockstore.WipeFile(path)
 }
@@ -37,7 +36,7 @@ func wipeAll(dir string) (int64, error) {
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		n, werr := blockstore.WipePrivateFile(path)
+		n, werr := wipeFile(path)
 		total += n
 		return werr
 	})

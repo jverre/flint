@@ -179,9 +179,11 @@ def _ensure_bridge() -> None:
 
 
 
-def _setup_veth_pair(ns_name: str, vm_id: str) -> tuple[str, str]:
+def _setup_veth_pair(ns_name: str, vm_id: str, veth_ip: str | None = None) -> tuple[str, str]:
     """Create a veth pair connecting the netns to br-flint for internet access.
 
+    ``veth_ip`` is an address the caller already reserved in the daemon's
+    allocator (a separate process's allocator can't see live sandboxes).
     Returns ``(veth_ip, veth_ns_ifname)``, e.g. ``("10.0.0.2", "vn-1a2b3c4d")``.
     """
     _ensure_bridge()
@@ -189,7 +191,11 @@ def _setup_veth_pair(ns_name: str, vm_id: str) -> tuple[str, str]:
     # Linux interface names limited to 15 chars
     veth_host = f"vh-{vm_id[:8]}"
     veth_ns = f"vn-{vm_id[:8]}"
-    veth_ip = _allocate_veth_ip(ns_name)
+    if veth_ip:
+        with _veth_ip_lock:
+            _veth_ips[ns_name] = veth_ip
+    else:
+        veth_ip = _allocate_veth_ip(ns_name)
 
     with IPRoute() as ipr:
         # Create veth pair in root namespace
@@ -411,7 +417,8 @@ def configure_tenant_peers(groups: list[list[str]]) -> None:
                                    check=True, capture_output=True)
 
 
-def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True) -> str:
+def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True,
+                          veth_ip: str | None = None) -> str:
     """Create a network namespace with a configured TAP device inside it.
 
     Returns the veth IP address if internet access is enabled, or '' otherwise.
@@ -431,9 +438,11 @@ def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True)
         raise RuntimeError(f"Failed to setup TAP {tap_name} in {ns_name}: {exc}") from exc
 
     # Set up veth pair for internet access
-    veth_ip, veth_ns = "", None
+    veth_ns = None
     if internet:
-        veth_ip, veth_ns = _setup_veth_pair(ns_name, _strip_ns_prefix(ns_name))
+        veth_ip, veth_ns = _setup_veth_pair(ns_name, _strip_ns_prefix(ns_name), veth_ip)
+    else:
+        veth_ip = ""
     _apply_netns_firewall(ns_name, veth_ns)
     from ._limits import network_limits
     network_limits(ns_name, tap_name)
