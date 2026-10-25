@@ -60,9 +60,12 @@ class RecoveryEngine:
                     try:
                         enforce_recovered(self._manager._backend, row)
                     except Exception:
-                        self._store.transition_state(vm_id, SandboxState.DELETING, detail="recovery enforcement failed")
-                        self._manager.kill(vm_id)
                         log.exception("[%s] recovered VM could not be confined", vm_id[:8])
+                        self._store.transition_state(vm_id, SandboxState.DELETING, detail="recovery enforcement failed")
+                        try:
+                            self._manager.kill(vm_id)
+                        except Exception:
+                            log.exception("[%s] deletion retained for retry during recovery", vm_id[:8])
                         continue
                 entry.tenant = row.get("tenant") or ""
                 entry.availability = row.get("availability") or ""

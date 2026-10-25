@@ -140,7 +140,8 @@ def _vm(kind: str, disk_mb: int):
         with open(rootfs, "r+b") as f:
             f.truncate(max(12288, disk_mb * 4 + 4096) * (1 << 20))
         subprocess.run(["resize2fs", rootfs], check=True, capture_output=True, timeout=60)
-        _setup_netns_pyroute2(ns, tap)
+        # The supervising daemon reserved this bridge IP against its live sandboxes.
+        _setup_netns_pyroute2(ns, tap, veth_ip=os.environ["FLINT_BUILD_VETH_IP"])
         _apply_netns_firewall(ns, "vn-" + _strip_ns_prefix(ns)[:8], allow_storage=False)
         if spec:
             os.link(shared_readonly(config.KERNEL_PATH, config.JAILER_SHARED_DIR), f"{spec.chroot_root}/vmlinux")
