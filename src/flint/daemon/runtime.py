@@ -125,7 +125,7 @@ class Runtime:
             raise ValueError("Cluster parameters are not accepted by the local runtime")
         from .auth import TRUSTED
         from flint.core._template_registry import _slugify
-        TRUSTED.resolve_tenant(tenant)
+        tenant = TRUSTED.resolve_tenant(tenant)
         if not isinstance(template_id, str) or _slugify(template_id) != template_id:
             raise ValueError("Invalid template ID")
         if any(type(v) is not bool for v in (allow_internet_access, use_pool, use_pyroute2)):
@@ -146,6 +146,8 @@ class Runtime:
     def create_volume(self, name, size_gib=None, tenant="default"):
         from flint.core import _nfs_server
         from flint.core._volumes import DEFAULT_SIZE_GIB
+        from .auth import TRUSTED
+        tenant = TRUSTED.resolve_tenant(tenant)
         size = size_gib or DEFAULT_SIZE_GIB if _nfs_server.images_available() else 0
         if type(size) is not int or size < 0:
             raise ValueError("Invalid volume size")
@@ -193,7 +195,7 @@ class Runtime:
         from flint.core._template_registry import _slugify
         from flint.core._template_registry import claim_template, update_template_artifact_status
         from .auth import TRUSTED
-        TRUSTED.resolve_tenant(tenant)
+        tenant = TRUSTED.resolve_tenant(tenant)
         if not isinstance(name, str) or not name or not isinstance(dockerfile, str) or not dockerfile:
             raise ValueError("name and dockerfile are required")
         if type(rootfs_size_mb) is not int or not 64 <= rootfs_size_mb <= 16384:
