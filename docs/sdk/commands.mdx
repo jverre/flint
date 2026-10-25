@@ -126,13 +126,3 @@ Commands that exceed the timeout return with `exit_code` of `-1`.
 result = sandbox.commands.run("sleep 10", timeout=2)
 print(result.exit_code)  # -1
 ```
-
-## Shorthand
-
-`Sandbox` exposes `run_command` as a direct alias:
-
-```python
-# These are equivalent
-result = sandbox.commands.run("echo hi")
-result = sandbox.run_command("echo hi")
-```

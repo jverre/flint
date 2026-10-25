@@ -14,7 +14,6 @@ class AppState:
     sandboxes: dict[str, dict] = field(default_factory=dict)
     volumes: list[dict] = field(default_factory=list)
     templates: list[dict] = field(default_factory=list)
-    agents: list[dict] = field(default_factory=list)
     config: dict = field(default_factory=dict)
 
     # UI state

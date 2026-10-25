@@ -220,14 +220,7 @@ def test_list_files(sandbox):
     assert "b.txt" in names
 
 
-# ── run_command / run_code ───────────────────────────────────────────────────
-
-
-def test_run_command(sandbox):
-    """Test the high-level run_command method."""
-    result = sandbox.run_command("echo hi")
-    assert result.exit_code == 0
-    assert "hi" in result.stdout
+# ── run_code ─────────────────────────────────────────────────────────────────
 
 
 def test_run_code_python(sandbox):
