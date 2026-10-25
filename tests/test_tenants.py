@@ -237,7 +237,7 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
     """
     if not backend_health.get("network_policy"):
         pytest.skip(f"{backend_health['backend_kind']} has no bridge network or credential proxy")
-    from flint.core.config import BRIDGE_IP, PROXY_PORT, VETH_SUBNET
+    from flint.core.config import BRIDGE_IP, PROXY_PORT, VETH_SUBNET, GUEST_IP
 
     (ta, tok_a), (tb, tok_b) = tenants["a"], tenants["b"]
     a, b = DaemonClient(TCP_URL, api_key=tok_a), DaemonClient(TCP_URL, api_key=tok_b)
@@ -274,8 +274,12 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
                        "192.168.0.1 80", "172.17.0.1 80", "100.64.0.1 80"):
             code, out = run(a, a2, f"nc -w3 {target} </dev/null")
             assert code != 0, f"a2 reached {target}: {out}"
-        code, out = run(a, a2, "nc -w5 1.1.1.1 80 </dev/null")
+        code, out = run(a, a2, f"nc -s {GUEST_IP} -w5 1.1.1.1 80 </dev/null")
         assert code == 0, f"a2 can't reach the internet: {out}"
+        code, out = run(a, a2, f"ip addr add {VETH_SUBNET}.254/32 dev eth0; "
+                               f"nc -s {VETH_SUBNET}.254 -w3 1.1.1.1 80 </dev/null; code=$?; "
+                               f"ip addr del {VETH_SUBNET}.254/32 dev eth0; exit $code")
+        assert code != 0, f"forged bridge source escaped guest source filtering: {out}"
         # Through a1's proxy, cloud metadata is still out of reach.
         code, out = run(a, a1, "wget -q -T5 -O - --header 'Metadata: true' "
                                "'http://169.254.169.254/metadata/instance?api-version=2021-02-01'")
@@ -321,6 +325,16 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
         code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
         assert code == 0, out
         assert json.loads(out)["headers"].get("x-flint-auth") == secret, out
+        import sqlite3
+        from pathlib import Path
+        from flint.core._proxy import _RULES_DIR
+        with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
+            proxy_ns = db.execute("SELECT ns_name FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()[0]
+        a.pause(a1)
+        assert not list(Path(_RULES_DIR).glob(proxy_ns + "-*")), "paused VM retained plaintext proxy credentials"
+        a.resume(a1)
+        code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
+        assert code == 0 and json.loads(out)["headers"].get("x-flint-auth") == secret, out
         # The pattern is put together in the shell, so the probe itself never
         # brings the whole secret into the VM.
         half = len(secret) // 2
@@ -385,6 +399,7 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
             wiped = _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
             assert wiped["files"] > 0 and wiped["bytes"] > 0, wiped
             assert not root.exists(), f"deleted VM files remain under {root}"
+            assert not list(Path(_RULES_DIR).glob(proxy_ns + "-*")), "deleted VM retained plaintext proxy credentials"
             for stream in held:
                 while chunk := stream.read(1 << 20):
                     assert chunk.count(0) == len(chunk), f"data left in deleted file {stream.name}"

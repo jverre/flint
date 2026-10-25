@@ -1411,6 +1411,8 @@ class FlintDaemon:
         if self.backend.kind.startswith("linux-"):
             from flint.core._builder import cleanup_abandoned_builders
             from flint.core._build_job import recover_builds
+            from flint.core._proxy import cleanup_abandoned_proxies
+            cleanup_abandoned_proxies()
             recover_builds()
             cleanup_abandoned_builders()
         from flint.core._recovery import RecoveryEngine
@@ -1420,7 +1422,12 @@ class FlintDaemon:
             from flint.core._netns import reconcile_namespace
             for row in self._state_store.list_active():
                 if row["state"] in ("Running", "Paused"):
-                    reconcile_namespace(row["ns_name"], proxy=bool(row.get("network_policy_json")))
+                    reconcile_namespace(row["ns_name"])
+                    entry = self.manager.get_entry(row["vm_id"])
+                    policy = self._state_store.get_network_policy(row["vm_id"])
+                    if entry and policy:
+                        entry.network_policy = json.loads(policy)
+                        self.manager._apply_network_policy(entry, entry.network_policy)
         self.manager.refresh_tenant_networks()
         print(f"Recovery: {report}")
 

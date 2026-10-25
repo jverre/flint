@@ -275,6 +275,9 @@ class SandboxManager:
             self.refresh_tenant_networks()
             if entry and entry.proxy:
                 entry.proxy.stop()
+            elif self._backend.kind.startswith("linux-"):
+                from ._proxy import stop_namespace_proxy
+                stop_namespace_proxy(entry.ns_name if entry else row.get("ns_name", ""))
             for hook in self.kill_hooks:
                 hook(sandbox_id)
             if entry:
@@ -315,6 +318,10 @@ class SandboxManager:
             raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
 
         self._backend.pause(entry, self._state_store)
+
+        if entry.proxy:
+            entry.proxy.stop()
+            entry.proxy = None
 
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
