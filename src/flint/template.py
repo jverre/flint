@@ -115,7 +115,7 @@ class Template:
         from flint.core._template_build import _generate_dockerfile
         return _generate_dockerfile(self._base_image, self._steps)
 
-    def build(self, poll_interval: float = 2.0, timeout: float = 600.0) -> TemplateInfo:
+    def build(self, poll_interval: float = 2.0, timeout: float = 1200.0) -> TemplateInfo:
         """Build the template via the daemon. Blocks until complete."""
         dockerfile = self._to_dockerfile()
         client = _get_client()  # shared: don't close it
