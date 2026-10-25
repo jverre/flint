@@ -248,12 +248,13 @@ class SandboxManager:
     def _kill(self, sandbox_id: str) -> None:
         with self._lock:
             entry = self._sandboxes.get(sandbox_id)
+            if entry:
+                # Under the lock: the health monitor must not overwrite this.
+                entry.state = SandboxState.DELETING
+                entry.agent_healthy = False
         row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
         if not entry and (not row or row["state"] == SandboxState.DEAD.value):
             return
-        if entry:
-            entry.state = SandboxState.DELETING
-            entry.agent_healthy = False
         if self._state_store:
             if row and row["state"] != SandboxState.DELETING.value:
                 self._state_store.transition_state(sandbox_id, SandboxState.DELETING, detail="deletion pending")
@@ -520,7 +521,7 @@ class SandboxManager:
             if entry.proxy:
                 entry.proxy.update_rules(rules)
             else:
-                proxy = CredentialProxy(entry.ns_name)
+                proxy = CredentialProxy(entry.ns_name, entry.vm_id)
                 proxy.start(rules)
                 entry.proxy = proxy
                 _setup_proxy_redirect(entry.ns_name)

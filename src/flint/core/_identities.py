@@ -79,3 +79,14 @@ def release(owner: str, *, directory: str = STATE_DIR) -> None:
         return
     with closing(sqlite3.connect(path, timeout=30)) as db, db:
         db.execute("DELETE FROM identities WHERE owner = ?", (owner,))
+
+
+def release_kind(kind: str, *, directory: str = STATE_DIR) -> None:
+    """Release every identity of a kind (e.g. "proxy") once none can be running."""
+    if not re.fullmatch(r"[a-z]+", kind):
+        raise ValueError("Invalid workload identity kind")
+    path = os.path.join(directory, "identities.sqlite")
+    if not os.path.exists(path):
+        return
+    with closing(sqlite3.connect(path, timeout=30)) as db, db:
+        db.execute("DELETE FROM identities WHERE substr(owner, 1, ?) = ?", (len(kind) + 1, kind + ":"))

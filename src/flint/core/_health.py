@@ -61,8 +61,14 @@ class HealthMonitor:
                 if self._store:
                     self._store.update_health(vm_id, now)
             else:
+                with self._manager._lock:
+                    # A deletion may have started during the (slow) probe.
+                    if entry.state != SandboxState.RUNNING:
+                        continue
+                    entry.state = SandboxState.ERROR
                 log.warning("[%s] sandbox unhealthy — transitioning to error", vm_id[:8])
-                entry.state = SandboxState.ERROR
+                # Outside the lock: publishing looks the VM up. The store
+                # rejects DELETING -> ERROR if a deletion wins from here.
                 if self._store:
                     self._store.transition_state(
                         vm_id, SandboxState.ERROR,

@@ -136,6 +136,9 @@ def register_template_artifact(
         "status": status,
         "rootfs_size_mb": rootfs_size_mb,
     }
+    if status == "ready":
+        # Stays bootable while a later rebuild runs or after it fails.
+        artifacts[backend_kind]["published"] = True
     existing["artifacts"] = artifacts
     registry[template_id] = existing
     _save_registry(registry)
@@ -225,6 +228,18 @@ def delete_template_artifact(template_id: str, backend_kind: str) -> None:
     _save_registry(registry)
 
 
+def artifact_usable(artifact: dict) -> bool:
+    """Bootable: ready, or published by an earlier build than the latest attempt."""
+    return artifact.get("status", "ready") == "ready" or bool(artifact.get("published"))
+
+
+def template_usable(template: dict, backend_kind: str) -> bool:
+    artifact = (template.get("artifacts") or {}).get(backend_kind)
+    if artifact:
+        return artifact_usable(artifact)
+    return template.get("status", "ready") == "ready"
+
+
 def get_template_dir(template_id: str, backend_kind: str = "linux-firecracker") -> str:
     if template_id == DEFAULT_TEMPLATE_ID:
         return GOLDEN_DIR
@@ -234,7 +249,7 @@ def get_template_dir(template_id: str, backend_kind: str = "linux-firecracker") 
     artifacts = entry.get("artifacts") or {}
     artifact = artifacts.get(backend_kind)
     if artifact:
-        if artifact.get("status", "ready") != "ready":
+        if not artifact_usable(artifact):
             raise KeyError(f"Template {template_id} is not ready")
         return artifact["template_dir"]
     return entry["template_dir"]
