@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -525,6 +525,7 @@ dependencies = [
     { name = "click" },
     { name = "cryptography" },
     { name = "fastapi" },
+    { name = "h11" },
     { name = "httpx" },
     { name = "itsdangerous" },
     { name = "mitmproxy" },
@@ -550,6 +551,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.3.1" },
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "h11", specifier = ">=0.16" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "itsdangerous", specifier = ">=2.2" },
     { name = "mitmproxy", specifier = ">=10.0" },

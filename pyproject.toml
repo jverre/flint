@@ -17,6 +17,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "httpx>=0.28",
+    "h11>=0.16",
     "websockets>=14.0",
     "mitmproxy>=10.0",
     "cryptography>=42",

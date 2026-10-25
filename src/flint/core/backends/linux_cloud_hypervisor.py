@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import shutil
+import socket
 import threading
 import urllib.request
 
@@ -380,26 +381,11 @@ class LinuxCloudHypervisorBackend(HostBackend):
     def template_files(self, template_dir: str) -> list[str]:
         return ["rootfs.ext4"] + [f"snapshot/{n}" for n in (*self._PAUSE_FILES, "rootfs.ext4")]
 
-    def proxy_guest_request(
-        self,
-        entry: _SandboxEntry,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        timeout: float = 65,
-    ) -> tuple[int, bytes]:
-        url = f"{entry.agent_url}{path}"
-        req = urllib.request.Request(url, data=body, method=method)
-        if body is not None:
-            req.add_header("Content-Type", "application/json")
-
-        ns_name = entry.ns_name or (entry.backend_metadata or {}).get("ns_name")
-        orig_fd = _enter_netns(ns_name)
+    def connect_guest(self, entry: _SandboxEntry) -> socket.socket:
+        # A socket belongs to the netns it was created in.
+        orig_fd = _enter_netns(entry.ns_name or (entry.backend_metadata or {}).get("ns_name"))
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            return super().connect_guest(entry)
         finally:
             _restore_netns(orig_fd)
 

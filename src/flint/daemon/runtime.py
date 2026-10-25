@@ -19,7 +19,6 @@ import struct
 import threading
 
 from flint.core import config
-from flint.core._netns import _enter_netns, _restore_netns
 from flint.core._quotas import Usage
 from . import events
 from .runtime_protocol import MAX_RESPONSE, receive, send
@@ -99,18 +98,15 @@ class Runtime:
 
     def entry(self, sandbox_id: str):
         entry = self.daemon.manager.get_entry(sandbox_id)
-        return {"vm_id": entry.vm_id, "backend_metadata": entry.backend_metadata,
+        return {"vm_id": entry.vm_id, "backend_metadata": entry.backend_metadata, "tenant": entry.tenant,
                 "ns_name": "", "agent_url": ""} if entry else None
 
     def connect(self, sandbox_id: str):
-        entry = self.daemon.manager.get_entry(sandbox_id)
-        if entry is None:
+        # Returns with the connection still in progress: a guest that drops
+        # the SYN must not hold one of the runtime's request slots.
+        if self.daemon.manager.get_entry(sandbox_id) is None:
             raise ValueError("VM not found")
-        old = _enter_netns(entry.ns_name)
-        try:
-            return socket.create_connection((config.GUEST_IP, config.AGENT_PORT), timeout=30)
-        finally:
-            _restore_netns(old)
+        return self.daemon.manager.connect_agent(sandbox_id)
 
     def usage(self, tenant: str):
         vms = sum(v.get("tenant") == tenant for v in self.daemon.manager.list_dicts())

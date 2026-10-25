@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 import json
+import socket
+import threading
 import time
 
 from fastapi.testclient import TestClient
@@ -25,15 +27,25 @@ def test_events_and_audit_obey_the_http_principal(tmp_path, monkeypatch):
     _, acme = tokens.create(SERVICE, "acme-backend", ["acme"])
     _, other = tokens.create(SERVICE, "other", ["other"])
     vm = {"vm_id": "vm-1", "tenant": "acme", "state": "dead"}
-    manager = SimpleNamespace(get_dict=lambda vm_id: vm if vm_id == "vm-1" else None)
+
+    def agent(vm_id):
+        """A guest agent that answers one exec."""
+        host, guest = socket.socketpair()
+        body = json.dumps({"exit_code": 0, "stdout": "stored\n", "stderr": ""}).encode()
+
+        def serve():
+            with guest:
+                guest.recv(65536)
+                guest.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+
+        threading.Thread(target=serve, daemon=True).start()
+        return host
+
+    manager = SimpleNamespace(get_dict=lambda vm_id: vm if vm_id == "vm-1" else None,
+                              get_entry=lambda vm_id: SimpleNamespace(**vm), connect_agent=agent)
     daemon = SimpleNamespace(tokens=tokens, eventlog=log, cluster=None, manager=manager, metrics=None)
     monkeypatch.setattr(app.state, "daemon", daemon, raising=False)
     monkeypatch.setattr(events, "sink", log.record)
-
-    async def agent(*args):
-        return 200, json.dumps({"exit_code": 0, "stdout": "stored\n", "stderr": ""}).encode()
-
-    monkeypatch.setattr("flint.daemon.server._agent_request_async", agent)
     monkeypatch.setattr(events, "vm_tenant", lambda vm_id: "acme")
     for tenant in ("", "other", "acme"):
         log.record({"type": "vm.deleted", "ts": time.time(), "tenant": tenant, "vm_id": "vm-1"})

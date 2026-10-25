@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import threading
@@ -11,7 +12,7 @@ import time
 import urllib.parse
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 import uvicorn
 
 from flint.core.backends import get_host_backend
@@ -29,6 +30,8 @@ from flint.core._template_registry import (
 from flint.core._volumes import DEFAULT_SIZE_GIB, Volumes, VolumeError
 from flint.core._quotas import QuotaExceeded, Quotas, Usage
 from flint.core import _nfs_server
+from flint.core import _guest_http
+from flint.core._guest_http import GuestAgentError
 from flint.core._metrics import MetricsSampler
 from flint.core import _logs
 from flint.daemon import events as _events
@@ -56,6 +59,12 @@ app.add_middleware(
 
 @app.exception_handler(AuthError)
 async def _auth_error(_request: Request, e: AuthError):
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": e.detail}, status_code=e.status)
+
+
+@app.exception_handler(GuestAgentError)
+async def _guest_agent_error(_request: Request, e: GuestAgentError):
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": e.detail}, status_code=e.status)
 
@@ -196,11 +205,49 @@ def _write_state(daemon: FlintDaemon) -> None:
         os.replace(tmp_path, DAEMON_STATE_PATH)
 
 
-async def _agent_request_async(vm_id: str, method: str, path: str, body: bytes | None = None, timeout: float = 65) -> tuple[int, bytes]:
-    """Async wrapper: runs backend transport in a worker thread."""
+# The API holds at most this much of a guest agent's reply and streams the
+# rest through, so a guest that is slow or sends a lot costs a coroutine, a
+# socket and a chunk, however many requests a tenant makes.
+_HELD_REPLY = 1 << 20
+
+
+async def _guest_reply(vm_id: str, method: str, path: str, body=None, timeout: float = 65):
+    """Send a request to the VM's agent: ``(reply, its first bytes, whether that is all)``."""
     mgr = _require_manager()
     _require_entry(vm_id)
-    return await asyncio.to_thread(mgr.agent_request, vm_id, method, path, body, timeout)
+    sock = await asyncio.to_thread(mgr.connect_agent, vm_id)
+    reply = await _guest_http.open(sock, method, path, body, timeout)
+    head, complete = await reply.head(_HELD_REPLY)
+    return reply, head, complete
+
+
+def _relay(reply, head: bytes, complete: bool, media_type: str = "application/json", on_end=None) -> Response:
+    """The guest's reply as the API's response, streaming what wasn't held.
+
+    ``on_end`` gets the body's last few KiB once a streamed body has ended.
+    """
+    if complete:
+        return Response(content=head, status_code=reply.status, media_type=media_type)
+
+    async def body():
+        tail = head[-4096:]
+        try:
+            yield head
+            async for chunk in reply.rest():
+                tail = (tail + chunk)[-4096:]
+                yield chunk
+        finally:
+            reply.close()  # now, not when the generator is collected, if the client hangs up
+        if on_end:
+            on_end(tail)
+
+    # A body cut short then shows as one, not as a complete shorter file.
+    headers = {"content-length": reply.headers["content-length"]} if "content-length" in reply.headers else None
+    return StreamingResponse(body(), status_code=reply.status, media_type=media_type, headers=headers)
+
+
+async def _proxy(vm_id: str, method: str, path: str, body=None) -> Response:
+    return _relay(*await _guest_reply(vm_id, method, path, body))
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -597,18 +644,24 @@ async def exec_command(vm_id: str, request: Request):
     print(f"POST /vms/{vm_id[:8]}/exec")
     body = await request.body()
     t0 = time.monotonic()
-    status, resp_body = await _agent_request_async(vm_id, "POST", "/exec", body)
+    reply, head, complete = await _guest_reply(vm_id, "POST", "/exec", body)
     event = {"vm_id": vm_id, "cmd": _command_text(body), "duration_ms": round((time.monotonic() - t0) * 1000, 1)}
+    if not complete:
+        # Too much output to hold: the exit code is the reply's last field.
+        def on_end(tail: bytes) -> None:
+            code = re.search(rb'"exit_code":\s*(-?\d+)\s*}\s*$', tail)
+            _events.publish("vm.exec", **event, exit_code=int(code[1]) if code else None)
+        return _relay(reply, head, complete, on_end=on_end)
     try:
-        result = json.loads(resp_body) if status == 200 else {}
+        result = json.loads(head) if reply.status == 200 else {}
         event.update(exit_code=result.get("exit_code"), stdout_tail=str(result.get("stdout", ""))[-256:],
                      stderr_tail=str(result.get("stderr", ""))[-256:])
     except ValueError:
         pass
-    if status != 200:
-        event["error"] = resp_body[:256].decode(errors="replace")
+    if reply.status != 200:
+        event["error"] = head[:256].decode(errors="replace")
     _events.publish("vm.exec", **event)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return _relay(reply, head, complete)
 
 
 @app.post("/vms/{vm_id}/processes")
@@ -616,45 +669,38 @@ async def create_process(vm_id: str, request: Request):
     """Proxy POST /processes to the guest agent."""
     print(f"POST /vms/{vm_id[:8]}/processes")
     body = await request.body()
-    status, resp_body = await _agent_request_async(vm_id, "POST", "/processes", body)
-    if status == 200:
+    reply, head, complete = await _guest_reply(vm_id, "POST", "/processes", body)
+    if reply.status == 200:
         try:
-            pid = json.loads(resp_body).get("pid")
+            pid = json.loads(head).get("pid")
         except ValueError:
             pid = None
         _events.publish("vm.process_started", vm_id=vm_id, cmd=_command_text(body), pid=pid)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return _relay(reply, head, complete)
 
 
 @app.get("/vms/{vm_id}/processes")
 async def list_processes(vm_id: str):
     """Proxy GET /processes to the guest agent."""
-    status, resp_body = await _agent_request_async(vm_id, "GET", "/processes")
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "GET", "/processes")
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/input")
 async def process_input(vm_id: str, pid: int, request: Request):
     """Proxy stdin input to a guest process."""
-    body = await request.body()
-    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/input", body)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "POST", f"/processes/{pid}/input", await request.body())
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/signal")
 async def process_signal(vm_id: str, pid: int, request: Request):
     """Proxy signal to a guest process."""
-    body = await request.body()
-    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/signal", body)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "POST", f"/processes/{pid}/signal", await request.body())
 
 
 @app.post("/vms/{vm_id}/processes/{pid}/resize")
 async def process_resize(vm_id: str, pid: int, request: Request):
     """Proxy resize to a guest process."""
-    body = await request.body()
-    status, resp_body = await _agent_request_async(vm_id, "POST", f"/processes/{pid}/resize", body)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "POST", f"/processes/{pid}/resize", await request.body())
 
 
 # ── Filesystem proxy endpoints ───────────────────────────────────────────
@@ -662,41 +708,35 @@ async def process_resize(vm_id: str, pid: int, request: Request):
 @app.get("/vms/{vm_id}/files")
 async def read_file(vm_id: str, path: str):
     """Proxy GET /files to the guest agent."""
-    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files?path={urllib.parse.quote(path, safe='/')}")
-    media = "application/octet-stream" if status == 200 else "application/json"
-    return Response(content=resp_body, status_code=status, media_type=media)
+    reply, head, complete = await _guest_reply(vm_id, "GET", f"/files?path={urllib.parse.quote(path, safe='/')}")
+    media = "application/octet-stream" if reply.status == 200 else "application/json"
+    return _relay(reply, head, complete, media)
 
 
 @app.post("/vms/{vm_id}/files")
 async def write_file(vm_id: str, path: str, request: Request, mode: str = "0644"):
     """Proxy POST /files to the guest agent."""
-    body = await request.body()
-    status, resp_body = await _agent_request_async(vm_id, "POST", f"/files?path={urllib.parse.quote(path, safe='/')}&mode={mode}", body)
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "POST", f"/files?path={urllib.parse.quote(path, safe='/')}&mode={mode}", request.stream())
 
 
 @app.get("/vms/{vm_id}/files/stat")
 async def stat_file(vm_id: str, path: str):
-    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files/stat?path={urllib.parse.quote(path, safe='/')}")
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "GET", f"/files/stat?path={urllib.parse.quote(path, safe='/')}")
 
 
 @app.get("/vms/{vm_id}/files/list")
 async def list_files(vm_id: str, path: str):
-    status, resp_body = await _agent_request_async(vm_id, "GET", f"/files/list?path={urllib.parse.quote(path, safe='/')}")
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "GET", f"/files/list?path={urllib.parse.quote(path, safe='/')}")
 
 
 @app.post("/vms/{vm_id}/files/mkdir")
 async def mkdir(vm_id: str, path: str, parents: bool = True):
-    status, resp_body = await _agent_request_async(vm_id, "POST", f"/files/mkdir?path={urllib.parse.quote(path, safe='/')}&parents={'true' if parents else 'false'}")
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "POST", f"/files/mkdir?path={urllib.parse.quote(path, safe='/')}&parents={'true' if parents else 'false'}")
 
 
 @app.delete("/vms/{vm_id}/files")
 async def delete_file(vm_id: str, path: str, recursive: bool = False):
-    status, resp_body = await _agent_request_async(vm_id, "DELETE", f"/files?path={urllib.parse.quote(path, safe='/')}&recursive={'true' if recursive else 'false'}")
-    return Response(content=resp_body, status_code=status, media_type="application/json")
+    return await _proxy(vm_id, "DELETE", f"/files?path={urllib.parse.quote(path, safe='/')}&recursive={'true' if recursive else 'false'}")
 
 
 # ── Terminal WebSocket ────────────────────────────────────────────────────
