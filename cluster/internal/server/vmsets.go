@@ -256,6 +256,9 @@ func (s *Server) handleCreateVMSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
+	if !s.templateUsable(w, r, body.Spec.TemplateID, body.Tenant) {
+		return
+	}
 	now := nowMs()
 	vs := &VMSet{ID: "vs-" + uuid.NewString()[:13], Tenant: body.Tenant, Name: body.Name, Spec: body.Spec, Generation: 1, CreatedAt: now, UpdatedAt: now}
 	if _, err := s.db.Exec(r.Context(), `INSERT INTO vmsets (id, tenant, name, spec, generation, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, ?, ?)`,
@@ -264,6 +267,19 @@ func (s *Server) handleCreateVMSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"vmset": s.vmsetDict(r.Context(), vs, true)})
+}
+
+// templateUsable answers 404 unless the set's tenant may boot the template.
+func (s *Server) templateUsable(w http.ResponseWriter, r *http.Request, id, tenant string) bool {
+	if id == "default" {
+		return true
+	}
+	if _, err := s.templateFor(r.Context(), id, tenant); err != nil {
+		code, detail := statusFor(err)
+		writeErr(w, code, detail)
+		return false
+	}
+	return true
 }
 
 func (s *Server) vmsetForRequest(w http.ResponseWriter, r *http.Request) (*VMSet, bool) {
@@ -313,6 +329,9 @@ func (s *Server) handleUpdateVMSet(w http.ResponseWriter, r *http.Request) {
 	body.Spec.normalize()
 	if msg := validSpec(body.Spec); msg != "" {
 		writeErr(w, 400, msg)
+		return
+	}
+	if !s.templateUsable(w, r, body.Spec.TemplateID, vs.Tenant) {
 		return
 	}
 	if _, err := s.db.Exec(r.Context(), `UPDATE vmsets SET spec = ?, generation = generation + 1, updated_at = ? WHERE id = ?`,

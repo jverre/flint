@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/jverre/flint/cluster/internal/db"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -399,6 +400,19 @@ func (s *Server) getTemplate(ctx context.Context, id string) (*Template, error) 
 		Scan(&t.ID, &t.Name, &t.Tenant, &t.Dockerfile, &t.RootfsMB, &t.Status, &bh, &t.Error, &t.CreatedAt, &t.UpdatedAt)
 	t.BuildHost = bh.String
 	return &t, err
+}
+
+// templateFor returns a template a tenant's VMs may boot: a shared one or the
+// tenant's own. Another tenant's is "not found", even for an admin.
+func (s *Server) templateFor(ctx context.Context, id, tenant string) (*Template, error) {
+	t, err := s.getTemplate(ctx, id)
+	if err == nil && t.Tenant != "" && t.Tenant != tenant {
+		err = sql.ErrNoRows
+	}
+	if isNotFound(err) {
+		return nil, &apiError{http.StatusNotFound, "template not found: " + id}
+	}
+	return t, err
 }
 
 func (s *Server) listTemplates(ctx context.Context) ([]*Template, error) {

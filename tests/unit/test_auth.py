@@ -51,3 +51,31 @@ def test_tokens_authenticate_until_revoked(tmp_path):
 def test_admin_tokens_take_no_tenants(tmp_path):
     with pytest.raises(AuthError):
         TokenStore(os.path.join(tmp_path, "flint.db")).create(ADMIN, "ops", ["acme"])
+
+
+def _authenticates(path: str, *, over_socket: bool) -> "Principal | None | str":
+    """Run the auth middleware's decision for a GET to ``path`` with no token.
+    Returns the principal, or the refusal status as a string."""
+    from flint.daemon.auth import AuthMiddleware, AuthError
+    mw = AuthMiddleware(None, tokens=lambda: None, cluster_mode=lambda: False, vm_tenant=lambda _id: None)
+    server = ("/run/flint.sock", None) if over_socket else ("127.0.0.1", 9100)
+    scope = {"type": "http", "method": "GET", "path": path, "headers": [], "server": server}
+    try:
+        return mw._authenticate(scope, path)
+    except AuthError as e:
+        return f"{e.status}"
+
+
+def test_public_paths_need_no_token():
+    # The genuinely public surface stays reachable without a token.
+    for path in ("/health", "/ui/", "/ui/assets/app.js", "/auth/login/google"):
+        assert _authenticates(path, over_socket=False) is None, path
+
+
+def test_a_dot_segment_never_makes_a_path_public():
+    # A TCP caller can't dodge the token check by hiding an admin route behind
+    # the public /ui/ prefix with a dot segment (decoded by the server by now).
+    for path in ("/ui/../config", "/ui/../v1/tokens", "/ui/../../config", "/health/../config"):
+        assert _authenticates(path, over_socket=False) == "401", path
+    # Over the trusted Unix socket the caller is an admin regardless.
+    assert _authenticates("/ui/../config", over_socket=True).is_admin

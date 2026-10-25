@@ -204,6 +204,9 @@ class TokenStore:
 # Reachable without a token: liveness, the web UI's static files, and SSO
 # sign-in (the UI then signs in with SSO or a token).
 _PUBLIC = re.compile(r"^/(health|ui(/.*)?|auth(/.*)?)?$")
+# A dot segment (``/ui/../config``, or its percent-encoded form, which the
+# server has decoded by now) never makes a path public.
+_DOT_SEGMENT = re.compile(r"(^|/)\.\.?(/|$)")
 _ADMIN_ONLY = re.compile(r"^/(config|v1/tokens|v1/audit)(/.*)?$")
 _VM_PATH = re.compile(r"^/vms/([^/]+)(/.*)?$")
 
@@ -335,7 +338,7 @@ class AuthMiddleware:
             log.exception("audit: recording %s %s failed", scope.get("method"), path)
 
     def _authenticate(self, scope, path: str) -> Principal | None:
-        if _PUBLIC.match(path):
+        if _PUBLIC.match(path) and not _DOT_SEGMENT.search(path):
             return None
         if self._cluster_mode() or _over_unix_socket(scope):
             principal = TRUSTED  # mTLS from the control plane, or the Unix socket
