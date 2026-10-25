@@ -164,9 +164,10 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	}
 	tmpl := firstNonEmpty(body.TemplateID, q.Get("template_id"), "default")
 	if tmpl != "default" {
-		t, err := s.getTemplate(r.Context(), tmpl)
+		t, err := s.templateFor(r.Context(), tmpl, tenant)
 		if err != nil {
-			writeErr(w, 404, "template not found: "+tmpl)
+			code, detail := statusFor(err)
+			writeErr(w, code, detail)
 			return
 		}
 		if t.Status != "ready" {
@@ -508,8 +509,10 @@ func (s *Server) handleBuildTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "name and dockerfile are required")
 		return
 	}
-	if body.Tenant != "" && !p.CanTenant(body.Tenant) {
-		writeErr(w, 403, "not allowed for this tenant")
+	tenant, err := p.resolveTenant(body.Tenant)
+	if err != nil {
+		code, detail := statusFor(err)
+		writeErr(w, code, detail)
 		return
 	}
 	if body.RootfsMB == 0 {
@@ -520,6 +523,23 @@ func (s *Server) handleBuildTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "cannot rebuild the default template")
 		return
 	}
+	// IDs are one namespace: a rebuild must not replace another tenant's
+	// template (or a shared one), whose VMs would then run this Dockerfile.
+	taken := func() bool {
+		t, err := s.getTemplate(r.Context(), id)
+		if err != nil || t.Tenant == tenant {
+			return false
+		}
+		if t.Tenant == "" || p.CanTenant(t.Tenant) {
+			writeErr(w, 409, "template "+id+" already exists")
+		} else {
+			writeErr(w, 403, "template "+id+" already exists for another tenant")
+		}
+		return true
+	}
+	if taken() {
+		return
+	}
 	cands, err := s.candidates(r.Context(), placeReq{TemplateID: "default"})
 	if err != nil {
 		writeErr(w, 503, err.Error())
@@ -527,11 +547,16 @@ func (s *Server) handleBuildTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	h := cands[0]
 	now := nowMs()
-	if _, err := s.db.Exec(r.Context(), `INSERT INTO templates (id, name, tenant, dockerfile, rootfs_mb, status, build_host, error, created_at, updated_at)
+	res, err := s.db.Exec(r.Context(), `INSERT INTO templates (id, name, tenant, dockerfile, rootfs_mb, status, build_host, error, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, 'building', ?, '', ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, dockerfile = excluded.dockerfile,
-		rootfs_mb = excluded.rootfs_mb, status = 'building', build_host = excluded.build_host, error = '', updated_at = excluded.updated_at`,
-		id, body.Name, body.Tenant, body.Dockerfile, body.RootfsMB, h.ID, now, now); err != nil {
+		rootfs_mb = excluded.rootfs_mb, status = 'building', build_host = excluded.build_host, error = '', updated_at = excluded.updated_at
+		WHERE templates.tenant = excluded.tenant`,
+		id, body.Name, tenant, body.Dockerfile, body.RootfsMB, h.ID, now, now)
+	if err != nil {
 		writeErr(w, 500, err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 && taken() { // another tenant claimed it meanwhile
 		return
 	}
 	// A rebuild replaces the template's snapshots.
@@ -601,6 +626,10 @@ func (s *Server) handleDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	t, err := s.getTemplate(r.Context(), id)
 	if err != nil || (t.Tenant != "" && !principal(r).CanTenant(t.Tenant)) {
 		writeErr(w, 404, "Template not found")
+		return
+	}
+	if p := principal(r); t.Tenant == "" && len(p.Tenants) > 0 && !p.IsAdmin() {
+		writeErr(w, 403, "shared templates can only be deleted by an admin")
 		return
 	}
 	hosts, _ := s.listHosts(r.Context())

@@ -85,6 +85,11 @@ func (s *Server) placeAndCreate(ctx context.Context, v *VM, req placeReq, snap *
 	if req.TemplateID == "" {
 		req.TemplateID = v.TemplateID
 	}
+	if snap == nil && v.TemplateID != "default" {
+		if _, err := s.templateFor(ctx, v.TemplateID, v.Tenant); err != nil {
+			return nil, nil, err
+		}
+	}
 	if snap != nil {
 		req.SnapshotID = snap.ID
 		if sn, err := s.getSnapshot(ctx, snap.ID); err == nil {

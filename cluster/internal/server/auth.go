@@ -45,6 +45,27 @@ func (p *Principal) CanTenant(t string) bool {
 	return false
 }
 
+// resolveTenant is the tenant a new resource belongs to: the one asked for
+// if allowed, else the caller's only tenant, else "default".
+func (p *Principal) resolveTenant(requested string) (string, error) {
+	if requested != "" {
+		if !tenantRe.MatchString(requested) {
+			return "", &apiError{http.StatusBadRequest, "invalid tenant"}
+		}
+		if !p.CanTenant(requested) {
+			return "", &apiError{http.StatusForbidden, "this token can't act for tenant " + requested}
+		}
+		return requested, nil
+	}
+	if len(p.Tenants) > 0 && !p.IsAdmin() {
+		if len(p.Tenants) == 1 {
+			return p.Tenants[0], nil
+		}
+		return "", &apiError{http.StatusBadRequest, "tenant is required: this token acts for " + strings.Join(p.Tenants, ", ")}
+	}
+	return "default", nil
+}
+
 // Tokens look like flint_<id>_<secret>; only sha256(secret) is stored.
 func formatToken(id, secret string) string { return "flint_" + id + "_" + secret }
 
