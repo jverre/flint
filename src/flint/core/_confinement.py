@@ -47,22 +47,27 @@ def parser_command(uid: int, gid: int, *, readonly: dict[str, str], writable: di
             "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
             "--setenv", "HOME", "/tmp", "--setenv", "PYTHONNOUSERSITE", "1"]
     # Bind only the interpreter, its installed dependencies and public TLS roots.
-    for path in dict.fromkeys(("/usr", "/lib", "/lib64", sys.prefix, sys.base_prefix,
-                               "/etc/ssl/certs", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf")):
-        if os.path.exists(path):
-            args += ["--ro-bind", path, path]
+    bound = [path for path in dict.fromkeys(("/usr", "/lib", "/lib64", sys.prefix, sys.base_prefix,
+             "/etc/ssl/certs", "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf")) if os.path.exists(path)]
+    for path in bound:
+        args += ["--ro-bind", path, path]
     for source, target in readonly.items():
         args += ["--ro-bind", source, target]
     for source, target in writable.items():
         args += ["--bind", source, target]
     args += ["--chmod", "0755", "/etc", "--chmod", "0755", "/etc/ssl"]
-    # bwrap copies ancestor permissions when constructing mountpoints. A venv
-    # below /root or a private home needs traversable *synthetic* parents; no
-    # other files from that home are exposed and the host modes stay untouched.
-    for parent in reversed(Path(sys.prefix).parents):
-        path = str(parent)
-        if path != "/" and not any(path == p or path.startswith(p + "/") for p in ("/usr", "/lib", "/lib64")):
-            args += ["--chmod", "0755", path]
+    # bwrap creates mountpoint parents that the parser can't traverse. A venv
+    # below /root or a private home, or an interpreter under /opt (as in CI),
+    # needs traversable *synthetic* parents; no other files from those
+    # directories are exposed and the host modes stay untouched.
+    synthetic = set()
+    for prefix in (sys.prefix, sys.base_prefix):
+        for parent in Path(prefix).parents:
+            path = str(parent)
+            if path != "/" and not any(path == p or path.startswith(p + "/") for p in bound):
+                synthetic.add(path)
+    for path in sorted(synthetic, key=lambda p: p.count("/")):
+        args += ["--chmod", "0755", path]
     # The only remaining capabilities belong to this fixed launcher. setpriv
     # clears groups and the capability bounding set before the parser execs.
     return args + ["--", "/usr/bin/setpriv", f"--reuid={uid}", f"--regid={gid}",
