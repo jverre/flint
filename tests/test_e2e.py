@@ -359,6 +359,23 @@ def test_template_build_and_run(backend_kind, require_sandbox, daemon_only):
             assert result.exit_code == 0 and "ok" in result.stdout, result
         finally:
             sandbox.kill()
+        # A failed rebuild reports its failure but keeps the published
+        # template bootable.
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                with pytest.raises(RuntimeError, match="Template build failed"):
+                    Template(name).from_alpine_image().run_cmd("exit 17").build(timeout=1200)
+                break
+            except httpx.HTTPStatusError as exc:
+                assert exc.response.status_code in (409, 429) and time.monotonic() < deadline, exc.response.text
+                time.sleep(.05)
+        sandbox = Sandbox(template_id=template.template_id)
+        try:
+            result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
+            assert result.exit_code == 0 and "ok" in result.stdout, result
+        finally:
+            sandbox.kill()
     finally:
         listener.close()
         if template:

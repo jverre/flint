@@ -588,14 +588,19 @@ class LinuxCloudHypervisorBackend(HostBackend):
         template_dir = output_dir(template_id)
         os.makedirs(template_dir, exist_ok=True)
 
-        register_template_artifact(
-            template_id,
-            name,
-            self.kind,
-            template_dir,
-            status="building",
-            rootfs_size_mb=rootfs_size_mb,
-        )
+        # A supervised build stages its output; the supervisor records the
+        # published directory, so keep the current one bootable meanwhile.
+        if os.environ.get("FLINT_BUILD_JOB"):
+            update_template_artifact_status(template_id, self.kind, "building")
+        else:
+            register_template_artifact(
+                template_id,
+                name,
+                self.kind,
+                template_dir,
+                status="building",
+                rootfs_size_mb=rootfs_size_mb,
+            )
 
         import tempfile
         context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)

@@ -138,15 +138,19 @@ def build_template(
     template_dir = output_dir(template_id)
     os.makedirs(template_dir, exist_ok=True)
 
-    # Register as "building"
-    register_template_artifact(
-        template_id,
-        name,
-        "linux-firecracker",
-        template_dir,
-        status="building",
-        rootfs_size_mb=rootfs_size_mb,
-    )
+    # Register as "building". A supervised build stages its output; the
+    # supervisor records the published directory, so keep the current one.
+    if os.environ.get("FLINT_BUILD_JOB"):
+        update_template_artifact_status(template_id, "linux-firecracker", "building")
+    else:
+        register_template_artifact(
+            template_id,
+            name,
+            "linux-firecracker",
+            template_dir,
+            status="building",
+            rootfs_size_mb=rootfs_size_mb,
+        )
 
     context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
     try:

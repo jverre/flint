@@ -260,7 +260,8 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
         tmpl = _template_for(principal, template_id)
         if tmpl is None or (tmpl.get("tenant") and tmpl["tenant"] != tenant):
             raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
-        if tmpl.get("status", "ready") != "ready":
+        from flint.core._template_registry import template_usable
+        if not template_usable(tmpl, daemon.backend.kind):
             raise HTTPException(409, "Template is not ready")
     snapshot = data.get("snapshot")
     template_snapshot = data.get("template_snapshot")
@@ -830,6 +831,8 @@ def _start_template_build(body: dict, request: Request):
         principal = principal_of(request)
         tenant = principal.resolve_tenant(body.get("tenant"))
         existing = get_template(template_id)
+        if existing is not None and not existing.get("tenant") and principal.is_admin and not body.get("tenant"):
+            tenant = ""  # an admin rebuilding a template shared before tenancy keeps it shared
         if existing is not None and existing.get("tenant", "") != tenant:
             visible = _template_for(principal, template_id) is not None
             raise HTTPException(status_code=409 if visible else 403,

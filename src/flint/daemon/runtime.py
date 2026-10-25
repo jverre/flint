@@ -195,7 +195,6 @@ class Runtime:
         from flint.core._template_registry import _slugify
         from flint.core._template_registry import claim_template, update_template_artifact_status
         from .auth import TRUSTED
-        tenant = TRUSTED.resolve_tenant(tenant)
         if not isinstance(name, str) or not name or not isinstance(dockerfile, str) or not dockerfile:
             raise ValueError("name and dockerfile are required")
         if type(rootfs_size_mb) is not int or not 64 <= rootfs_size_mb <= 16384:
@@ -207,6 +206,9 @@ class Runtime:
             if template_id in self._builds and self._builds[template_id].is_alive():
                 raise HTTPException(409, "A build for this template is already running")
             old = self.template(template_id)
+            # "" only rebuilds a template that was shared before tenancy.
+            if tenant != "" or not old or old.get("tenant"):
+                tenant = TRUSTED.resolve_tenant(tenant)
             if old and old.get("tenant", "") != tenant:
                 raise HTTPException(403, "Template belongs to another tenant")
             from flint.core._build_job import Admission, BuildBusy

@@ -137,7 +137,7 @@ def _finish(job: Path) -> None:
 
 def recover_builds() -> None:
     from ._wipe import wipe_tree
-    from ._template_registry import update_template_artifact_status
+    from ._template_registry import register_template_artifact, update_template_artifact_status
     for job in _root().iterdir():
         if not re.fullmatch(r"[a-f0-9]{32}", job.name):
             raise RuntimeError("Invalid build operation directory")
@@ -146,8 +146,21 @@ def recover_builds() -> None:
             continue
         data = json.loads((job / "job.json").read_text())
         _cleanup(job)
-        wipe_tree(str(Path(config.TEMPLATES_DIR) / (".build-" + job.name)))
-        wipe_tree(str(Path(config.TEMPLATES_DIR) / (".retired-" + job.name)))
+        stage = Path(config.TEMPLATES_DIR) / (".build-" + job.name)
+        retired = Path(config.TEMPLATES_DIR) / (".retired-" + job.name)
+        destination = Path(config.TEMPLATES_DIR) / data["template_id"]
+        if data.get("publishing") and not data.get("published"):
+            if stage.exists():
+                # Interrupted before the new template moved in: restore the old one.
+                if retired.exists() and not destination.exists():
+                    os.replace(retired, destination)
+            elif destination.exists():
+                # The new template is in place: finish publishing it.
+                register_template_artifact(data["template_id"], data.get("name", data["template_id"]), data["kind"],
+                                           str(destination), status="ready", rootfs_size_mb=data.get("rootfs_size_mb"))
+                data["published"] = True
+        wipe_tree(str(stage))
+        wipe_tree(str(retired))
         if not data.get("published"):
             update_template_artifact_status(data["template_id"], data["kind"], "failed")
         _finish(job)
@@ -175,11 +188,13 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
     from ._template_registry import register_template_artifact, update_template_artifact_status
     from ._wipe import wipe_tree
     from ._limits import cgroup_limits
+    from ._artifacts import fsync_path
     from ._netns import _allocate_veth_ip, _release_veth_ip
     template_id = _slugify(name)
     job = _root() / uuid.uuid4().hex
     job.mkdir(mode=0o700)
-    _atomic(job / "job.json", {"kind": kind, "template_id": template_id})
+    journal = {"kind": kind, "template_id": template_id, "name": name, "rootfs_size_mb": size_mb}
+    _atomic(job / "job.json", journal)
     group = f"/sys/fs/cgroup/flint-builds/{job.name}"
     stage = Path(config.TEMPLATES_DIR) / (".build-" + job.name)
     retired = stage.with_name(".retired-" + job.name)
@@ -201,13 +216,17 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
                 raise RuntimeError(log.read().decode(errors="replace"))
         _cleanup(job)
         _release_veth_ip(reservation)
+        # Recovery rolls an interrupted swap back (old template restored) or
+        # forward (new template registered); it never discards both.
+        _atomic(job / "job.json", {**journal, "publishing": True})
         destination = Path(config.TEMPLATES_DIR) / template_id
         if destination.exists():
             os.replace(destination, retired)
         os.replace(stage, destination)
-        wipe_tree(str(retired))
+        fsync_path(config.TEMPLATES_DIR)
         register_template_artifact(template_id, name, kind, str(destination), status="ready", rootfs_size_mb=size_mb)
-        _atomic(job / "job.json", {"kind": kind, "template_id": template_id, "published": True})
+        _atomic(job / "job.json", {**journal, "published": True})
+        wipe_tree(str(retired))
         _finish(job)
         return {"template_id": template_id, "status": "ready"}
     except Exception as exc:
@@ -215,11 +234,14 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
         update_template_artifact_status(template_id, kind, "failed", error=str(exc))
         try:
             _cleanup(job)
+            destination = Path(config.TEMPLATES_DIR) / template_id
+            if retired.exists() and not destination.exists():
+                os.replace(retired, destination)  # failed mid-swap: keep the old template
             wipe_tree(str(stage))
             wipe_tree(str(retired))
         except Exception:
             # The builder namespace may still hold the IP: keep it reserved.
-            _atomic(job / "job.json", {"kind": kind, "template_id": template_id, "cleanup_pending": True})
+            _atomic(job / "job.json", {**journal, "cleanup_pending": True})
             raise
         _release_veth_ip(reservation)
         _finish(job)
