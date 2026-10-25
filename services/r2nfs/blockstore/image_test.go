@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -135,6 +136,30 @@ func TestSyncedWritesSurviveReopen(t *testing.T) {
 	write(t, img, 200, "overlay")
 	if err := img.Sync(); err != nil {
 		t.Fatal(err)
+	}
+	previous, err := os.Open(filepath.Join(dir, bitmapFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Close()
+	// Recovery can find the previous generation linked but not yet replaced.
+	if err := os.Link(filepath.Join(dir, bitmapFile), filepath.Join(dir, bitmapFile+".retired")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, img, BlockSize+200, "later")
+	if err := img.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := previous.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := make([]byte, st.Size())
+	if _, err := previous.ReadAt(held, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(held, make([]byte, len(held))) {
+		t.Fatal("a replaced bitmap retained data in its old inode")
 	}
 	img.Close()
 

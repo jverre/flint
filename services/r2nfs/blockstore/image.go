@@ -399,6 +399,26 @@ func writeJSON(path string, v any) error {
 }
 
 func writeFileAtomic(path string, data []byte) error {
+	// Keep replaced metadata reachable until it is wiped. Otherwise a final
+	// flush can unlink an old bitmap which deletion can no longer discard.
+	retired := path + ".retired"
+	if old, err := os.Stat(retired); err == nil {
+		current, currentErr := os.Stat(path)
+		if currentErr != nil && !errors.Is(currentErr, fs.ErrNotExist) {
+			return currentErr
+		}
+		if currentErr != nil || !os.SameFile(old, current) {
+			if _, err := WipeFile(retired); err != nil {
+				return err
+			}
+		}
+		// A crash before rename may leave an alias of the still-live file.
+		if err := os.Remove(retired); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -415,7 +435,30 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Link(path, retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		return err
+	}
+	if _, err := WipeFile(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return dir.Sync()
 }
 
 // References returns the store keys an image with manifest m needs: its
