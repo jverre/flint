@@ -116,6 +116,11 @@ def test_events_are_stored_with_who_caused_them(require_sandbox, daemon_only):
             assert (e["actor"], e["actor_name"], e["tenant"]) == (f"token:{made['id']}", "timeline-test", "timeline"), e
         assert (by_type["vm.exec"]["cmd"], by_type["vm.exec"]["exit_code"]) == ("echo stored", 0)
         assert by_type["vm.exec"]["stdout_tail"].strip() == "stored"
+        # The tenant's unfiltered event listing includes them too.
+        listing = httpx.get(f"{TCP_URL}/v1/events", headers={"Authorization": f"Bearer {made['token']}"})
+        assert listing.status_code == 200, listing.text
+        assert {"vm.created", "vm.exec"} <= {e["type"] for e in listing.json()["events"]
+                                          if vm_id in (e.get("vm_id"), (e.get("vm") or {}).get("vm_id"))}, listing.text
         # Another tenant's token sees none of it.
         seen = httpx.get(f"{TCP_URL}/v1/events", params={"vm_id": vm_id}, headers={"Authorization": f"Bearer {other['token']}"}).json()
         assert seen["events"] == [], seen

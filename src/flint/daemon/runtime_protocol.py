@@ -5,6 +5,7 @@ import array
 import json
 import socket
 import struct
+import time
 
 MAX_FRAME = 4 << 20
 # Responses come from the trusted runtime and may carry long event pages.
@@ -62,7 +63,16 @@ class RuntimeClient:
         from .eventlog import actor
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(180)
-            conn.connect(self.path)
+            # A full accept backlog fails a Unix connect with EAGAIN instead of waiting.
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    conn.connect(self.path)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.01)
             send(conn, {"operation": operation, "arguments": arguments, "actor": list(actor.get())})
             result, fd = receive(conn, MAX_RESPONSE)
         if "error" in result:

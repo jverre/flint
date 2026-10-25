@@ -297,6 +297,8 @@ def _json_value(value):
 class RuntimeServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     block_on_close = False
+    # socketserver's default backlog of 5 refuses API bursts with EAGAIN.
+    request_queue_size = 1024
 
     def __init__(self, path: str, runtime: Runtime):
         self.runtime = runtime

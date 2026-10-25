@@ -152,6 +152,9 @@ class EventLog:
         return self.client.request("events.record", event=event)
 
     def query(self, **kwargs):
+        # "" means no VM filter; the runtime only accepts canonical VM IDs.
+        if not kwargs.get("vm_id"):
+            kwargs.pop("vm_id", None)
         return self.client.request("events.query", **kwargs)
 
     def audit(self, **kwargs):
