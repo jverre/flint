@@ -86,6 +86,10 @@ def cleanup_abandoned_proxies() -> None:
                 stop_namespace_proxy(group.name)
     from ._wipe import wipe_tree
     wipe_tree(_RULES_DIR)
+    # No proxy is left running, so no proxy identity is in use. This also
+    # drops records keyed by namespace name from before they were per VM.
+    from ._identities import release_kind
+    release_kind("proxy")
 
 
 def _write_rules(path: str, rules: dict, uid: int, gid: int) -> None:
@@ -107,13 +111,15 @@ def _mitmdump() -> str:
 class CredentialProxy:
     """Manages a credential injection proxy for a single sandbox."""
 
-    def __init__(self, ns_name: str) -> None:
+    def __init__(self, ns_name: str, vm_id: str) -> None:
         self.ns_name = ns_name
+        # Keyed by VM: pooled namespaces are reused across VMs and tenants.
+        self.owner = "proxy:" + vm_id
         self._process: subprocess.Popen | None = None
         self._rules_file: str | None = None
         self._directory: str | None = None
         self.ca_cert_path = ""
-        self.uid, self.gid = identity("proxy:" + ns_name)
+        self.uid, self.gid = identity(self.owner)
 
     def start(self, rules: dict) -> None:
         """Start the mitmdump proxy subprocess in the sandbox's network namespace."""
@@ -199,7 +205,7 @@ class CredentialProxy:
             self._directory = None
             self._rules_file = None
         stop_namespace_proxy(self.ns_name)
-        release("proxy:" + self.ns_name)
+        release(self.owner)
 
     def update_rules(self, rules: dict) -> None:
         """Update the proxy rules by rewriting the rules file.

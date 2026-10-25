@@ -267,9 +267,8 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer
         from flint.core._identities import identity
         import subprocess
         with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
-            namespace = db.execute("SELECT ns_name FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()[0]
             peer_directory = db.execute("SELECT vm_dir FROM sandboxes WHERE vm_id = ?", (vm_b,)).fetchone()[0]
-        proxy_uid = identity("proxy:" + namespace)[0]
+        proxy_uid = identity("proxy:" + a1)[0]
         workload_uids = {os.stat(f"/proc/{client.get(vm)['pid']}").st_uid
                          for client, vm in ((a, a1), (a, a2), (b, vm_b))}
         assert len(workload_uids) == 3 and proxy_uid not in workload_uids

@@ -35,6 +35,11 @@ def _prepare_api_state(daemon, directory: Path, uid: int, gid: int) -> None:
         temporary.replace(database)
     if database.lstat().st_uid != uid or database.is_symlink():
         raise RuntimeError("Untrusted API state database")
+    # The API's database is now the only token authority. Stale copies here
+    # would revive revoked tokens if this state were used by an older release.
+    with sqlite3.connect(config.DAEMON_DB_PATH) as root:
+        if root.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens'").fetchone():
+            root.execute("DELETE FROM api_tokens")
     admin = directory / "admin.token"
     if not admin.exists() and os.path.isfile(config.ADMIN_TOKEN_PATH):
         fd = os.open(admin, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
