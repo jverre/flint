@@ -136,7 +136,7 @@ def _vm(kind: str, disk_mb: int):
             rootfs = jail.host_path("/rootfs.ext4")
         sparse_copy(source, rootfs)
         make_private(rootfs) if spec else jail.give("/rootfs.ext4")
-        # Allocate enough sparse space for Docker's vfs copies, export and output.
+        # Bound space for image layers, export and the output filesystem.
         with open(rootfs, "r+b") as f:
             f.truncate(max(12288, disk_mb * 4 + 4096) * (1 << 20))
         subprocess.run(["resize2fs", rootfs], check=True, capture_output=True, timeout=60)
@@ -230,7 +230,7 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
 
         run("mkdir -p /build /export /run /sys/fs/cgroup; "
             "mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true; "
-            "dockerd --storage-driver=vfs --iptables=false --bridge=none --ip-forward=false --ip-masq=false "
+            "dockerd --storage-driver=overlay2 --iptables=false --bridge=none --ip-forward=false --ip-masq=false "
             ">/var/log/docker.log 2>&1 &", stage="start Docker")
         run("i=0; until docker info >/dev/null 2>&1; do i=$((i+1)); "
             "if [ $i -ge 60 ]; then cat /var/log/docker.log >&2; exit 1; fi; sleep .5; done", stage="wait for Docker")
