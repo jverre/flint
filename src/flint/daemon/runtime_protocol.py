@@ -79,6 +79,6 @@ class RuntimeClient:
                 raise kind(error["status"], error["detail"])
             if error.get("status"):
                 from fastapi import HTTPException
-                raise HTTPException(error["status"], error["detail"])
+                raise HTTPException(error["status"], error["detail"], headers=error.get("headers"))
             raise kind(error["detail"])
         return socket.socket(fileno=fd) if fd is not None else result["value"]

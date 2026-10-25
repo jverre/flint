@@ -191,7 +191,7 @@ class Runtime:
     def build(self, name: str, dockerfile: str, rootfs_size_mb: int, tenant: str):
         from fastapi import HTTPException
         from flint.core._template_registry import _slugify
-        from flint.core._template_registry import claim_template
+        from flint.core._template_registry import claim_template, update_template_artifact_status
         from .auth import TRUSTED
         TRUSTED.resolve_tenant(tenant)
         if not isinstance(name, str) or not name or not isinstance(dockerfile, str) or not dockerfile:
@@ -214,6 +214,7 @@ class Runtime:
                 raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from exc
             try:
                 claim_template(template_id, name, tenant)
+                update_template_artifact_status(template_id, self.daemon.backend.kind, "building")
             except Exception:
                 admission.release()
                 raise
@@ -221,8 +222,12 @@ class Runtime:
                 try:
                     with admission:
                         self.daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
-                except Exception:
+                except Exception as exc:
+                    update_template_artifact_status(template_id, self.daemon.backend.kind, "failed", error=str(exc))
                     config.log.exception("Template build failed: %s", template_id)
+                finally:
+                    with self._build_lock:
+                        self._builds.pop(template_id, None)
             thread = threading.Thread(target=run, daemon=True, name=f"build-{template_id}")
             self._builds[template_id] = thread
             try:
@@ -324,7 +329,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 detail = getattr(exc, "detail", str(exc))
                 if isinstance(exc, (TypeError, ValueError)):
                     status = 400
-                send(conn, {"error": {"kind": type(exc).__name__, "detail": detail, "status": status}})
+                send(conn, {"error": {"kind": type(exc).__name__, "detail": detail, "status": status,
+                                      "headers": getattr(exc, "headers", None)}})
         except (OSError, ValueError):
             pass
         finally:
