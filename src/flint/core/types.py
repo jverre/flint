@@ -14,6 +14,7 @@ class SandboxState(enum.Enum):
     RUNNING = "Running"
     PAUSED = "Paused"
     ERROR = "Error"
+    DELETING = "Deleting"
     DEAD = "Dead"
 
     def __str__(self) -> str:
@@ -26,6 +27,7 @@ _STATE_API_NAMES: dict[SandboxState, str] = {
     SandboxState.RUNNING: "Started",
     SandboxState.PAUSED: "Paused",
     SandboxState.ERROR: "Error",
+    SandboxState.DELETING: "Deleting",
     SandboxState.DEAD: "Dead",
 }
 
@@ -94,5 +96,6 @@ class _SandboxEntry:
             "timeout_seconds": self.timeout_seconds,
             "timeout_policy": self.timeout_policy,
             "tenant": self.tenant,
+            "network_address": self.backend_metadata.get("veth_ip", ""),
             "availability": self.availability,
         }

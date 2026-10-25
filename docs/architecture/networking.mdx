@@ -3,14 +3,14 @@ title: "Networking"
 description: "How sandboxes connect to the host and the internet, and what they can't reach."
 ---
 
-Each sandbox gets its own network namespace. Sandboxes can reach the internet through NAT on the host, but not each other, the host's services, or private and link-local networks.
+Each sandbox gets its own network namespace. Sandboxes can reach the internet through NAT on the host, but cannot reach the host's services or private and link-local networks. Traffic between VMs is blocked unless their tenant opts in.
 
 ## The network stack
 
-```
+```text
 Internet
     |
-  Host eth0 (NAT via iptables)
+  Host eth0 (NAT via nftables)
     |
   br-flint bridge (10.0.0.1/24)       each sandbox port is isolated
     |
@@ -41,13 +41,43 @@ The attacker Flint defends against is the code inside a sandbox. Every boundary 
 | A sandbox can't reach | Enforced by |
 |---|---|
 | Other sandboxes' namespaces | Bridge port isolation (`isolated on`) + each namespace drops unsolicited traffic arriving on its veth |
-| Services on the host (any address) | Host `FLINT-INPUT` chain + namespace egress policy |
-| Private, loopback, CGNAT, multicast and link-local destinations, including cloud metadata at `169.254.169.254` | Namespace `FLINT-EGRESS` chain + host `FLINT-FORWARD` chain |
+| Services on the host (any address) | Host nftables input chain + namespace egress policy |
+| Private, loopback, CGNAT, multicast and link-local destinations, including cloud metadata at `169.254.169.254` | Namespace nftables egress chain + host forward chain |
 | Another sandbox's credential proxy | The proxy listens only on `172.16.0.1` + the namespace ingress firewall |
 
 The only exception to the egress policy is the workspace storage server, when one is configured: `r2nfs` on the bridge IP, or the S3 Files NFS endpoint. IPv6 is disabled inside sandbox namespaces.
 
 Flint also explicitly allows sandbox traffic out through the host's `FORWARD` chain. Docker sets the host's forward policy to `DROP`, which would otherwise cut sandboxes off from the internet.
+
+## Same-tenant traffic
+
+A service token can opt its tenant into peer networking on a single Linux host:
+
+```bash
+curl -X PUT http://localhost:9100/v1/tenants/customer-a/network \
+  -H "Authorization: Bearer $FLINT_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"allow_same_tenant": true}'
+```
+
+The response is `{"tenant":"customer-a","allow_same_tenant":true}`. Read it with `GET /v1/tenants/customer-a/network`. A token cannot change another tenant's network (`403`); invalid bodies return `400`. Clusters and the macOS backend reject changes with `409`.
+
+Connect to another VM using its `network_address` from `GET /vms/{id}`, preserving your application's port. Both VMs must belong to the same opted-in tenant and have a bridge uplink (`allow_internet_access=True`). Guest IPs remain private to their namespaces.
+
+Bridge ports stay isolated. Routes send peer traffic through the host, which checks the source and destination pair; the destination namespace forwards only approved peers to guest services. TCP ports `5000` (guest agent) and `8080` (credential proxy, or your configured proxy port) stay blocked. Setting `allow_same_tenant` to `false` revokes the host ACL for new and established connections. Settings persist across daemon restarts and apply to newly created and resumed VMs.
+
+## Resource ceilings
+
+Both Linux backends require native `nftables`, `tc` from `iproute2`, and cgroup v2 with the CPU, memory, IO and PID controllers. Firecracker root disks require a local block-backed filesystem for `io.max`. Cloud Hypervisor also configures its virtio-block limiter, including for shared NFS/CEPH root disks. Fresh and recovered processes must belong to their configured cgroup before they are served; recovery rejects a shared-disk VM whose disk limiter cannot be verified. Startup fails if these boundaries cannot be configured.
+
+Each VMM gets CPU and memory ceilings, a 512-task ceiling, and a root-disk IO limit. The guest's TAP shapes inbound traffic and polices outbound traffic, including storage traffic. Host settings apply to every VM:
+
+| Environment variable | Default | Unit |
+| --- | --- | --- |
+| `FLINT_DISK_BYTES_PER_SECOND` | `104857600` | Bytes per second through the root-disk limiter (Cloud Hypervisor also limits shared disks) |
+| `FLINT_NETWORK_BYTES_PER_SECOND` | `12500000` | Bytes per second in each network direction |
+
+Values must be positive integers. These limits complement tenant quotas; shared storage is also bounded by the VM's network ceiling.
 
 ## Pre-built namespaces
 

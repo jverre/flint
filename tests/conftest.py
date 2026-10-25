@@ -62,8 +62,10 @@ _sandbox_creation_result: str | bool | None = None
 
 def _read_daemon_log() -> str:
     try:
-        with open(_daemon_log_path) as f:
-            return f.read()
+        with open(_daemon_log_path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4000))
+            return f.read().decode(errors="replace")
     except OSError:
         return "(no daemon log available)"
 
@@ -165,14 +167,13 @@ def _ensure_daemon(request):
 def _sandbox_probe(_ensure_daemon):
     """Try to create a sandbox once per session. Cache the result."""
     global _sandbox_creation_result
-    resp = api.get(f"{BASE_URL}/health", timeout=5.0)
-    resp.raise_for_status()
-    health = resp.json()
-    if not health.get("golden_snapshot_ready", False):
-        _sandbox_creation_result = f"Backend {health.get('backend_kind', 'unknown')} not ready"
-        return
-
     try:
+        resp = api.get(f"{BASE_URL}/health", timeout=5.0)
+        resp.raise_for_status()
+        health = resp.json()
+        if not health.get("golden_snapshot_ready", False):
+            _sandbox_creation_result = f"Backend {health.get('backend_kind', 'unknown')} not ready"
+            return
         sb = Sandbox()
         sb.kill()
         _sandbox_creation_result = True
@@ -186,14 +187,14 @@ def _sandbox_probe(_ensure_daemon):
 def require_sandbox(_sandbox_probe):
     """Skip the test if sandbox creation is not available on this host.
 
-    In CI (GitHub Actions, on KVM hosts), or with FLINT_REQUIRE_VMS=1, that
-    is a failure instead: a run whose VM tests all skipped proves nothing.
+    In CI (GitHub Actions, on KVM hosts), or with FLINT_REQUIRE_VMS=1, abort
+    the session instead: every VM test depends on this shared prerequisite.
     """
     if _sandbox_creation_result is not True:
         why = f"Sandbox creation not available: {_sandbox_creation_result}"
         default = "1" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
         if os.environ.get("FLINT_REQUIRE_VMS", default) == "1":
-            pytest.fail(f"{why}\n--- daemon log tail ---\n{_read_daemon_log()[-4000:]}")
+            pytest.exit(f"{why}\n--- daemon log tail ---\n{_read_daemon_log()[-4000:]}", returncode=1)
         pytest.skip(why)
 
 

@@ -72,15 +72,15 @@ class LifecycleManager:
             return
 
         now = time.time()
-        error_rows = self._store.list_in_state(SandboxState.ERROR)
+        error_rows = self._store.list_in_state(SandboxState.ERROR) + self._store.list_in_state(SandboxState.DELETING)
         for row in error_rows:
             vm_id = row["vm_id"]
-            updated_at = row["updated_at"]
-            if now - updated_at >= self._error_cleanup_delay:
+            deleting = row["state"] == SandboxState.DELETING.value
+            updated_at = row.get("deletion_attempt_at", 0) if deleting else row.get("state_changed_at", row["updated_at"])
+            if now - updated_at >= (5 if deleting else self._error_cleanup_delay):
                 sid = vm_id[:8]
                 log.info("[%s] error cleanup — killing after %.0fs", sid, now - updated_at)
                 try:
                     self._manager.kill(vm_id)
                 except Exception:
-                    # If kill fails, just mark as dead
-                    self._store.transition_state(vm_id, SandboxState.DEAD, detail="error cleanup failed")
+                    log.exception("[%s] cleanup failed; retaining resource for retry", sid)

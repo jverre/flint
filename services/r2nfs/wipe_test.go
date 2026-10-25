@@ -44,6 +44,14 @@ func TestCollectGarbageKeepsOnlySharedChunks(t *testing.T) {
 	}
 	base.Close()
 
+	// An interrupted metadata publication may leave two names for one inode.
+	bitmap := filepath.Join(dir, "base", "overlay.bitmap")
+	if err := os.Link(bitmap, bitmap+".retired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := blockstore.PrepareDelete(filepath.Join(dir, "base")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := wipeAll(filepath.Join(dir, "base")); err != nil {
 		t.Fatal(err)
 	}

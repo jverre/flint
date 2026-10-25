@@ -64,6 +64,9 @@ class LinuxFirecrackerBackend(HostBackend):
             problems.append(f"jailer binary not found (searched PATH and {JAILER_BINARY})")
         if not os.path.exists(KERNEL_PATH):
             problems.append(f"kernel image not found at {KERNEL_PATH}")
+        for tool in ("nft", "tc"):
+            if not shutil.which(tool):
+                problems.append(f"{tool} is required for workload isolation")
         return problems
 
     def template_artifact_valid(self, template_dir: str) -> bool:
@@ -336,7 +339,7 @@ class LinuxFirecrackerBackend(HostBackend):
             )
 
         try:
-            _wait_for_api_socket(socket_path)
+            _wait_for_api_socket(socket_path, process=process, log_path=log_path, vm_id=spec.vm_id)
             snapshot_body = {
                 "snapshot_path": PAUSE_VMSTATE,
                 "mem_backend": {"backend_type": "File", "backend_path": PAUSE_MEM},
@@ -562,6 +565,9 @@ class LinuxFirecrackerBackend(HostBackend):
         return "alive", entry
 
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+        if not os.environ.get("FLINT_BUILD_JOB"):
+            from flint.core._build_job import run_build
+            return run_build(self.kind, name, dockerfile, rootfs_size_mb)
         template_id = _build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
         return {"template_id": template_id, "status": "building"}
 

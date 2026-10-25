@@ -3,13 +3,11 @@ package main
 import (
 	"errors"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/jverre/flint/services/r2nfs/blockstore"
-	"golang.org/x/sys/unix"
 )
 
 // Deleting an image volume wipes what it held: its overlay (the writes since
@@ -19,52 +17,31 @@ import (
 // blocks, with zeros written instead where that isn't supported.
 // Objects already pushed to a remote store are not removed from it.
 
-// wipeFile discards the data of the regular file at path, in place.
 func wipeFile(path string) (int64, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
-		return 0, err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Size == 0 {
-		return 0, nil
-	}
-	held := st.Blocks * 512
-	if unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, 0, st.Size) == nil {
-		if _, err := unix.Seek(int(f.Fd()), 0, unix.SEEK_DATA); errors.Is(err, unix.ENXIO) {
-			return held, nil // nothing left but holes
-		}
-	}
-	zeros := make([]byte, 1<<20)
-	for off := int64(0); off < st.Size; off += int64(len(zeros)) {
-		n := min(int64(len(zeros)), st.Size-off)
-		if _, err := f.WriteAt(zeros[:n], off); err != nil {
-			return held, err
-		}
-	}
-	return held, f.Sync()
+	return blockstore.WipeFile(path)
 }
 
 // wipeAll wipes every file under dir, then removes it.
 func wipeAll(dir string) (int64, error) {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil // retry after the overlay was removed but collection failed
+	} else if err != nil {
+		return 0, err
+	}
 	var total int64
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		n, werr := wipeFile(path)
 		total += n
-		if werr != nil {
-			log.Printf("wiping %s: %v", path, werr)
-		}
-		return nil
+		return werr
 	})
-	if rerr := os.RemoveAll(dir); err == nil {
-		err = rerr
+	if err == nil {
+		err = os.RemoveAll(dir)
 	}
 	return total, err
 }
@@ -124,7 +101,7 @@ func collectGarbage(imagesDir string, store blockstore.Store, storeDir string, e
 			path := filepath.Join(dir, o.Name())
 			n, werr := wipeFile(path)
 			if werr != nil {
-				log.Printf("wiping %s: %v", path, werr)
+				return removed, freed, werr
 			}
 			if err := os.Remove(path); err != nil {
 				return removed, freed, err

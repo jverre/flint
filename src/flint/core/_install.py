@@ -488,8 +488,21 @@ def _current_ch_version(binary: str) -> str | None:
     return out.strip().split()[-1]
 
 
+def _install_isolation_tools() -> None:
+    if platform.system() != "Linux":
+        return
+    if shutil.which("nft") and shutil.which("tc"):
+        return
+    if shutil.which("apt-get"):
+        subprocess.run(["apt-get", "update", "-qq"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "nftables", "iproute2"], check=True)
+    else:
+        raise RuntimeError("Install nftables and iproute2 before starting Flint")
+
+
 def install_cloud_hypervisor(version: str = "latest", install_dir: str = "/usr/local/bin") -> None:
     """Install the static cloud-hypervisor binary, verified against its SHA256."""
+    _install_isolation_tools()
     arch = _detect_arch()
     asset = "cloud-hypervisor-static" + ("" if arch == "x86_64" else "-aarch64")
     release = None
@@ -584,6 +597,7 @@ def install_deps(
         _error("This command must be run as root (sudo flint install-deps)")
         raise SystemExit(1)
 
+    _install_isolation_tools()
     arch = _detect_arch()
     fc_version = _resolve_version(fc_version)
 

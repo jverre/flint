@@ -2,6 +2,8 @@ import ctypes
 import ctypes.util
 import fcntl
 import functools
+import json
+import hashlib
 import os
 import socket
 import struct
@@ -77,7 +79,7 @@ def _strip_ns_prefix(ns_name: str) -> str:
 
     Flint wraps each VM's netns in a per-backend prefix (``fc-``, ``ch-``,
     …) so the same vm-id doesn't collide across backends on the same host.
-    Shared veth/iptables helpers only need the suffix. Fall back to the
+    Shared veth/firewall helpers only need the suffix. Fall back to the
     whole name if there's no recognized prefix.
     """
     for prefix in ("fc-", "ch-"):
@@ -96,10 +98,12 @@ def _create_netns(ns_name: str) -> None:
 
 
 def _delete_netns(ns_name: str) -> None:
-    try:
+    if not ns_name:
+        return
+    if os.path.exists(f"/var/run/netns/{ns_name}"):
         pynetns.remove(ns_name)
-    except Exception:
-        pass
+    if os.path.exists(f"/var/run/netns/{ns_name}"):
+        raise RuntimeError(f"Namespace {ns_name} still exists; retaining its address")
     _release_veth_ip(ns_name)
 
 
@@ -173,21 +177,13 @@ def _ensure_bridge() -> None:
     with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
         f.write("1")
 
-    # Add masquerade rule for veth subnet (idempotent: check first, then add)
-    result = subprocess.run(
-        ["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", f"{VETH_SUBNET}.0/{BRIDGE_CIDR}", "-j", "MASQUERADE"],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        subprocess.run(
-            ["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", f"{VETH_SUBNET}.0/{BRIDGE_CIDR}", "-j", "MASQUERADE"],
-            capture_output=True, check=True,
-        )
 
 
-def _setup_veth_pair(ns_name: str, vm_id: str) -> tuple[str, str]:
+def _setup_veth_pair(ns_name: str, vm_id: str, veth_ip: str | None = None) -> tuple[str, str]:
     """Create a veth pair connecting the netns to br-flint for internet access.
 
+    ``veth_ip`` is an address the caller already reserved in the daemon's
+    allocator (a separate process's allocator can't see live sandboxes).
     Returns ``(veth_ip, veth_ns_ifname)``, e.g. ``("10.0.0.2", "vn-1a2b3c4d")``.
     """
     _ensure_bridge()
@@ -195,7 +191,11 @@ def _setup_veth_pair(ns_name: str, vm_id: str) -> tuple[str, str]:
     # Linux interface names limited to 15 chars
     veth_host = f"vh-{vm_id[:8]}"
     veth_ns = f"vn-{vm_id[:8]}"
-    veth_ip = _allocate_veth_ip(ns_name)
+    if veth_ip:
+        with _veth_ip_lock:
+            _veth_ips[ns_name] = veth_ip
+    else:
+        veth_ip = _allocate_veth_ip(ns_name)
 
     with IPRoute() as ipr:
         # Create veth pair in root namespace
@@ -256,86 +256,169 @@ def storage_endpoints() -> tuple[tuple[str, str, int], ...]:
     return tuple(endpoints)
 
 
-def _egress_rules(chain: str) -> list[str]:
-    rules = [f"-A {chain} -d {ip}/32 -p {proto} --dport {port} -j RETURN" for ip, proto, port in storage_endpoints()]
-    rules += [f"-A {chain} -d {cidr} -j DROP" for cidr in BLOCKED_EGRESS]
-    return rules
+_firewall_lock = threading.RLock()
+_HOST_TABLE = "flint_" + hashlib.sha256(BRIDGE_NAME.encode()).hexdigest()[:12]
+
+
+def _nft(script: str, ns_name: str = "") -> None:
+    cmd = (["ip", "netns", "exec", ns_name] if ns_name else []) + ["nft", "-f", "-"]
+    result = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(f"nftables in {ns_name or 'host'}: {result.stderr.strip()}")
+
+
+def _replace_table(family: str, name: str, body: str, ns_name: str = "") -> None:
+    # 'add table' is idempotent; delete and rebuild in one atomic transaction.
+    _nft(f"add table {family} {name}\ndelete table {family} {name}\n" + body, ns_name)
+
+
+def _blocked() -> str:
+    return "{ " + ", ".join(BLOCKED_EGRESS) + " }"
+
+
+def _retire_legacy_host_rules() -> None:
+    # Upgrade from iptables-nft without flushing Docker's or the operator's rules.
+    result = subprocess.run(["nft", "-j", "list", "ruleset"], check=True, text=True, capture_output=True)
+    commands = []
+    for obj in json.loads(result.stdout).get("nftables", []):
+        rule = obj.get("rule")
+        if not rule or rule.get("family") != "ip":
+            continue
+        expr = rule.get("expr", [])
+        ours = any(e.get("jump", {}).get("target") in (HOST_INPUT_CHAIN, HOST_FORWARD_CHAIN) for e in expr)
+        old_nat = rule.get("table") == "nat" and any("masquerade" in e for e in expr) and any(
+            e.get("match", {}).get("right") == {"prefix": {"addr": f"{VETH_SUBNET}.0", "len": BRIDGE_CIDR}}
+            for e in expr
+        )
+        if ours or old_nat:
+            commands.append(f"delete rule ip {rule['table']} {rule['chain']} handle {rule['handle']}")
+    if commands:
+        _nft("\n".join(commands) + "\n")
+
+
+def _docker_forward_compat() -> None:
+    # Docker's iptables-nft FORWARD base chain can have policy DROP. An accept
+    # in our earlier base chain cannot override that later verdict. Insert only
+    # the bridge exceptions there, AFTER our own isolation filter has run.
+    result = subprocess.run(["nft", "-j", "list", "chain", "ip", "filter", "FORWARD"], text=True, capture_output=True)
+    if result.returncode:
+        return
+    comment = f"flint-forward-{BRIDGE_NAME}"
+    if any(x.get("rule", {}).get("comment") == comment for x in json.loads(result.stdout).get("nftables", [])):
+        return
+    _nft(f'insert rule ip filter FORWARD iifname "{BRIDGE_NAME}" accept comment "{comment}"\n'
+         f'insert rule ip filter FORWARD oifname "{BRIDGE_NAME}" accept comment "{comment}"\n')
 
 
 def ensure_host_firewall() -> None:
-    """Host-side rules for traffic from sandboxes on this daemon's bridge (idempotent, rebuilt each start).
-
-    - FLINT-INPUT: sandboxes can't reach services on the host itself, except
-      the storage server they mount.
-    - FLINT-FORWARD: no sandbox-to-sandbox hairpin through the host, no private
-      or link-local destinations, and explicit egress to the internet, so hosts
-      whose FORWARD policy is DROP (Docker sets that) still give sandboxes internet.
-    Each namespace enforces the same egress policy; this is the second layer.
-    """
-    rules = ["*filter", f":{HOST_INPUT_CHAIN} - [0:0]", f":{HOST_FORWARD_CHAIN} - [0:0]"]
-    rules += [f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
-    rules += [
-        f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
-        for ip, proto, port in storage_endpoints() if ip == BRIDGE_IP
-    ]
-    rules += [f"-A {HOST_INPUT_CHAIN} -i {BRIDGE_NAME} -j DROP"]
-    rules += [
-        f"-A {HOST_FORWARD_CHAIN} -o {BRIDGE_NAME} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-        f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -o {BRIDGE_NAME} -j DROP",
-    ]
-    rules += [
-        f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -d {ip}/32 -p {proto} --dport {port} -j ACCEPT"
-        for ip, proto, port in storage_endpoints() if ip != BRIDGE_IP
-    ]
-    rules += [f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -d {cidr} -j DROP" for cidr in BLOCKED_EGRESS]
-    rules += [f"-A {HOST_FORWARD_CHAIN} -i {BRIDGE_NAME} -j ACCEPT", "COMMIT", ""]
-    # --noflush keeps the host's other rules; declaring the chains flushes ours.
-    subprocess.run(["iptables-restore", "--noflush"], input="\n".join(rules), text=True, capture_output=True, check=True)
-    for parent, chain in (("INPUT", HOST_INPUT_CHAIN), ("FORWARD", HOST_FORWARD_CHAIN)):
-        if subprocess.run(["iptables", "-C", parent, "-j", chain], capture_output=True).returncode != 0:
-            subprocess.run(["iptables", "-I", parent, "1", "-j", chain], capture_output=True, check=True)
+    """Atomic native nftables isolation, NAT and a default-empty peer set."""
+    storage = "\n".join(f'iifname "{BRIDGE_NAME}" ip daddr {ip} {proto} dport {port} accept'
+                        for ip, proto, port in storage_endpoints())
+    body = f'''table inet {_HOST_TABLE} {{
+      set peers {{ type ipv4_addr . ipv4_addr; }}
+      chain input {{ type filter hook input priority -200; policy accept;
+        iifname "{BRIDGE_NAME}" meta nfproto ipv6 drop
+        iifname "{BRIDGE_NAME}" ct state established,related accept
+        {storage}
+        iifname "{BRIDGE_NAME}" drop
+      }}
+      chain forward {{ type filter hook forward priority -200; policy accept;
+        iifname "{BRIDGE_NAME}" meta nfproto ipv6 drop
+        iifname "{BRIDGE_NAME}" oifname "{BRIDGE_NAME}" ip saddr . ip daddr @peers accept
+        iifname "{BRIDGE_NAME}" oifname "{BRIDGE_NAME}" drop
+        oifname "{BRIDGE_NAME}" ct state established,related accept
+        {storage}
+        iifname "{BRIDGE_NAME}" ip daddr {_blocked()} drop
+        iifname "{BRIDGE_NAME}" accept
+      }}
+      chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+        ip saddr {VETH_SUBNET}.0/{BRIDGE_CIDR} oifname != "{BRIDGE_NAME}" masquerade
+      }}
+    }}\n'''
+    with _firewall_lock:
+        _replace_table("inet", _HOST_TABLE, body)
+        _retire_legacy_host_rules()
+        _docker_forward_compat()
 
 
-def _apply_netns_firewall(ns_name: str, veth_ns: str | None) -> None:
-    """Configure forwarding, NAT and the firewall of a sandbox netns.
-
-    Ingress: the namespace accepts and forwards nothing that arrives
-    unsolicited on its bridge veth (another sandbox, a scan of the bridge
-    subnet), only replies to connections the guest or its credential proxy
-    opened. Applied to every namespace before a VM gets it, so pre-built ones
-    are never reachable.
-
-    Egress: nothing in BLOCKED_EGRESS except the storage endpoint.
-
-    IPv6 is off: nothing uses it, and it would bypass these rules.
-    """
-    sysctls = ["net.ipv6.conf.all.disable_ipv6=1", "net.ipv6.conf.default.disable_ipv6=1"]
-    rules = ["*filter", ":INPUT ACCEPT [0:0]", ":FORWARD ACCEPT [0:0]", ":OUTPUT ACCEPT [0:0]"]
-    nat = ["*nat", ":PREROUTING ACCEPT [0:0]", ":INPUT ACCEPT [0:0]", ":OUTPUT ACCEPT [0:0]", ":POSTROUTING ACCEPT [0:0]"]
+def _apply_netns_firewall(ns_name: str, veth_ns: str | None, *, allow_storage: bool = True) -> None:
+    """Default deny unsolicited ingress; peers may reach guest services only."""
+    subprocess.run(["ip", "netns", "exec", ns_name, "sysctl", "-qw",
+                    "net.ipv6.conf.all.disable_ipv6=1", "net.ipv6.conf.default.disable_ipv6=1",
+                    "net.ipv4.ip_forward=1"], check=True, capture_output=True)
+    # Remove only legacy tables inside this VM's private namespace on upgrade.
+    for table in ("filter", "nat"):
+        subprocess.run(["ip", "netns", "exec", ns_name, "nft", "delete", "table", "ip", table], capture_output=True)
+    storage = "\n".join(f"ip daddr {ip} {proto} dport {port} accept" for ip, proto, port in storage_endpoints()) if allow_storage else ""
+    ingress = forwarding = nat = ""
     if veth_ns:
-        sysctls.append("net.ipv4.ip_forward=1")
-        rules.insert(1, ":FLINT-EGRESS - [0:0]")
-        for chain in ("INPUT", "FORWARD"):
-            rules += [
-                f"-A {chain} -i {veth_ns} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
-                f"-A {chain} -i {veth_ns} -j DROP",
-            ]
-        # Egress policy for the guest's traffic and for the namespace's own
-        # (the credential proxy connects out on the guest's behalf).
-        rules += [f"-A FORWARD -o {veth_ns} -j FLINT-EGRESS", f"-A OUTPUT -o {veth_ns} -j FLINT-EGRESS"]
-        rules += _egress_rules("FLINT-EGRESS")
-        # Masquerade guest traffic (172.16.0.0/30) going out via the veth
-        nat.append(f"-A POSTROUTING -s 172.16.0.0/30 -o {veth_ns} -j MASQUERADE")
-    ruleset = "\n".join(rules + ["COMMIT"] + nat + ["COMMIT"]) + "\n"
-    result = subprocess.run(
-        ["ip", "netns", "exec", ns_name, "sh", "-c", f"sysctl -qw {' '.join(sysctls)} && iptables-restore"],
-        input=ruleset, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to configure firewall in {ns_name}: {result.stderr.strip()}")
+        address = _veth_ips[ns_name]
+        ingress = f'iifname "{veth_ns}" ct state established,related accept\niifname "{veth_ns}" drop'
+        forwarding = f'''iifname "{veth_ns}" ct state established,related accept
+          iifname "{veth_ns}" ip saddr @peers ip daddr {GUEST_IP} accept
+          iifname "{veth_ns}" drop
+          ip saddr != {GUEST_IP} drop
+          oifname "{veth_ns}" jump egress'''
+        # Reserved ports are never DNATed: packets land in INPUT and are dropped.
+        nat = f'''chain prerouting {{ type nat hook prerouting priority dstnat; policy accept;
+          iifname "{veth_ns}" meta l4proto tcp tcp dport {{ 5000, {PROXY_PORT} }} return
+          iifname "{veth_ns}" ip saddr @peers ip daddr {address} dnat ip to {GUEST_IP}
+        }}
+        chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+          ip saddr {GUEST_IP} oifname "{veth_ns}" masquerade
+        }}'''
+    body = f'''table inet flint {{
+      set peers {{ type ipv4_addr; }}
+      chain egress {{
+        ip daddr @peers accept
+        {storage}
+        ip daddr {_blocked()} drop
+      }}
+      chain input {{ type filter hook input priority filter; policy accept;
+        {ingress}
+      }}
+      chain forward {{ type filter hook forward priority filter; policy accept;
+        {forwarding}
+      }}
+      chain output {{ type filter hook output priority filter; policy accept;
+        {f'oifname "{veth_ns}" jump egress' if veth_ns else ''}
+      }}
+      {nat}
+    }}\n'''
+    _replace_table("inet", "flint", body, ns_name)
 
 
-def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True) -> str:
+def configure_tenant_peers(groups: list[list[str]]) -> None:
+    """Replace the host ACL first (revocation), then the netns sets/routes.
+
+    Bridge ports remain isolated; /32 routes force peers through the gateway,
+    whose source/destination ACL is enforced even on established connections.
+    """
+    import ipaddress
+    with _firewall_lock:
+        addresses = {ns: ip for group in groups for ns in group if (ip := _veth_ips.get(ns))}
+        pairs = [(addresses[a], addresses[b]) for group in groups for a in group for b in group
+                 if a != b and a in addresses and b in addresses]
+        script = f"flush set inet {_HOST_TABLE} peers\n"
+        if pairs:
+            script += f"add element inet {_HOST_TABLE} peers {{ " + ", ".join(f"{a} . {b}" for a, b in pairs) + " }\n"
+        _nft(script)
+        for group in groups:
+            for ns_name in group:
+                if ns_name not in addresses or not os.path.exists(f"/var/run/netns/{ns_name}"):
+                    continue
+                peers = [str(ipaddress.IPv4Address(addresses[n])) for n in group if n != ns_name and n in addresses]
+                script = "flush set inet flint peers\n"
+                if peers:
+                    script += "add element inet flint peers { " + ", ".join(peers) + " }\n"
+                _nft(script, ns_name)
+                for ip in peers:
+                    subprocess.run(["ip", "-n", ns_name, "route", "replace", ip + "/32", "via", BRIDGE_IP],
+                                   check=True, capture_output=True)
+
+
+def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True,
+                          veth_ip: str | None = None) -> str:
     """Create a network namespace with a configured TAP device inside it.
 
     Returns the veth IP address if internet access is enabled, or '' otherwise.
@@ -355,10 +438,14 @@ def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True)
         raise RuntimeError(f"Failed to setup TAP {tap_name} in {ns_name}: {exc}") from exc
 
     # Set up veth pair for internet access
-    veth_ip, veth_ns = "", None
+    veth_ns = None
     if internet:
-        veth_ip, veth_ns = _setup_veth_pair(ns_name, _strip_ns_prefix(ns_name))
+        veth_ip, veth_ns = _setup_veth_pair(ns_name, _strip_ns_prefix(ns_name), veth_ip)
+    else:
+        veth_ip = ""
     _apply_netns_firewall(ns_name, veth_ns)
+    from ._limits import network_limits
+    network_limits(ns_name, tap_name)
     return veth_ip
 
 
@@ -376,6 +463,8 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
 
     if not internet:
         _apply_netns_firewall(ns_name, None)
+        from ._limits import network_limits
+        network_limits(ns_name, tap_name)
         return ""
 
     # Set up veth pair for internet access
@@ -400,44 +489,37 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
     run_in_ns(["ip", "link", "set", veth_ns, "up"])
     run_in_ns(["ip", "route", "add", "default", "via", BRIDGE_IP])
     _apply_netns_firewall(ns_name, veth_ns)
+    from ._limits import network_limits
+    network_limits(ns_name, tap_name)
     return veth_ip
 
 
 def _setup_proxy_redirect(ns_name: str) -> None:
-    """Add iptables REDIRECT rules to send outbound HTTP/HTTPS from the guest to the credential proxy.
-
-    Idempotent: checks whether each rule already exists before appending.
-    """
-    run_in_ns = lambda cmd: subprocess.run(
-        ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
-
-    for dport in ("80", "443"):
-        rule = [
-            "iptables", "-t", "nat",
-            "-s", "172.16.0.0/30", "-p", "tcp", "--dport", dport,
-            "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
-        ]
-        # Check first, append only if missing
-        check = run_in_ns(["iptables", "-t", "nat", "-C", "PREROUTING"] + rule[3:])
-        if check.returncode != 0:
-            run_in_ns(["iptables", "-t", "nat", "-A", "PREROUTING"] + rule[3:])
-
-    log.info("Proxy redirect rules added for %s (port %d)", ns_name, PROXY_PORT)
+    # Peer traffic is never fed to the credential proxy. Its INPUT remains
+    # guest-facing only, and peer DNAT excludes the proxy and agent ports.
+    body = f'''table inet flint_proxy {{
+      chain prerouting {{ type nat hook prerouting priority -110; policy accept;
+        ip daddr {VETH_SUBNET}.0/{BRIDGE_CIDR} return
+        ip saddr {GUEST_IP} tcp dport {{ 80, 443 }} redirect to :{PROXY_PORT}
+      }}
+    }}\n'''
+    _replace_table("inet", "flint_proxy", body, ns_name)
 
 
 def _remove_proxy_redirect(ns_name: str) -> None:
-    """Remove iptables REDIRECT rules for the credential proxy."""
-    run_in_ns = lambda cmd: subprocess.run(
-        ["ip", "netns", "exec", ns_name] + cmd, capture_output=True, text=True)
+    subprocess.run(["ip", "netns", "exec", ns_name, "nft", "delete", "table", "inet", "flint_proxy"],
+                   check=True, capture_output=True)
 
-    run_in_ns([
-        "iptables", "-t", "nat", "-D", "PREROUTING",
-        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "80",
-        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
-    ])
-    run_in_ns([
-        "iptables", "-t", "nat", "-D", "PREROUTING",
-        "-s", "172.16.0.0/30", "-p", "tcp", "--dport", "443",
-        "-j", "REDIRECT", "--to-port", str(PROXY_PORT),
-    ])
-    log.info("Proxy redirect rules removed for %s", ns_name)
+
+def reconcile_namespace(ns_name: str, *, proxy: bool = False) -> None:
+    """Upgrade a recovered namespace and reapply its host-enforced ceilings."""
+    from ._limits import network_limits
+    result = subprocess.run(["ip", "-n", ns_name, "-j", "-4", "addr", "show"],
+                            check=True, text=True, capture_output=True)
+    links = json.loads(result.stdout)
+    tap = next(link["ifname"] for link in links if any(a.get("local") == HOST_IP for a in link.get("addr_info", [])))
+    veth = next((link["ifname"] for link in links if link["ifname"].startswith("vn-")), None)
+    _apply_netns_firewall(ns_name, veth)
+    network_limits(ns_name, tap)
+    if proxy:
+        _setup_proxy_redirect(ns_name)

@@ -317,21 +317,52 @@ def test_workspace_persists_across_pause_resume(sandbox):
     assert data == b"survives"
 
 
-@pytest.mark.slow
-def test_template_build_and_run(backend_kind):
-    if backend_kind != "linux-firecracker":
-        pytest.skip("Template build-and-run test is only implemented for the Linux backend today")
+def test_template_build_and_run(backend_kind, require_sandbox, daemon_only):
+    if backend_kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
+        pytest.skip("Template builds require a Linux hypervisor")
     if shutil.which("docker") is None:
-        pytest.skip("docker is required for template build tests")
-
-    template = Template("flint-test-template").from_alpine_image().run_cmd("touch /tmp/template-built").build()
-    sandbox = Sandbox(template_id=template.template_id)
+        pytest.fail("docker is required for isolated template builds")
+    import socket
+    import uuid
+    from flint.core.config import BRIDGE_IP
+    name = "phase1-build-" + uuid.uuid4().hex[:8]
+    # A live host listener makes a blocked connection meaningful.
+    listener = socket.socket()
+    listener.bind((BRIDGE_IP, 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    template = None
     try:
-        result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
-        assert result.exit_code == 0
-        assert "ok" in result.stdout
+        # A failed attempt must be rebuildable under the same name. Polling
+        # the replacement must observe the new attempt, not its stale error.
+        with pytest.raises(RuntimeError, match="Template build failed"):
+            Template(name).from_alpine_image().run_cmd("exit 17").build(timeout=1200)
+        definition = (Template(name).from_alpine_image()
+            .run_cmd("command -v nc >/dev/null && nc -w5 1.1.1.1 80 </dev/null")
+            .run_cmd(f"! nc -w2 {BRIDGE_IP} {port} </dev/null")
+            .run_cmd("! nc -w2 169.254.169.254 80 </dev/null")
+            .run_cmd("test ! -S /var/run/docker.sock && touch /tmp/template-built"))
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                template = definition.build(timeout=1200)
+                break
+            except httpx.HTTPStatusError as exc:
+                # The failed worker may still be releasing its resources.
+                assert exc.response.status_code in (409, 429) and time.monotonic() < deadline, exc.response.text
+                time.sleep(.05)
+        info = api.get(f"{BASE_URL}/templates/{template.template_id}").json()["template"]
+        assert info["tenant"] == "default", info
+        sandbox = Sandbox(template_id=template.template_id)
+        try:
+            result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
+            assert result.exit_code == 0 and "ok" in result.stdout, result
+        finally:
+            sandbox.kill()
     finally:
-        sandbox.kill()
+        listener.close()
+        if template:
+            api.delete(f"{BASE_URL}/templates/{template.template_id}").raise_for_status()
 
 
 def test_localhost_works_in_the_sandbox(sandbox):

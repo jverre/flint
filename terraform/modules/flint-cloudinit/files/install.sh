@@ -32,7 +32,7 @@ fi
 log "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git curl ca-certificates python3 iptables iproute2 e2fsprogs util-linux >/dev/null
+apt-get install -y -qq git curl ca-certificates python3 nftables iproute2 e2fsprogs util-linux >/dev/null
 
 if ! command -v go >/dev/null || [ "$(go env GOVERSION 2>/dev/null)" != "go${GO_VERSION}" ]; then
   log "go ${GO_VERSION}"

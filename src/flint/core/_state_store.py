@@ -75,6 +75,7 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        self._conn.execute("CREATE TABLE IF NOT EXISTS tenant_networks (tenant TEXT PRIMARY KEY, allow_same_tenant INTEGER NOT NULL DEFAULT 0)")
         # It holds token hashes and sealed credentials: the daemon's user only.
         for path in (db_path, db_path + "-wal", db_path + "-shm"):
             if os.path.exists(path):
@@ -96,6 +97,8 @@ class StateStore:
             "backend_meta_json TEXT",
             "tenant TEXT NOT NULL DEFAULT ''",
             "availability TEXT NOT NULL DEFAULT ''",
+            "state_changed_at REAL NOT NULL DEFAULT 0",
+            "deletion_attempt_at REAL NOT NULL DEFAULT 0",
         ):
             try:
                 self._conn.execute(f"ALTER TABLE sandboxes ADD COLUMN {column_def}")
@@ -110,6 +113,7 @@ class StateStore:
                 pass
         # VMs from before every VM had a tenant belong to the default one.
         self._conn.execute("UPDATE sandboxes SET tenant = 'default' WHERE tenant = ''")
+        self._conn.execute("UPDATE sandboxes SET state_changed_at = updated_at WHERE state_changed_at = 0")
         self._conn.commit()
         self._seal_policies()
 
@@ -129,6 +133,17 @@ class StateStore:
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._conn.execute("VACUUM")
 
+    @_locked
+    def tenant_network(self, tenant: str) -> bool:
+        row = self._conn.execute("SELECT allow_same_tenant FROM tenant_networks WHERE tenant = ?", (tenant,)).fetchone()
+        return bool(row and row[0])
+
+    @_locked
+    def set_tenant_network(self, tenant: str, enabled: bool) -> None:
+        self._conn.execute("INSERT INTO tenant_networks VALUES (?, ?) ON CONFLICT(tenant) DO UPDATE SET allow_same_tenant=excluded.allow_same_tenant", (tenant, int(enabled)))
+        self._conn.commit()
+
+    @_locked
     def insert_sandbox(
         self,
         vm_id: str,
@@ -183,8 +198,8 @@ class StateStore:
         now = time.time()
         daemon_pid = os.getpid()
         self._conn.execute(
-            "UPDATE sandboxes SET state = ?, updated_at = ?, error_message = COALESCE(?, error_message) WHERE vm_id = ?",
-            (new_state.value, now, detail, vm_id),
+            "UPDATE sandboxes SET state = ?, updated_at = ?, state_changed_at = ?, error_message = COALESCE(?, error_message) WHERE vm_id = ?",
+            (new_state.value, now, now, detail, vm_id),
         )
         if new_state == SandboxState.DEAD:
             # A dead VM's credentials have no use left.
@@ -207,8 +222,8 @@ class StateStore:
     def update_health(self, vm_id: str, timestamp: float | None = None) -> None:
         now = timestamp or time.time()
         self._conn.execute(
-            "UPDATE sandboxes SET last_health_at = ?, updated_at = ? WHERE vm_id = ?",
-            (now, now, vm_id),
+            "UPDATE sandboxes SET last_health_at = ? WHERE vm_id = ?",
+            (now, vm_id),
         )
         self._conn.commit()
 
@@ -281,8 +296,8 @@ class StateStore:
         """Return sandboxes whose timeout has passed."""
         now = now or time.time()
         rows = self._conn.execute(
-            "SELECT * FROM sandboxes WHERE timeout_at IS NOT NULL AND timeout_at < ? AND state NOT IN (?, ?)",
-            (now, SandboxState.DEAD.value, SandboxState.PAUSED.value),
+            "SELECT * FROM sandboxes WHERE timeout_at IS NOT NULL AND timeout_at < ? AND state NOT IN (?, ?, ?)",
+            (now, SandboxState.DEAD.value, SandboxState.PAUSED.value, SandboxState.DELETING.value),
         ).fetchall()
         return [dict(r) for r in rows]
 

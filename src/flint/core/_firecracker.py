@@ -46,16 +46,32 @@ def _fc_status_ok(resp: str) -> bool:
     return status_line.startswith("HTTP/1.1 2")
 
 
-def _wait_for_api_socket(socket_path: str, timeout: float = 5.0) -> None:
+def _wait_for_api_socket(socket_path: str, timeout: float = 5.0, *, process=None, log_path: str = "", vm_id: str = "") -> None:
+    def failure(message: str) -> str:
+        if log_path:
+            try:
+                with open(log_path, "rb") as log_file:
+                    log_file.seek(0, 2)
+                    log_file.seek(max(0, log_file.tell() - 4096))
+                    return message + "\n" + log_file.read().decode(errors="replace")
+            except OSError:
+                pass
+        return message
+
     t0 = time.monotonic()
     while True:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(failure(f"Firecracker/jailer exited with code {process.returncode}"))
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             connect_unix(s, socket_path)
+            if vm_id:
+                from ._limits import verify_process, vm_cgroup
+                verify_process(vm_cgroup(vm_id, "linux-firecracker"), process.pid)
             return
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             if time.monotonic() - t0 > timeout:
-                raise TimeoutError("Firecracker API socket not ready")
+                raise TimeoutError(failure(f"Firecracker API socket not ready after {timeout}s"))
             time.sleep(0.001)
         finally:
             s.close()

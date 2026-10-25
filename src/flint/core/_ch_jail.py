@@ -93,7 +93,7 @@ class ChJail:
         """Hard-link a read-only artifact shared by all VMs into the chroot."""
         os.link(shared_readonly(src, JAILER_SHARED_DIR), self.host_path(jail_path))
 
-    def spawn(self, ns_name: str) -> subprocess.Popen:
+    def spawn(self, ns_name: str, *, vcpus: int | None = None, memory_mib: int | None = None) -> subprocess.Popen:
         """Start the jailed VMM and wait for its API socket."""
         try:
             os.unlink(self.socket_path)
@@ -112,7 +112,7 @@ class ChJail:
                 start_new_session=True,
             )
         try:
-            self._enter_cgroup(process.pid)
+            self._enter_cgroup(process.pid, vcpus=vcpus, memory_mib=memory_mib)
             _ch.wait_for_api_socket(self.socket_path, process=process, log_path=self.log_path)
         except Exception:
             process.kill()
@@ -120,16 +120,20 @@ class ChJail:
             raise
         return process
 
-    def _enter_cgroup(self, pid: int) -> None:
+    def _enter_cgroup(self, pid: int, *, vcpus: int | None = None, memory_mib: int | None = None) -> None:
+        from ._limits import cgroup_limits
+        cgroup_limits(self.cgroup, self.host_path(JAIL_ROOTFS), vcpus=vcpus or config.CH_CPU_COUNT,
+                      memory_mib=memory_mib or config.CH_MEMORY_BYTES // (1 << 20), vmm_disk_limit=True)
         # ip/setpriv/chroot exec into the VMM, so the pid is the VMM's for its lifetime.
         if config.JAILER_CGROUP_VER != 2:
             log.warning("cloud-hypervisor jail: cgroup v1 not supported, VMM %s runs without its own cgroup", self.vm_id[:8])
             return
-        os.makedirs(self.cgroup, exist_ok=True)
-        with open(f"{self.cgroup}/cgroup.procs", "w") as f:
-            f.write(str(pid))
+        from ._limits import attach_process
+        attach_process(self.cgroup, pid)
 
     def cleanup(self) -> None:
+        from ._limits import stop_processes
+        stop_processes(self.cgroup)
         marker = f"{self.base}/shared-rootfs"
         if os.path.exists(marker):
             target = self.host_path(JAIL_ROOTFS)

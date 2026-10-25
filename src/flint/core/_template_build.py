@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from .config import log, TEMPLATES_DIR, KERNEL_PATH, BOOT_ARGS, GUEST_MAC
 from ._snapshot import create_golden_snapshot
@@ -110,68 +111,22 @@ def _find_init_net_sh() -> str:
     )
 
 
-def _docker_build(template_id: str, dockerfile_content: str, context_dir: str) -> str:
-    tag = f"flint-template:{template_id}"
-    dockerfile_path = os.path.join(context_dir, "Dockerfile")
-    with open(dockerfile_path, "w") as f:
-        f.write(dockerfile_content)
-
-    log.info("Building Docker image %s ...", tag)
-    log.info("Dockerfile:\n%s", dockerfile_content)
-    log.info("Context dir contents: %s", os.listdir(context_dir))
-    result = subprocess.run(
-        ["docker", "build", "-t", tag, "-f", dockerfile_path, context_dir],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log.error("Docker build FAILED (exit %d):\nstdout: %s\nstderr: %s",
-                  result.returncode, result.stdout[-2000:], result.stderr[-2000:])
-        raise RuntimeError(
-            f"Docker build failed for {tag} (exit {result.returncode}): {result.stderr[-500:]}"
-        )
-    log.info("Docker build succeeded for %s", tag)
-    return tag
-
-
 def _extract_rootfs(image_tag: str, rootfs_path: str, size_mb: int) -> None:
-    log.info("Extracting rootfs from %s (%d MB) ...", image_tag, size_mb)
-
-    # Create empty ext4 image
-    subprocess.run(["truncate", "-s", f"{size_mb}M", rootfs_path], check=True)
-    subprocess.run(["mkfs.ext4", "-F", "-m", "0", rootfs_path], check=True, capture_output=True)
-
-    # Mount, export docker filesystem, unmount
-    mount_dir = f"/tmp/flint-rootfs-mount-{os.getpid()}"
-    os.makedirs(mount_dir, exist_ok=True)
-    try:
-        subprocess.run(["mount", rootfs_path, mount_dir], check=True)
-
-        # Create container, export, extract
-        result = subprocess.run(
-            ["docker", "create", image_tag],
-            check=True, capture_output=True, text=True,
-        )
-        container_id = result.stdout.strip()
+    """Export the fixed trusted appliance without creating host mounts."""
+    with tempfile.TemporaryDirectory(prefix="export-", dir=os.path.dirname(rootfs_path)) as directory:
+        container = "flint-appliance-" + os.environ["FLINT_BUILD_JOB"]
+        subprocess.run(["docker", "create", "--name", container, image_tag], check=True, capture_output=True)
         try:
-            export_proc = subprocess.Popen(
-                ["docker", "export", container_id],
-                stdout=subprocess.PIPE,
-            )
-            subprocess.run(
-                ["tar", "-x", "-C", mount_dir],
-                stdin=export_proc.stdout,
-                check=True,
-            )
-            rc = export_proc.wait()
-            if rc != 0:
-                raise RuntimeError(f"docker export failed with exit code {rc}")
+            with subprocess.Popen(["docker", "export", container], stdout=subprocess.PIPE) as export:
+                subprocess.run(["tar", "-xf", "-", "-C", directory], stdin=export.stdout, check=True)
+                export.stdout.close()
+                if export.wait() != 0:
+                    raise RuntimeError("Trusted appliance export failed")
+            with open(rootfs_path, "wb") as disk:
+                disk.truncate(size_mb << 20)
+            subprocess.run(["mkfs.ext4", "-F", "-m", "0", "-d", directory, rootfs_path], check=True, capture_output=True)
         finally:
-            subprocess.run(["docker", "rm", container_id], capture_output=True)
-    finally:
-        subprocess.run(["umount", mount_dir], capture_output=True)
-        shutil.rmtree(mount_dir, ignore_errors=True)
-
-    log.info("Rootfs extracted to %s", rootfs_path)
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=30)
 
 
 def build_template(
@@ -185,7 +140,8 @@ def build_template(
     Returns template_id.
     """
     template_id = _slugify(name)
-    template_dir = f"{TEMPLATES_DIR}/{template_id}"
+    from ._build_job import output_dir
+    template_dir = output_dir(template_id)
     os.makedirs(template_dir, exist_ok=True)
 
     # Register as "building"
@@ -198,10 +154,8 @@ def build_template(
         rootfs_size_mb=rootfs_size_mb,
     )
 
+    context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
     try:
-        # Prepare build context directory
-        context_dir = f"/tmp/flint-build-{template_id}"
-        os.makedirs(context_dir, exist_ok=True)
         log.info("[%s] Build started (rootfs_size_mb=%d)", template_id, rootfs_size_mb)
 
         # Copy flintd binary and init-net.sh into context
@@ -214,12 +168,9 @@ def build_template(
         with open(f"{template_dir}/Dockerfile", "w") as f:
             f.write(dockerfile_content)
 
-        # Docker build
-        image_tag = _docker_build(template_id, dockerfile_content, context_dir)
-
-        # Extract rootfs
+        from ._builder import build_rootfs
         rootfs_path = f"{template_dir}/rootfs.ext4"
-        _extract_rootfs(image_tag, rootfs_path, rootfs_size_mb)
+        build_rootfs("linux-firecracker", dockerfile_content, context_dir, rootfs_path, rootfs_size_mb)
 
         # Create golden snapshot for this template
         # TAP device names must be ≤15 chars (Linux IFNAMSIZ limit).
@@ -236,11 +187,10 @@ def build_template(
         )
 
         # Update status
-        update_template_artifact_status(template_id, "linux-firecracker", "ready")
+        if not os.environ.get("FLINT_BUILD_JOB"):
+            update_template_artifact_status(template_id, "linux-firecracker", "ready")
 
         # Cleanup
-        subprocess.run(["docker", "rmi", image_tag], capture_output=True)
-        shutil.rmtree(context_dir, ignore_errors=True)
 
         log.info("Template %s built successfully", template_id)
         return template_id
@@ -248,3 +198,6 @@ def build_template(
     except Exception:
         update_template_artifact_status(template_id, "linux-firecracker", "failed")
         raise
+    finally:
+        from ._wipe import wipe_tree
+        wipe_tree(context_dir)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import fcntl
 import json
 import os
 import threading
@@ -17,13 +18,24 @@ def _registry_path() -> str:
 
 # Every change is a read-modify-write of registry.json; builds run in threads.
 _lock = threading.RLock()
+_local = threading.local()
 
 
 def _locked(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with _lock:
-            return fn(*args, **kwargs)
+            if getattr(_local, "locked", False):
+                return fn(*args, **kwargs)
+            os.makedirs(TEMPLATES_DIR, exist_ok=True)
+            with open(f"{TEMPLATES_DIR}/registry.lock", "a") as lock:
+                os.chmod(lock.name, 0o600)
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                _local.locked = True
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _local.locked = False
     return wrapper
 
 
@@ -108,6 +120,7 @@ def register_template_artifact(
     registry = _load_registry()
     existing = _normalize_entry(registry.get(template_id, {"name": name, "created_at": time.time()}))
     existing["name"] = name
+    existing.pop("error", None)
     existing["status"] = status
     existing["template_dir"] = template_dir if backend_kind == "linux-firecracker" else existing.get("template_dir", template_dir)
     existing["rootfs_size_mb"] = rootfs_size_mb if rootfs_size_mb is not None else existing.get("rootfs_size_mb")
@@ -153,16 +166,20 @@ def update_template_status(template_id: str, status: str) -> None:
 
 
 @_locked
-def update_template_artifact_status(template_id: str, backend_kind: str, status: str) -> None:
+def update_template_artifact_status(template_id: str, backend_kind: str, status: str, *, error: str | None = None) -> None:
     registry = _load_registry()
     if template_id not in registry:
         return
     entry = _normalize_entry(registry[template_id])
     artifacts = dict(entry.get("artifacts") or {})
     artifact = dict(artifacts.get(backend_kind) or {})
-    if not artifact:
-        return
     artifact["status"] = status
+    if error is not None:
+        artifact["error"] = error[-4096:]
+        entry["error"] = error[-4096:]
+    elif status == "building":
+        artifact.pop("error", None)
+        entry.pop("error", None)
     artifacts[backend_kind] = artifact
     entry["artifacts"] = artifacts
     # Same as register_template_artifact: the template's status follows its
@@ -211,6 +228,8 @@ def get_template_dir(template_id: str, backend_kind: str = "linux-firecracker") 
     artifacts = entry.get("artifacts") or {}
     artifact = artifacts.get(backend_kind)
     if artifact:
+        if artifact.get("status", "ready") != "ready":
+            raise KeyError(f"Template {template_id} is not ready")
         return artifact["template_dir"]
     return entry["template_dir"]
 

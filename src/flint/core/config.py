@@ -112,7 +112,7 @@ JAILER_CGROUP_VER  = int(os.environ.get("FLINT_JAILER_CGROUP_VER", "2"))
 # Pools are per daemon (keyed by data dir); shared artifacts are keyed by source.
 _DATA_KEY          = hashlib.sha1(DATA_DIR.encode()).hexdigest()[:8]
 GOLDEN_NS          = f"fc-golden-{_DATA_KEY}"
-# cgroup v2 parent of every jailed Firecracker VM (jailer --parent-cgroup).
+# cgroup v2 base of every jailed Firecracker VM; the jailer joins its VM leaf.
 JAILER_PARENT_CGROUP = os.environ.get("FLINT_JAILER_PARENT_CGROUP", "firecracker")
 FC_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-fc-{_DATA_KEY}"
 CH_POOL_DIR        = f"{JAILER_BASE_DIR}/.pool-ch-{_DATA_KEY}"

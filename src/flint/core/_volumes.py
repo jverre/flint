@@ -329,9 +329,9 @@ class Volumes:
             vol = self._require(ref, tenants)
             if self._mounts_where("volume_id = ?", vol.id):
                 raise VolumeError(409, f"Volume '{vol.name}' is mounted; unmount it first")
+            self._discard(vol)
             self._conn.execute("DELETE FROM volumes WHERE id = ?", (vol.id,))
             self._conn.commit()
-        self._discard(vol)
         log.info("Deleted volume %s (%s)", vol.id, vol.name)
         return vol
 
@@ -341,7 +341,7 @@ class Volumes:
             try:
                 _nfs_server.delete_image(vol.id)  # unmounts it first
             except _nfs_server.NfsServerError as e:
-                log.warning("Failed to delete image %s: %s", vol.id, e)
+                raise VolumeError(503, f"Could not wipe volume '{vol.name}'; retry deletion: {e}") from e
         # Wiped like a sandbox's files; never follows the symlinks sandboxes
         # may have left in it. (The storage server wipes image volumes.)
         from ._wipe import wipe_tree

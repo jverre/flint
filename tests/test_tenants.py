@@ -213,7 +213,21 @@ def test_a_tenant_over_its_quota_is_refused(tenants, require_sandbox):
             api.delete(f"{BASE_URL}/vms/{vm}")
 
 
-def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
+@pytest.fixture(scope="session")
+def peer_service(tmp_path_factory):
+    import platform
+    import subprocess
+    from pathlib import Path
+    target = tmp_path_factory.mktemp("peer-service") / "peer-service"
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()]
+    result = subprocess.run(["go", "build", "-o", str(target), str(Path(__file__).parent / "fixtures" / "peer_server.go")],
+                            env={**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": arch},
+                            capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr.decode()
+    return target.read_bytes()
+
+
+def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health, peer_service):
     """Phase 1's exit test: every boundary between two tenants, on one host.
 
     Tenant a has two VMs (one holding a credential), tenant b one. None can
@@ -236,6 +250,7 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
     for events, ws in ((events_a, ws_a), (events_b, ws_b)):
         threading.Thread(target=_collect, args=(events, ws), daemon=True).start()
     vms: list[str] = []
+    volumes: list[str] = []
     try:
         a1 = a.create(network_policy=policy)["vm_id"]
         vms.append(a1)
@@ -266,10 +281,56 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
                                "'http://169.254.169.254/metadata/instance?api-version=2021-02-01'")
         assert code != 0, f"a1 got cloud metadata through its proxy: {out}"
 
+        # Default deny includes real guest services and the two control ports.
+        peer_ip = a.get(a2)["network_address"]
+        other_ip = b.get(vm_b)["network_address"]
+        assert peer_ip and other_ip and peer_ip != other_ip
+        a.write_file(a2, "/tmp/peer-service", peer_service, mode="0755")
+        code, out = run(a, a2, "nohup /tmp/peer-service >/tmp/peer-http.log 2>&1 </dev/null &")
+        assert code == 0, out
+        deadline = time.monotonic() + 5
+        while True:
+            code, out = run(a, a2, "test -f /tmp/peer-ready && wget -q -T1 -O - http://127.0.0.1:18080")
+            if code == 0:
+                break
+            assert time.monotonic() < deadline, run(a, a2, "cat /tmp/peer-http.log")
+            time.sleep(.05)
+        assert out.strip() == "tenant-a", out
+        code, out = run(a, a1, f"wget -q -T2 -O - http://{peer_ip}:18080")
+        assert code != 0, f"same-tenant traffic allowed without opt-in: {out}"
+        with _tcp(tok_b) as c:
+            assert c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": True}).status_code == 403
+        with _tcp(tok_a) as c:
+            c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": True}).raise_for_status()
+            assert c.get(f"/v1/tenants/{ta}/network").json()["allow_same_tenant"] is True
+        code, out = run(a, a1, f"wget -q -T3 -O - http://{peer_ip}:18080")
+        assert code == 0 and out.strip() == "tenant-a", out
+        for target in (f"{peer_ip} 5000", f"{peer_ip} {PROXY_PORT}", f"{other_ip} 18080"):
+            code, out = run(a, a1, f"nc -w2 {target} </dev/null")
+            assert code != 0, f"peer opt-in exposed another tenant or control port: {target}: {out}"
+        a.pause(a2)
+        a.resume(a2)
+        code, out = run(a, a1, f"wget -q -T3 -O - http://{peer_ip}:18080")
+        assert code == 0 and out.strip() == "tenant-a", out
+        with _tcp(tok_a) as c:
+            c.put(f"/v1/tenants/{ta}/network", json={"allow_same_tenant": False}).raise_for_status()
+        code, out = run(a, a1, f"wget -q -T2 -O - http://{peer_ip}:18080")
+        assert code != 0, f"traffic still allowed after revocation: {out}"
+
         # Credentials: injected on a1's HTTPS, never inside a1, not readable, not b's.
         code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
         assert code == 0, out
         assert json.loads(out)["headers"].get("x-flint-auth") == secret, out
+        import sqlite3
+        from pathlib import Path
+        from flint.core._proxy import _RULES_DIR
+        with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
+            proxy_ns = db.execute("SELECT ns_name FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()[0]
+        a.pause(a1)
+        assert not list(Path(_RULES_DIR).glob(proxy_ns + "-*")), "paused VM retained plaintext proxy credentials"
+        a.resume(a1)
+        code, out = run(a, a1, "wget -q -O - https://postman-echo.com/headers", timeout=30)
+        assert code == 0 and json.loads(out)["headers"].get("x-flint-auth") == secret, out
         # The pattern is put together in the shell, so the probe itself never
         # brings the whole secret into the VM.
         half = len(secret) // 2
@@ -283,9 +344,64 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         assert "x-flint-auth" not in json.loads(out)["headers"], out
         assert b.get(a1) is None
 
-        # Deleting a1 wipes it, and only a's event stream hears of it.
-        a.kill(vms.pop(0))
-        _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
+        # Storage ownership is enforced even for an admin attaching a volume.
+        with _tcp(tok_a) as c:
+            response = c.post("/volumes", json={"name": "isolation-data", "size_gib": 1})
+            response.raise_for_status()
+            volume = response.json()["volume"]
+            volumes.append(volume["id"])
+        assert volume["tenant"] == ta, volume
+        api.post(f"{BASE_URL}/vms/{a1}/mounts", json={"volume": volume["id"], "path": "/mnt/private"}).raise_for_status()
+        code, out = run(a, a1, "echo tenant-a-data > /mnt/private/marker; sync")
+        assert code == 0, out
+        assert api.post(f"{BASE_URL}/vms/{vm_b}/mounts", json={"volume": volume["id"], "path": "/mnt/stolen"}).status_code == 404
+        with _tcp(tok_b) as c:
+            assert volume["id"] not in {v["id"] for v in c.get("/volumes").json()["volumes"]}
+            assert c.post(f"/volumes/{volume['id']}/snapshot", json={"name": "stolen"}).status_code == 404
+        api.delete(f"{BASE_URL}/vms/{a1}/mounts", params={"path": "/mnt/private"}).raise_for_status()
+        from pathlib import Path
+        from flint.core._nfs_server import IMAGES_DIR, VOLUMES_DIR
+        volume_dir = Path(IMAGES_DIR if volume["kind"] == "image" else VOLUMES_DIR) / volume["id"]
+        volume_files = [p.open("rb") for p in volume_dir.rglob("*") if p.is_file() and not p.is_symlink()
+                        and p.stat().st_nlink == 1 and p.stat().st_size > 0]
+        assert volume_files, f"no on-disk volume files exercised under {volume_dir}"
+        try:
+            with _tcp(tok_a) as c:
+                c.delete(f"/volumes/{volume['id']}").raise_for_status()
+            volumes.remove(volume["id"])
+            assert not volume_dir.exists()
+            for stream in volume_files:
+                while chunk := stream.read(1 << 20):
+                    assert chunk.count(0) == len(chunk), f"data left in deleted volume file {stream.name}"
+        finally:
+            for stream in volume_files:
+                stream.close()
+
+        # Hold the real disk/snapshot inodes open across deletion, so an
+        # unlink without wiping cannot satisfy the exit criterion.
+        import sqlite3
+        from pathlib import Path
+        a.pause(a1)
+        with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
+            vm_dir, chroot = db.execute("SELECT vm_dir, chroot_base FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()
+        root = Path(chroot or vm_dir)
+        private = [p for p in root.rglob("*") if not p.is_symlink() and p.is_file()
+                   and p.stat().st_nlink == 1 and p.stat().st_size > 0]
+        assert any("pause" in str(p) for p in private), "no private pause snapshot was exercised"
+        held = [p.open("rb") for p in private]
+        try:
+            a.kill(a1)
+            vms.remove(a1)
+            wiped = _wait_for(events_a, lambda e: e.get("type") == "vm.wiped" and e.get("vm_id") == a1, "vm.wiped for a1", 30)
+            assert wiped["files"] > 0 and wiped["bytes"] > 0, wiped
+            assert not root.exists(), f"deleted VM files remain under {root}"
+            assert not list(Path(_RULES_DIR).glob(proxy_ns + "-*")), "deleted VM retained plaintext proxy credentials"
+            for stream in held:
+                while chunk := stream.read(1 << 20):
+                    assert chunk.count(0) == len(chunk), f"data left in deleted file {stream.name}"
+        finally:
+            for stream in held:
+                stream.close()
         b_mark = b.create()["vm_id"]  # once b hears of its own VM, it would have heard of a1 before
         vms.append(b_mark)
         _wait_for(events_b, lambda e: e.get("type") == "vm.created" and e["vm"]["vm_id"] == b_mark, "b's own event")
@@ -304,3 +420,5 @@ def test_two_tenants_are_isolated(tenants, require_sandbox, backend_health):
         ws_b.close()
         for vm in vms:
             api.delete(f"{BASE_URL}/vms/{vm}")
+        for volume_id in volumes:
+            api.delete(f"{BASE_URL}/volumes/{volume_id}")

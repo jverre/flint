@@ -20,10 +20,10 @@ def cluster():
     c = Cluster()
     try:
         c.start([("a", "zone-1"), ("b", "zone-2")])
-    except Exception:
+    except Exception as exc:
         diag = c.diagnostics()
         c.stop()
-        pytest.fail(f"cluster failed to start:\n{diag}", pytrace=True)
+        pytest.exit(f"cluster failed to start: {exc}\n{diag}", returncode=1)
     flint.configure(url=c.url, api_key=c.api.headers["Authorization"].split(" ", 1)[1], tenant=TENANT)
     yield c
     c.stop()

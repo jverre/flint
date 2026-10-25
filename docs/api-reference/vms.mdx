@@ -89,7 +89,7 @@ Paused VMs are included. Their VMM isn't running, so `agent_healthy` is `false` 
 
 `DELETE /vms/{vm_id}`
 
-Terminates the hypervisor process and cleans up all resources.
+Terminates the hypervisor process and cleans up all resources. Deletion persists as `Deleting` while cleanup is pending, including after a daemon restart. A wipe failure returns `503` and retains the resource for retry; `200` means cleanup completed. A VM being deleted cannot serve commands or terminals.
 
 **Response** `200`
 

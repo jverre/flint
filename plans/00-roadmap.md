@@ -45,7 +45,7 @@ provider and built-in tenant-aware observability in open source.
 |---|-----------|--------|
 | 1 | **Host agent**: backends (Firecracker, Cloud Hypervisor, macOS VZ), golden snapshot + pool, lifecycle, volumes | Exists (the daemon; `flint agent` runs it as a cluster host) |
 | 2 | **Guest agent** (`flintd`): exec, PTY, files, processes | Exists |
-| 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Single host done except IO/network rate limits and same-tenant opt-in, see [01](01-tenant-isolation.md) |
+| 3 | **Isolation layer**: jailing, per-tenant networks, egress, secrets, storage wipe, quotas | Single-host implementation includes resource ceilings, same-tenant opt-in and isolated builds; see [01](01-tenant-isolation.md) for verification |
 | 4 | **Control plane API**: OpenAPI source of truth, `metadata/spec/status`, `tenant`, auth; later multi-host + scheduler | Cluster control plane, scheduler, admin/service tokens and `tenant` exist ([03](03-cluster.md)). No checked-in OpenAPI spec; resources are flat, not `metadata/spec/status` (only VM sets are declarative). The single daemon has a trusted Unix socket, admin/service tokens on TCP, and a `tenant` on every VM, volume and template |
 | 5 | **Event pipeline**: persisted timeline + audit log, tenant-tagged, OTLP/Prometheus/webhook export | Partial: daemon and cluster persist tenant-tagged events with `actor`, exec details, per-VM timelines and a hash-chained admin audit log. CLI and dashboard read stored history. Export remains |
 | 6 | **Surfaces**: Python SDK, CLI, TUI, TypeScript SDK, MCP, Terraform, web dashboard | Python SDK/CLI/TUI exist; Terraform deploys clusters. Web UI at `/ui` on the daemon and the control plane (#31). No TypeScript SDK, MCP server or workload/admin Terraform provider |
@@ -73,14 +73,16 @@ model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
   *Done.*
 - Per-tenant quotas. *Done on the single daemon (#43).*
 - Written threat model. *Done (#44).*
-- Still open: template builds run on the host's Docker, not in a VM (the
-  biggest gap); per-VM disk IO and network rate limits; letting a tenant's
-  own VMs talk to each other; moving the firewall from iptables to
-  nftables; encrypting policies in the cluster's database.
+- Implemented in the completion pass: disposable VM template builds, native
+  nftables, tenant peer-network opt-in, per-VM IO/network ceilings, and
+  deletion that retains resources after wipe failures.
+- Cluster policies remain plaintext; that is outside the single-host scope.
 
 **Done when** an end-to-end test with two tenants proves every boundary in the
-threat model, on both Linux backends. *Done: `test_two_tenants_are_isolated`
-(#44).*
+threat model, on both Linux backends. The strengthened
+`test_two_tenants_are_isolated` checks peer opt-in/revocation and the contents
+of disk/snapshot inodes after deletion. The template build-and-boot flow now
+runs in both daemon CI jobs. A skipped run is not completion evidence.
 
 ### Phase 2: one API, many surfaces
 
@@ -129,8 +131,8 @@ Details in [03-cluster.md](03-cluster.md).
 
 ## Where to start
 
-Phase 1 is done apart from the open items listed under it. Template builds
-in a VM are the next isolation gap, then rate limits. Phase 2's persisted
+Phase 1's completion implementation needs a passing run of the strengthened
+flows on both Linux hypervisors before sign-off. Phase 2's persisted
 events and audit log are implemented; the OpenAPI contract is next.
 
 ## Non-goals for now

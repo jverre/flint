@@ -38,6 +38,8 @@ def create_golden_snapshot(
     """
     log.info("Creating golden snapshot (dir=%s)...", snapshot_dir)
     spec = JailSpec(vm_id=f"golden-{uuid.uuid4().hex[:12]}", ns_name=ns_name)
+    from ._build_job import register_vm
+    register_vm(spec.vm_id, ns_name, "linux-firecracker")
     socket_path = spec.socket_path_on_host
     log_path = f"{spec.chroot_base}/firecracker.log"  # outside the chroot
     process = None
@@ -61,7 +63,7 @@ def create_golden_snapshot(
             )
         log.info("Golden VM started in ns %s (pid=%d)", ns_name, process.pid)
 
-        _wait_for_api_socket(socket_path)
+        _wait_for_api_socket(socket_path, process=process, log_path=log_path, vm_id=spec.vm_id)
         _fc_put(socket_path, "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
         _fc_put(socket_path, "/drives/rootfs", {
             "drive_id": "rootfs", "path_on_host": "rootfs.ext4",

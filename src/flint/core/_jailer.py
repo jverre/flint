@@ -56,7 +56,10 @@ def stage_shared_file(src: str, dest_name: str, spec: JailSpec) -> str:
     return dest
 
 
-def build_jailer_command(spec: JailSpec) -> list[str]:
+def build_jailer_command(spec: JailSpec, *, vcpus: int = 1, memory_mib: int = 128) -> list[str]:
+    from ._limits import cgroup_limits
+    cgroup_limits(f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{spec.vm_id}",
+                  f"{spec.chroot_root}/rootfs.ext4", vcpus=vcpus, memory_mib=memory_mib)
     return [
         JAILER_BINARY,
         "--id", spec.vm_id,
@@ -65,7 +68,9 @@ def build_jailer_command(spec: JailSpec) -> list[str]:
         "--gid", str(JAILER_GID),
         "--chroot-base-dir", JAILER_BASE_DIR,
         "--cgroup-version", str(JAILER_CGROUP_VER),
-        "--parent-cgroup", JAILER_PARENT_CGROUP,
+        # With no --cgroup properties the jailer joins this existing group
+        # directly. Its parent has controllers delegated and cannot hold tasks.
+        "--parent-cgroup", f"{JAILER_PARENT_CGROUP}/{spec.vm_id}",
         "--netns", f"/var/run/netns/{spec.ns_name}",
         "--",
         "--api-sock", "firecracker.sock",
@@ -75,12 +80,14 @@ def build_jailer_command(spec: JailSpec) -> list[str]:
 def cleanup_jailer(chroot_base: str, vm_id: str) -> None:
     """Wipe and remove the chroot tree, and remove the cgroup entries."""
     from ._wipe import wipe_tree
+    from ._limits import stop_processes
+    stop_processes(f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{vm_id}")
     if os.path.isdir(chroot_base):
         wipe_tree(chroot_base, vm_id)
     if JAILER_CGROUP_VER == 2:
         cgroup_path = f"/sys/fs/cgroup/{JAILER_PARENT_CGROUP}/{vm_id}"
         if os.path.isdir(cgroup_path):
-            shutil.rmtree(cgroup_path, ignore_errors=True)
+            os.rmdir(cgroup_path)
     else:
         for controller in ("cpu", "memory", "blkio", "devices", "pids"):
             cgroup_path = f"/sys/fs/cgroup/{controller}/{JAILER_PARENT_CGROUP}/{vm_id}"
