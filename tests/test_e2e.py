@@ -166,16 +166,19 @@ def test_concurrent_commands(sandbox):
 
 
 def test_concurrent_commands_isolation(sandbox):
-    """Concurrent commands get independent stdout/stderr."""
+    """Many concurrent commands run side by side, with independent stdout/stderr."""
     import concurrent.futures
 
     def slow_cmd(n):
-        # Use sleep 1 (busybox doesn't support fractional seconds)
-        return sandbox.commands.run(f"sleep 1 && echo result-{n}")
+        # Use sleep 2 (busybox doesn't support fractional seconds)
+        return sandbox.commands.run(f"sleep 2 && echo result-{n}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(slow_cmd, i) for i in range(3)]
+    t0 = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
+        futures = [pool.submit(slow_cmd, i) for i in range(24)]
         results = [f.result() for f in futures]
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5, f"24 two-second commands took {elapsed:.1f}s: they were queued, not run together"
 
     for i, r in enumerate(results):
         assert r.exit_code == 0
@@ -615,6 +618,37 @@ def test_write_and_read_binary_file(sandbox):
     sandbox.write_file("/tmp/bin.dat", data_in)
     data_out = sandbox.read_file("/tmp/bin.dat")
     assert data_out == data_in
+
+
+def test_large_file_reads_stream(sandbox):
+    """A file far bigger than the daemon holds in memory reads back whole."""
+    size = 300 << 20
+    sandbox.commands.run(f"truncate -s {size} /tmp/huge")  # sparse: no guest memory or disk
+    received = 0
+    with api.stream("GET", f"{BASE_URL}/vms/{sandbox.id}/files", params={"path": "/tmp/huge"}, timeout=120.0) as resp:
+        assert resp.status_code == 200, resp.read()[:300]
+        for chunk in resp.iter_bytes():
+            assert not chunk.strip(b"\0"), "the file is all zeros"
+            received += len(chunk)
+    assert received == size
+
+
+def test_large_file_writes_stream(sandbox):
+    """A file far bigger than the daemon holds in memory arrives whole."""
+    import hashlib
+
+    data = os.urandom(150 << 20)
+    # Into a pipe, so the guest needs neither the memory nor the disk for it.
+    started = sandbox.commands.run(
+        "mkfifo /tmp/pipe && setsid sh -c 'md5sum < /tmp/pipe > /tmp/sum.part && mv /tmp/sum.part /tmp/sum' "
+        ">/dev/null 2>&1 </dev/null &")
+    assert started.exit_code == 0, started.stderr
+    sandbox.write_file("/tmp/pipe", data)
+    deadline = time.monotonic() + 30
+    while (result := sandbox.commands.run("cat /tmp/sum")).exit_code != 0:
+        assert time.monotonic() < deadline, f"the guest never finished reading: {result.stderr}"
+        time.sleep(0.2)
+    assert result.stdout.split()[0] == hashlib.md5(data).hexdigest()
 
 
 def test_write_file_with_mode(sandbox):

@@ -576,6 +576,13 @@ class SandboxManager:
             raise RuntimeError(f"Sandbox {sandbox_id} not found")
         return self._backend.proxy_guest_request(entry, method, path, body, timeout)
 
+    def connect_agent(self, sandbox_id: str):
+        """A socket starting to connect to the sandbox's guest agent."""
+        entry = self.get_entry(sandbox_id)
+        if not entry:
+            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+        return self._backend.connect_guest(entry)
+
     async def bridge_terminal(self, sandbox_id: str, websocket) -> None:
         entry = self.get_entry(sandbox_id)
         if not entry:

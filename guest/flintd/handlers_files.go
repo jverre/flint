@@ -52,13 +52,18 @@ func handleFileWrite(w http.ResponseWriter, r *http.Request) {
 			mode = os.FileMode(m)
 		}
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, 100<<20)) // 100MB max
+	// Streamed to the file: no size limit, and no copy of it in memory.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	if err := os.WriteFile(path, data, mode); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+	_, err = io.Copy(f, r.Body)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"write failed: %s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

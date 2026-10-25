@@ -198,6 +198,27 @@ def test_mounts_are_private_to_their_sandbox(volume, make_sandbox):
     assert "etc" not in sh(late, "ls /r").split(), "symlinked subpath resolved outside the volume"
 
 
+def test_unmount_revokes_the_guests_own_mounts(volume, make_sandbox):
+    """After unmount the volume is out of reach, even through a mount the guest made of its export itself."""
+    from flint.core.config import BRIDGE_IP, R2NFS_PORT
+
+    sb, observer = make_sandbox(), make_sandbox()
+    m = sb.mount(volume, "/data")
+    sh(sb, "echo before > /data/f")
+    mount = (f"mount -t nfs -o vers=3,proto=tcp,port={R2NFS_PORT},mountport={R2NFS_PORT},mountproto=tcp,"
+             f"nolock,soft,timeo=10,retrans=1,noac,lookupcache=none {BRIDGE_IP}:/{m['id']}")
+    # Its own export, so the server lets it: this is the copy a hostile guest keeps.
+    assert sh(sb, f"mkdir -p /copy && {mount} /copy && cat /copy/f").strip() == "before"
+
+    sb.unmount("/data")
+    kept = sb.commands.run("echo after > /copy/g; ls /copy")
+    assert "f" not in kept.stdout.split(), f"the guest's own mount still serves the volume: {kept.stdout}{kept.stderr}"
+    again = sb.commands.run(f"mkdir -p /again && {mount} /again")
+    assert again.exit_code != 0, f"the guest re-mounted a revoked export: {again.stdout}"
+    observer.mount(volume, "/v", readonly=True)
+    assert "g" not in sh(observer, "ls /v").split(), "a write landed through the revoked mount"
+
+
 def test_snapshot_is_a_frozen_read_only_copy(make_volume, make_sandbox):
     """A snapshot taken while a sandbox is writing keeps the data as it was then, read-only."""
     vol = make_volume()

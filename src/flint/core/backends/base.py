@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, Literal
+
+from flint.core import _guest_http
 
 RecoveryState = Literal["alive", "paused", "dead"]
 
@@ -160,7 +163,10 @@ class BackendPlugin(ABC):
     def discard_paused(self, row: dict) -> None:
         """Delete what a paused sandbox left behind: its snapshot, jail and network."""
 
-    @abstractmethod
+    def connect_guest(self, entry) -> socket.socket:
+        """Start connecting to the VM's guest agent; see :func:`_guest_http.connect`."""
+        return _guest_http.connect(entry.agent_url)
+
     def proxy_guest_request(
         self,
         entry,
@@ -169,7 +175,7 @@ class BackendPlugin(ABC):
         body: bytes | None = None,
         timeout: float = 65,
     ) -> tuple[int, bytes]:
-        pass
+        return _guest_http.request(self.connect_guest(entry), method, path, body, timeout)
 
     @abstractmethod
     async def bridge_terminal(self, entry, websocket) -> None:
