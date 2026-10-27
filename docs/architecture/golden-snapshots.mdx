@@ -41,11 +41,11 @@ The pool lives on the same filesystem as the sandboxes: `$FLINT_JAILER_BASE_DIR/
 
 ## Templates
 
-Custom templates work the same way. When you call `Template.build()`, Flint:
+Custom templates work the same way. When an admin imports an image (`Template.import_image()`), Flint:
 
-1. Builds a Docker image from your Dockerfile
-2. Extracts the filesystem from the image
-3. Boots a VM with that filesystem
+1. Pulls the image inside a disposable builder VM and turns its filesystem into a root disk, adding `flintd`
+2. Copies that disk out to the host as a size-bounded stream
+3. Boots a jailed VM from it
 4. Waits for `flintd` to be healthy
 5. Takes a snapshot - this becomes the template's golden snapshot
 

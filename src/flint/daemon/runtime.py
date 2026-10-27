@@ -51,7 +51,7 @@ class Runtime:
             "events.query": e.query, "events.record": e.record,
             "audit.append": e.audit, "audit.query": e.audit_entries, "audit.verify": e.verify_audit,
             "template.list": self.templates, "template.get": self.template,
-            "template.build": self.build, "template.delete": self.delete_template,
+            "template.import": self.import_template, "template.delete": self.delete_template,
             "config.get": self.get_config, "config.set": self.set_config,
             "auth.admin.publish": self.publish_admin_token,
             "state.write": self.write_state, "metrics.get": daemon.metrics.get,
@@ -190,27 +190,28 @@ class Runtime:
         from flint.core._template_registry import get_template
         return get_template(template_id)
 
-    def build(self, name: str, dockerfile: str, rootfs_size_mb: int, tenant: str):
+    def import_template(self, name: str, image: str, rootfs_size_mb: int, tenant: str, auth: dict | None):
         from fastapi import HTTPException
+        from flint.core._template_build import validate_auth, validate_image
         from flint.core._template_registry import _slugify
         from flint.core._template_registry import claim_template, update_template_artifact_status
         from .auth import TRUSTED
-        if not isinstance(name, str) or not name or not isinstance(dockerfile, str) or not dockerfile:
-            raise ValueError("name and dockerfile are required")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name is required")
+        validate_image(image)
+        validate_auth(auth)
         if type(rootfs_size_mb) is not int or not 64 <= rootfs_size_mb <= 16384:
             raise ValueError("Invalid rootfs size")
         template_id = _slugify(name)
         if not template_id or template_id == "default":
             raise ValueError("Invalid template name")
+        tenant = TRUSTED.resolve_tenant(tenant) if tenant else ""  # "" = every tenant
         with self._build_lock:
             if template_id in self._builds and self._builds[template_id].is_alive():
-                raise HTTPException(409, "A build for this template is already running")
+                raise HTTPException(409, f"Template '{template_id}' is already being imported")
             old = self.template(template_id)
-            # "" only rebuilds a template that was shared before tenancy.
-            if tenant != "" or not old or old.get("tenant"):
-                tenant = TRUSTED.resolve_tenant(tenant)
             if old and old.get("tenant", "") != tenant:
-                raise HTTPException(403, "Template belongs to another tenant")
+                raise HTTPException(409, f"Template '{template_id}' already exists for another owner; delete it first")
             from flint.core._build_job import Admission, BuildBusy
             try:
                 admission = Admission()
@@ -225,14 +226,14 @@ class Runtime:
             def run():
                 try:
                     with admission:
-                        self.daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
+                        self.daemon.backend.import_template(name, image, rootfs_size_mb=rootfs_size_mb, auth=auth)
                 except Exception as exc:
                     update_template_artifact_status(template_id, self.daemon.backend.kind, "failed", error=str(exc))
-                    config.log.exception("Template build failed: %s", template_id)
+                    config.log.exception("Template import failed: %s", template_id)
                 finally:
                     with self._build_lock:
                         self._builds.pop(template_id, None)
-            thread = threading.Thread(target=run, daemon=True, name=f"build-{template_id}")
+            thread = threading.Thread(target=run, daemon=True, name=f"import-{template_id}")
             self._builds[template_id] = thread
             try:
                 thread.start()
@@ -251,7 +252,7 @@ class Runtime:
             raise ValueError("Cannot delete default template")
         with self._build_lock:
             if template_id in self._builds and self._builds[template_id].is_alive():
-                raise HTTPException(409, "Cannot delete a template while its build is running")
+                raise HTTPException(409, "Cannot delete a template while it is being imported")
             template = self.template(template_id)
             if template is None:
                 raise HTTPException(404, "Template not found")

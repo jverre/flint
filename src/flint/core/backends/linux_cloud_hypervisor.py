@@ -27,7 +27,6 @@ from flint.core._ch_boot import (
     _ch_tap_name,
     ch_boot,
     ch_create_golden,
-    ch_create_golden_snapshot,
     ch_golden_ready,
     ch_snapshot_ready,
     ch_tap_for_ns,
@@ -567,70 +566,9 @@ class LinuxCloudHypervisorBackend(HostBackend):
         )
         return "alive", entry
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        if not os.environ.get("FLINT_BUILD_JOB"):
-            from flint.core._build_job import run_build
-            return run_build(self.kind, name, dockerfile, rootfs_size_mb)
-        """Build a CH template: Docker build -> rootfs extraction -> golden snapshot -> register."""
-        from flint.core._template_build import (
-            _build_flintd,
-            _find_init_net_sh,
-            _slugify,
-        )
-        from flint.core._template_registry import (
-            register_template_artifact,
-            update_template_artifact_status,
-        )
-        from flint.core.config import TEMPLATES_DIR
-
-        template_id = _slugify(name)
-        from flint.core._build_job import output_dir
-        template_dir = output_dir(template_id)
-        os.makedirs(template_dir, exist_ok=True)
-
-        # A supervised build stages its output; the supervisor records the
-        # published directory, so keep the current one bootable meanwhile.
-        if os.environ.get("FLINT_BUILD_JOB"):
-            update_template_artifact_status(template_id, self.kind, "building")
-        else:
-            register_template_artifact(
-                template_id,
-                name,
-                self.kind,
-                template_dir,
-                status="building",
-                rootfs_size_mb=rootfs_size_mb,
-            )
-
-        import tempfile
-        context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
-
-        try:
-            _build_flintd(os.path.join(context_dir, "flintd"))
-            init_net = _find_init_net_sh()
-            shutil.copy2(init_net, os.path.join(context_dir, "init-net.sh"))
-
-            with open(f"{template_dir}/Dockerfile", "w") as f:
-                f.write(dockerfile)
-
-            from flint.core._builder import build_rootfs
-            rootfs_path = f"{template_dir}/rootfs.ext4"
-            build_rootfs(self.kind, dockerfile, context_dir, rootfs_path, rootfs_size_mb)
-            ch_create_golden_snapshot(template_dir)
-
-            # The supervisor publishes only after worker cleanup and durable output.
-            if not os.environ.get("FLINT_BUILD_JOB"):
-                update_template_artifact_status(template_id, self.kind, "ready")
-
-
-            log.info("CH template %s built successfully", template_id)
-            return {"template_id": template_id, "status": "ready"}
-        except Exception:
-            update_template_artifact_status(template_id, self.kind, "failed")
-            raise
-        finally:
-            from flint.core._wipe import wipe_tree
-            wipe_tree(context_dir)
+    def import_template(self, name: str, image: str, rootfs_size_mb: int = 500, auth: dict | None = None) -> dict:
+        from flint.core._template_build import run_import
+        return run_import(self.kind, name, image, rootfs_size_mb, auth)
 
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
         from flint.core._template_registry import delete_template_artifact as _delete_template_artifact

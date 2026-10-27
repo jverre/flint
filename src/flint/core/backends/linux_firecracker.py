@@ -21,7 +21,6 @@ from flint.core._netns_pool import start_netns_pool, stop_netns_pool
 from flint.core._pool import start_pool, stop_pool
 
 from flint.core._snapshot import create_golden_snapshot, golden_snapshot_exists
-from flint.core._template_build import build_template as _build_template
 from flint.core._template_registry import (
     delete_template_artifact as _delete_template_artifact,
     get_template_dir,
@@ -563,12 +562,9 @@ class LinuxFirecrackerBackend(HostBackend):
         )
         return "alive", entry
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        if not os.environ.get("FLINT_BUILD_JOB"):
-            from flint.core._build_job import run_build
-            return run_build(self.kind, name, dockerfile, rootfs_size_mb)
-        template_id = _build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
-        return {"template_id": template_id, "status": "building"}
+    def import_template(self, name: str, image: str, rootfs_size_mb: int = 500, auth: dict | None = None) -> dict:
+        from flint.core._template_build import run_import
+        return run_import(self.kind, name, image, rootfs_size_mb, auth)
 
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
         if template is None:

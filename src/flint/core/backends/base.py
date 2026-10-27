@@ -204,7 +204,8 @@ class BackendPlugin(ABC):
         pass
 
     @abstractmethod
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
+    def import_template(self, name: str, image: str, rootfs_size_mb: int = 500, auth: dict | None = None) -> dict:
+        """Make template ``name`` from a container image (pulled with ``auth`` if given)."""
         pass
 
     @abstractmethod

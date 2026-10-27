@@ -25,7 +25,7 @@ Everything you build against Flint — sandbox lifecycle, exec, file ops, PTY, p
 ## What you can do with Flint
 
 - Run sandboxes and execute arbitrary code or shell commands
-- Create custom sandbox environments from Docker images using the `Template` builder
+- Boot sandboxes from your own container images with `Template.import_image()`
 - Pause a running sandbox to disk and resume it later — state is fully preserved
 - Run the same workloads on Linux and macOS with no code changes
 - Swap the hypervisor without changing your app — three backends ship in the box, and third parties can publish more

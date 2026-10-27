@@ -41,6 +41,9 @@ jobs:
       - name: Build
         working-directory: guest/flintd
         run: go build -o flintd .
+      - name: Vet and build the template importer
+        working-directory: guest/flint-import
+        run: go vet ./... && CGO_ENABLED=0 go build -o flint-import .
 
   web:
     runs-on: ubuntu-latest

@@ -6,7 +6,6 @@ Requires a running daemon (`flint start`).
 import json
 import os
 import platform
-import shutil
 import threading
 import time
 
@@ -310,69 +309,73 @@ def test_workspace_persists_across_pause_resume(sandbox):
     assert data == b"survives"
 
 
-def test_template_build_and_run(backend_kind, require_sandbox, daemon_only):
+# Public ECR mirrors Docker Hub's official images without its anonymous pull limits.
+_PYTHON_IMAGE = "public.ecr.aws/docker/library/python:3.12-alpine"
+
+
+def _import(name: str, image: str, **kwargs) -> Template:
+    """Import, waiting out a previous attempt's worker still releasing its resources."""
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return Template.import_image(name, image, timeout=1200, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            assert exc.response.status_code in (409, 429) and time.monotonic() < deadline, exc.response.text
+            time.sleep(.05)
+
+
+def _linux_imports_only(backend_kind):
     if backend_kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
-        pytest.skip("Template builds require a Linux hypervisor")
-    if shutil.which("docker") is None:
-        pytest.fail("docker is required for isolated template builds")
-    import socket
+        pytest.skip("Template imports require a Linux hypervisor")
+
+
+def test_template_import_and_boot(backend_kind, require_sandbox, daemon_only):
+    _linux_imports_only(backend_kind)
     import uuid
-    from flint.core.config import BRIDGE_IP
-    name = "phase1-build-" + uuid.uuid4().hex[:8]
-    # A live host listener makes a blocked connection meaningful.
-    listener = socket.socket()
-    listener.bind((BRIDGE_IP, 0))
-    listener.listen()
-    port = listener.getsockname()[1]
-    template = None
+    name = "import-" + uuid.uuid4().hex[:8]
     try:
-        # A failed attempt must be rebuildable under the same name. Polling
-        # the replacement must observe the new attempt, not its stale error.
-        with pytest.raises(RuntimeError, match="Template build failed"):
-            Template(name).from_alpine_image().run_cmd("exit 17").build(timeout=1200)
-        definition = (Template(name).from_alpine_image()
-            .run_cmd("command -v nc >/dev/null && nc -w5 1.1.1.1 80 </dev/null")
-            .run_cmd(f"! nc -w2 {BRIDGE_IP} {port} </dev/null")
-            .run_cmd("! nc -w2 169.254.169.254 80 </dev/null")
-            .run_cmd("test ! -S /var/run/docker.sock && touch /tmp/template-built"))
-        deadline = time.monotonic() + 30
-        while True:
+        # A failed import says why, and the name can be imported again.
+        with pytest.raises(RuntimeError, match="doesn't exist or needs registry credentials"):
+            _import(name, "public.ecr.aws/docker/library/flint-no-such-image:1")
+        template = _import(name, _PYTHON_IMAGE, rootfs_size_mb=1024)
+        assert template.status == "ready" and template.digest.startswith("sha256:"), template
+        assert template.image.endswith("library/python:3.12-alpine") and not template.tenant, template
+
+        def check_boots():
+            sandbox = Sandbox(template_id=template.template_id)
             try:
-                template = definition.build(timeout=1200)
-                break
-            except httpx.HTTPStatusError as exc:
-                # The failed worker may still be releasing its resources.
-                assert exc.response.status_code in (409, 429) and time.monotonic() < deadline, exc.response.text
-                time.sleep(.05)
-        info = api.get(f"{BASE_URL}/templates/{template.template_id}").json()["template"]
-        assert info["tenant"] == "default", info
+                r = sandbox.commands.run("python3 -c 'import sys; print(sys.version_info[:2])'; echo $PYTHON_VERSION")
+                # The image's own binaries, with its ENV (as `docker run` gives them).
+                assert r.exit_code == 0 and "(3, 12)" in r.stdout and "\n3.12." in r.stdout, r
+            finally:
+                sandbox.kill()
+
+        check_boots()
+        # A failed re-import (the image doesn't fit) reports it and keeps the
+        # published template bootable, at the same digest.
+        with pytest.raises(RuntimeError, match="raise rootfs_size_mb"):
+            _import(name, _PYTHON_IMAGE, rootfs_size_mb=64)
+        assert Template.get(template.template_id).digest == template.digest
+        check_boots()
+    finally:
+        api.delete(f"{BASE_URL}/templates/{name}")
+
+
+def test_template_from_a_distroless_image_boots(backend_kind, require_sandbox, daemon_only):
+    """An image with no shell or tools still boots, gets its network and runs commands."""
+    _linux_imports_only(backend_kind)
+    import uuid
+    name = "distroless-" + uuid.uuid4().hex[:8]
+    try:
+        template = _import(name, "gcr.io/distroless/static-debian12:latest", rootfs_size_mb=256)
         sandbox = Sandbox(template_id=template.template_id)
         try:
-            result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
-            assert result.exit_code == 0 and "ok" in result.stdout, result
-        finally:
-            sandbox.kill()
-        # A failed rebuild reports its failure but keeps the published
-        # template bootable.
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                with pytest.raises(RuntimeError, match="Template build failed"):
-                    Template(name).from_alpine_image().run_cmd("exit 17").build(timeout=1200)
-                break
-            except httpx.HTTPStatusError as exc:
-                assert exc.response.status_code in (409, 429) and time.monotonic() < deadline, exc.response.text
-                time.sleep(.05)
-        sandbox = Sandbox(template_id=template.template_id)
-        try:
-            result = sandbox.commands.run("test -f /tmp/template-built && echo ok")
-            assert result.exit_code == 0 and "ok" in result.stdout, result
+            r = sandbox.commands.run("echo shell-ok && ip -4 addr show eth0 && test -f /etc/os-release")
+            assert r.exit_code == 0 and "shell-ok" in r.stdout and "172.16.0.2" in r.stdout, r
         finally:
             sandbox.kill()
     finally:
-        listener.close()
-        if template:
-            api.delete(f"{BASE_URL}/templates/{template.template_id}").raise_for_status()
+        api.delete(f"{BASE_URL}/templates/{name}")
 
 
 def test_localhost_works_in_the_sandbox(sandbox):

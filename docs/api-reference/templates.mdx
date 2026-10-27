@@ -1,43 +1,43 @@
 ---
 title: "Templates"
-description: "Build and manage custom sandbox environments."
+description: "Import container images that sandboxes boot from."
 ---
 
-## Build a template
+## Import a template
 
-`POST /templates/build`
+`POST /templates` · **admin only**
 
-Starts a template build in the background and returns immediately. Poll `GET /templates/{template_id}` to check when it's ready. Submitted Dockerfiles run in disposable jailed VMs with private caches; host services, private networks and cloud metadata are unreachable.
+Imports a container image in the background and returns immediately. Poll `GET /templates/{template_id}` until it is ready. The image is pulled and converted inside a disposable jailed VM with public-only egress; host services, private networks and cloud metadata are unreachable, and the host never unpacks or runs image content.
 
 **Request body**
 
 ```json
 {
-  "name": "my-python-env",
-  "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
-  "rootfs_size_mb": 500
+  "name": "python",
+  "image": "python:3.12-slim",
+  "rootfs_size_mb": 2048
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | required | Human-readable name |
-| `dockerfile` | string | required | Full Dockerfile contents |
-| `rootfs_size_mb` | int | `500` | Rootfs image size in MB, from 64 to 16384 |
-| `tenant` | string | Caller's sole tenant, otherwise `default` | Owner of the resulting template |
+| `name` | string | required | The template's name; its ID is derived from it |
+| `image` | string | required | Image reference, e.g. `python:3.12-slim`, `ghcr.io/acme/app:1.4` or `repo@sha256:...`; `linux/amd64` only |
+| `rootfs_size_mb` | int | `2048` | Disk size in MiB, from 64 to 16384. The image must fit |
+| `tenant` | string | none | Only this tenant's VMs may boot it. Without it, every tenant's can |
+| `registry_auth` | object | none | `{"username", "password"}` for a private registry. Used for this pull only, never stored or logged |
 
-A token scoped to several tenants must specify one. A build for an existing template cannot change its owner. Invalid sizes return `400`; a concurrent build of the same ID returns `409`. Deleting a template while its build runs also returns `409`.
+Importing to an existing ID replaces that template once the new image is ready; until then, and if the import fails, the previous one keeps booting. An import can't change a template's owner (`409`: delete it first). A concurrent import of the same ID returns `409`, and so does deleting a template while it imports. Invalid fields return `400`; a token that isn't an admin gets `403`.
 
-Builds require host Docker for the trusted appliance. Each builder has 2 vCPUs, 2 GiB of guest memory, a bounded private disk and a host-enforced deadline for the complete operation (preparation, build, export and golden snapshot), defaulting to 900 seconds through `FLINT_BUILD_TIMEOUT_SECONDS`. `FLINT_BUILD_CONCURRENCY` caps admitted builds (default `1`, valid range `1`–`4`); excess requests return `429` with `Retry-After`. A template becomes ready only after its output is durable and its worker resources are cleaned up. After a daemon crash, abandoned operations are stopped and wiped before new requests are accepted. A cleanup failure retains its recovery journal and blocks new builds until a daemon restart retries cleanup. Failed builds include a bounded `error` in the template response.
+Each import has 2 vCPUs, 2 GiB of memory, a bounded private disk and a deadline for the whole operation, 900 seconds by default (`FLINT_BUILD_TIMEOUT_SECONDS`). `FLINT_BUILD_CONCURRENCY` caps concurrent imports (default `1`, from `1` to `4`); more return `429` with `Retry-After`. A failed import reports why in the template's `error`, for example a missing image, missing credentials, or an image too big for `rootfs_size_mb`.
 
 **Response** `200`
 
 ```json
-{
-  "template_id": "tpl_abc123",
-  "status": "building"
-}
+{"template_id": "python", "status": "building"}
 ```
+
+`POST /templates/build` (Dockerfile builds) was removed and returns `410`.
 
 ---
 
@@ -45,13 +45,16 @@ Builds require host Docker for the trusted appliance. Each builder has 2 vCPUs, 
 
 `GET /templates`
 
+Returns the templates the caller's tenants can boot.
+
 **Response** `200`
 
 ```json
 {
   "templates": [
-    {"template_id": "default",   "name": "Default",        "status": "ready"},
-    {"template_id": "tpl_abc123","name": "my-python-env",  "status": "ready"}
+    {"template_id": "default", "name": "Default", "status": "ready"},
+    {"template_id": "python", "name": "python", "status": "ready",
+     "image": "index.docker.io/library/python:3.12-slim", "digest": "sha256:9b98a8d3..."}
   ]
 }
 ```
@@ -67,22 +70,24 @@ Builds require host Docker for the trusted appliance. Each builder has 2 vCPUs, 
 ```json
 {
   "template": {
-    "template_id": "tpl_abc123",
-    "name": "my-python-env",
-    "status": "ready"
+    "template_id": "python",
+    "name": "python",
+    "status": "ready",
+    "image": "index.docker.io/library/python:3.12-slim",
+    "digest": "sha256:9b98a8d3..."
   }
 }
 ```
 
-Status values: `"building"`, `"ready"`, `"failed"`
+Status values: `"building"`, `"ready"`, and `"failed"` (a single daemon) or `"error"` (a cluster), with `error` set.
 
 ---
 
 ## Delete a template
 
-`DELETE /templates/{template_id}`
+`DELETE /templates/{template_id}` · **admin only**
 
-You can't delete the `"default"` template.
+VMs already running from it keep running. You can't delete the `"default"` template.
 
 **Response** `200`
 
@@ -90,6 +95,4 @@ You can't delete the `"default"` template.
 {"ok": true}
 ```
 
-**Response** `400` - if you try to delete `"default"`
-
-**Response** `404` - template not found
+**Response** `400` if you try to delete `"default"`, `403` for a token that isn't an admin, `404` if the template doesn't exist.

@@ -1,10 +1,10 @@
-"""Untrusted Dockerfiles execute in disposable, resource-limited microVMs.
+"""Template images are pulled and converted in disposable, resource-limited microVMs.
 
-The host Docker daemon only prepares the fixed, trusted builder appliance.
-Neither submitted Dockerfiles nor their exported files execute on the host.
-Each build boots a private disk with an empty Docker cache. The artifact is
-created inside the builder and copied as a bounded byte stream, never mounted
-or extracted on the host.
+Neither image layers nor their files are parsed, extracted or executed on the
+host. Each import boots a private copy of the builder appliance (the default
+rootfs plus e2fsprogs, GNU tar and a static busybox), pulls and flattens the
+image there, adds Flint's guest files, and builds the ext4 root disk. The disk
+is copied out as a bounded byte stream, never mounted or extracted on the host.
 """
 from __future__ import annotations
 
@@ -15,9 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
-import tempfile
 import time
 import re
 import urllib.request
@@ -34,12 +32,8 @@ from ._netns import (_setup_netns_pyroute2, _apply_netns_firewall, _strip_ns_pre
 _MEMORY_MIB = 2048
 _CPUS = 2
 _TIMEOUT = 900
-_APPLIANCE_DOCKERFILE = """FROM alpine:3.21
-RUN apk add --no-cache docker docker-cli-buildx iproute2 e2fsprogs util-linux coreutils tar
-COPY flintd /usr/local/bin/flintd
-COPY init-net.sh /etc/init-net.sh
-RUN chmod +x /etc/init-net.sh /usr/local/bin/flintd
-"""
+# Added to the default rootfs to make the builder appliance (Alpine's signed packages).
+_APPLIANCE_PACKAGES = "e2fsprogs tar busybox-static"
 
 
 def _marker(vm_id: str) -> Path:
@@ -74,42 +68,41 @@ def cleanup_abandoned_builders() -> None:
         marker.unlink()
 
 
-def _appliance() -> str:
-    # The content key avoids reusing an appliance with an old guest agent.
-    from ._template_build import _build_flintd, _find_init_net_sh, _extract_rootfs
+def _appliance(kind: str) -> str:
+    """The builder disk: the trusted default rootfs plus Alpine packages, added in a VM.
+
+    Keyed by the default rootfs and the package list, so it is prepared once per
+    rootfs version and never with host Docker.
+    """
+    st = os.stat(config.SOURCE_ROOTFS)
+    key = hashlib.sha256(f"{config.SOURCE_ROOTFS}:{st.st_size}:{st.st_mtime_ns}:{_APPLIANCE_PACKAGES}".encode()).hexdigest()[:16]
     root = Path(config.DATA_DIR) / ".builder"
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (root / ".lock").open("w") as lock, tempfile.TemporaryDirectory(prefix=f"prepare-{os.environ['FLINT_BUILD_JOB']}-", dir=root) as context:
+    path = root / f"{key}.ext4"
+    with (root / ".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        _build_flintd(os.path.join(context, "flintd"))
-        shutil.copy2(_find_init_net_sh(), os.path.join(context, "init-net.sh"))
-        key = hashlib.sha256(_APPLIANCE_DOCKERFILE.encode() + Path(context, "flintd").read_bytes()
-                             + Path(context, "init-net.sh").read_bytes()).hexdigest()[:16]
-        path = root / f"{key}.ext4"
         if path.exists():
             return str(path)
-        Path(context, "Dockerfile").write_text(_APPLIANCE_DOCKERFILE)
-        tag = f"flint-builder:{key}"
         started = time.monotonic()
-        config.log.info("Builder appliance %s: preparing trusted image", key)
+        config.log.info("Builder appliance %s: preparing from %s", key, config.SOURCE_ROOTFS)
+        tmp = root / f"prepare-{os.environ['FLINT_BUILD_JOB']}-{key}.ext4"
         try:
-            subprocess.run(["docker", "build", "-t", tag, context], check=True, capture_output=True, timeout=300)
-            disk = Path(context) / "appliance.ext4"
-            _extract_rootfs(tag, str(disk), 4096)
-            os.chmod(disk, 0o600)
-            os.replace(disk, path)
-            config.log.info("Builder appliance %s: ready in %.1fs", key, time.monotonic() - started)
-        except subprocess.CalledProcessError as exc:
-            detail = ((exc.stdout or b"") + (exc.stderr or b""))[-4096:].decode(errors="replace")
-            raise RuntimeError(f"Builder appliance preparation failed: {detail}") from exc
+            with _vm(kind, 1024, source=config.SOURCE_ROOTFS, keep=str(tmp)) as ns:
+                _run(ns, f"apk add --no-cache {_APPLIANCE_PACKAGES} && sync", 300, stage="add builder packages")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
         finally:
-            subprocess.run(["docker", "image", "rm", tag], capture_output=True, timeout=30)
+            if tmp.exists():
+                from ._wipe import wipe_tree
+                wipe_tree(str(tmp))
+        config.log.info("Builder appliance %s: ready in %.1fs", key, time.monotonic() - started)
         return str(path)
 
 
 @contextmanager
-def _vm(kind: str, disk_mb: int):
-    source = _appliance()
+def _vm(kind: str, disk_mb: int, *, source: str | None = None, keep: str | None = None):
+    """Boot a builder VM; ``keep`` copies its disk out after it stops."""
+    source = source or _appliance(kind)
     vm_id = "build-" + uuid.uuid4().hex[:16]
     ns = "fb-" + uuid.uuid4().hex[:8]
     tap = "tap-build"
@@ -136,7 +129,7 @@ def _vm(kind: str, disk_mb: int):
             rootfs = jail.host_path("/rootfs.ext4")
         sparse_copy(source, rootfs)
         make_private(rootfs, vm_id) if spec else jail.give("/rootfs.ext4")
-        # Bound space for image layers, export and the output filesystem.
+        # Bound space for the flattened image and the output filesystem.
         with open(rootfs, "r+b") as f:
             f.truncate(max(12288, disk_mb * 4 + 4096) * (1 << 20))
         subprocess.run(["resize2fs", rootfs], check=True, capture_output=True, timeout=60)
@@ -175,6 +168,11 @@ def _vm(kind: str, disk_mb: int):
         _wait_for_agent(ns, retries=3000)
         config.log.info("Builder %s: guest ready in %.1fs", vm_id, time.monotonic() - started)
         yield ns
+        if keep:
+            process.kill()
+            process.wait(timeout=10)
+            process = None
+            sparse_copy(rootfs, keep)
     finally:
         if process:
             process.kill()
@@ -210,42 +208,72 @@ class _BoundedReader:
         return data
 
 
-def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb: int) -> None:
-    """Build an artifact inside a fresh VM, and wipe the builder on every path."""
-    if kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
-        raise ValueError("Isolated template builds require a Linux hypervisor")
-    with _vm(kind, size_mb) as ns:
-        def run(cmd: str, timeout: int = 60, *, stage: str):
-            started = time.monotonic()
-            config.log.info("Builder %s: %s", ns, stage)
-            body = json.dumps({"cmd": ["/bin/sh", "-ec", cmd], "timeout": timeout}).encode()
-            with _request(ns, "/exec", body, timeout + 10) as response:
-                raw = response.read((1 << 20) + 1)
-                if len(raw) > 1 << 20:
-                    raise RuntimeError("Builder command output exceeded 1 MiB")
-                result = json.loads(raw)
-            if result["exit_code"] != 0:
-                detail = (result.get("stdout", "") + result.get("stderr", ""))[-4096:]
-                raise RuntimeError(f"Template build failed during {stage}: {detail}")
-            config.log.info("Builder %s: %s completed in %.1fs", ns, stage, time.monotonic() - started)
+def _run(ns: str, cmd: str, timeout: int = 60, *, stage: str) -> None:
+    started = time.monotonic()
+    config.log.info("Builder %s: %s", ns, stage)
+    body = json.dumps({"cmd": ["/bin/sh", "-ec", cmd], "timeout": timeout}).encode()
+    with _request(ns, "/exec", body, timeout + 10) as response:
+        raw = response.read((1 << 20) + 1)
+        if len(raw) > 1 << 20:
+            raise RuntimeError("Builder command output exceeded 1 MiB")
+        result = json.loads(raw)
+    if result["exit_code"] != 0:
+        detail = (result.get("stdout", "") + result.get("stderr", "")).strip()[-4096:]
+        raise RuntimeError(f"Template import failed to {stage}: {detail}")
+    config.log.info("Builder %s: %s completed in %.1fs", ns, stage, time.monotonic() - started)
 
-        run("mkdir -p /build /export /run /sys/fs/cgroup; "
-            "mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true; "
-            "dockerd --storage-driver=overlay2 --iptables=false --bridge=none --ip-forward=false --ip-masq=false "
-            ">/var/log/docker.log 2>&1 &", stage="start Docker")
-        run("i=0; until docker info >/dev/null 2>&1; do i=$((i+1)); "
-            "if [ $i -ge 60 ]; then cat /var/log/docker.log >&2; exit 1; fi; sleep .5; done", stage="wait for Docker")
-        for name in ("flintd", "init-net.sh"):
-            with _request(ns, f"/files?path=/build/{name}", Path(context, name).read_bytes()) as response:
-                response.read()
-        with _request(ns, "/files?path=/build/Dockerfile", dockerfile.encode()) as response:
-            response.read()
-        # --network=host is confined to this disposable VM, never the host.
-        run("DOCKER_BUILDKIT=1 docker build --network=host --no-cache -t artifact /build && "
-            "docker create --name artifact artifact >/dev/null && "
-            "docker export artifact > /export.tar && tar -xf /export.tar -C /export && "
-            f"truncate -s {size_mb}M /artifact.ext4 && mkfs.ext4 -F -m 0 -d /export /artifact.ext4 && "
-            "gzip -1 /artifact.ext4", _TIMEOUT, stage="build and export rootfs")
+
+def _upload(ns: str, path: str, data: bytes) -> None:
+    with _request(ns, f"/files?path={path}", data) as response:
+        response.read()
+
+
+def _download_small(ns: str, path: str, limit: int = 1 << 16) -> bytes:
+    with _request(ns, f"/files?path={path}") as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"Builder file {path} exceeded {limit} bytes")
+    return data
+
+
+def import_rootfs(kind: str, image: str, auth: dict | None, context: str, output: str, size_mb: int) -> dict:
+    """Pull ``image`` and build its root disk inside a fresh VM; return its source.
+
+    The builder is wiped on every path. ``auth`` reaches only the importer,
+    which deletes it once read.
+    """
+    if kind not in ("linux-firecracker", "linux-cloud-hypervisor"):
+        raise ValueError("Template imports require a Linux hypervisor")
+    import shlex
+    with _vm(kind, size_mb) as ns:
+        for name in ("flint-import", "flintd", "init-net.sh", "template-inject.sh"):
+            _upload(ns, f"/build/{name}", Path(context, name).read_bytes())
+        auth_arg = ""
+        if auth:
+            _upload(ns, "/build/auth.json", json.dumps(auth).encode())
+            auth_arg = "-auth /build/auth.json "
+        # GNU tar refuses absolute and ../ members and never writes through a
+        # symlink the archive itself created.
+        # On failure, report the importer's own error rather than tar's
+        # complaint about the stream it cut short.
+        _run(ns, "chmod 755 /build/flint-import; mkdir -p /export; chmod 755 /export; set -o pipefail; "
+                 f"/build/flint-import -image {shlex.quote(image)} {auth_arg}-max-bytes {size_mb << 20} "
+                 "-source-out /build/source.json -env-out /build/image.env 2>/build/import.err "
+                 "| tar -x --numeric-owner --xattrs --xattrs-include='*' -C /export 2>/build/tar.err "
+                 "|| { if [ -s /build/import.err ]; then cat /build/import.err; else cat /build/tar.err; fi >&2; exit 1; }",
+             _TIMEOUT, stage="pull the image")
+        source = json.loads(_download_small(ns, "/build/source.json"))
+        # A fresh directory the archive cannot have pre-planted, then a chroot
+        # so the image's own symlinks resolve inside the image.
+        _run(ns, "rm -rf /export/.flint-inject; mkdir -m 700 /export/.flint-inject; "
+                 "cp /bin/busybox.static /export/.flint-inject/busybox; "
+                 "cp /build/flintd /build/init-net.sh /build/image.env /build/template-inject.sh /export/.flint-inject/; "
+                 "chroot /export /.flint-inject/busybox sh /.flint-inject/template-inject.sh; "
+                 "rm -rf /export/.flint-inject", 120, stage="add Flint's guest files")
+        _run(ns, f"used=$(du -sm /export | cut -f1); if [ $((used + used / 10 + 16)) -gt {size_mb} ]; then "
+                 f"echo \"the image needs about $((used + used / 10 + 16)) MiB; raise rootfs_size_mb above {size_mb}\" >&2; exit 1; fi; "
+                 f"truncate -s {size_mb}M /artifact.ext4 && mkfs.ext4 -q -F -m 0 -d /export /artifact.ext4 && "
+                 "gzip -1 /artifact.ext4", _TIMEOUT, stage="build the root disk")
         expected = size_mb << 20
         tmp = output + ".tmp"
         started = time.monotonic()
@@ -273,3 +301,7 @@ def build_rootfs(kind: str, dockerfile: str, context: str, output: str, size_mb:
             if os.path.exists(tmp):
                 from ._wipe import wipe_tree
                 wipe_tree(tmp)
+    if not isinstance(source, dict) or not isinstance(source.get("image"), str) or not isinstance(source.get("digest"), str) \
+            or not re.fullmatch(r"sha256:[a-f0-9]{64}", source["digest"]) or len(source["image"]) > 1024:
+        raise RuntimeError("Builder returned an invalid image source")
+    return {"image": source["image"], "digest": source["digest"]}

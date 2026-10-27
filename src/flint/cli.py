@@ -725,3 +725,75 @@ def volumes_unmount(vm_id, path):
     """Unmount the volume at PATH in sandbox VM_ID."""
     _volume_call(_daemon_client().unmount, vm_id, path)
     click.echo(f"Unmounted {path}")
+
+
+# ── Templates ──────────────────────────────────────────────────────────────
+
+@cli.group()
+def templates():
+    """Templates: container images sandboxes boot from (import and delete need an admin)."""
+
+
+@templates.command("list")
+def templates_list():
+    """List templates."""
+    tpls = _volume_call(_daemon_client().list_templates)
+    for t in tpls:
+        image = (t.get("image") or "-").removeprefix("index.docker.io/library/")
+        status = t.get("status", "")
+        click.echo(f"  {t['template_id']:<24} {status:<9} {t.get('tenant') or 'all tenants':<16} {image}")
+        if status in ("failed", "error") and t.get("error"):
+            click.echo(f"  {'':<24} {t['error'].splitlines()[-1]}")
+
+
+@templates.command("import")
+@click.argument("name")
+@click.argument("image")
+@click.option("--disk", "rootfs_size_mb", type=int, default=2048, show_default=True,
+              help="Disk size in MiB; the image must fit, with room for what the VMs write")
+@click.option("--tenant", default=None, help="Only this tenant's VMs may boot it (default: every tenant)")
+@click.option("--registry-user", default=None, help="Log in to a private registry as this user")
+@click.option("--registry-password-stdin", is_flag=True, default=False,
+              help="Read the registry password or token from stdin (otherwise you are prompted)")
+@click.option("--no-wait", is_flag=True, default=False, help="Return once the import has started")
+def templates_import(name, image, rootfs_size_mb, tenant, registry_user, registry_password_stdin, no_wait):
+    """Import a container image as a template: NAME IMAGE, like `python python:3.12-slim`.
+
+    Build and push the image with your usual tooling first. Flint pulls it
+    once, pins the tag to its digest and snapshots it; importing to an
+    existing NAME replaces that template once the new image is ready.
+    """
+    auth = None
+    if registry_user:
+        password = (click.get_text_stream("stdin").read().strip() if registry_password_stdin
+                    else click.prompt("Registry password or token", hide_input=True))
+        auth = {"username": registry_user, "password": password}
+    elif registry_password_stdin:
+        raise click.UsageError("--registry-password-stdin needs --registry-user")
+    client = _daemon_client()
+    started = _volume_call(client.import_template, name, image, rootfs_size_mb=rootfs_size_mb, tenant=tenant,
+                           registry_auth=auth)
+    template_id = started["template_id"]
+    if no_wait:
+        click.echo(f"Importing {image} as {template_id}; check with `flint templates list`")
+        return
+    click.echo(f"Importing {image} as {template_id}...")
+    import time as _time
+    while True:
+        t = _volume_call(client.get_template, template_id)
+        status = (t or {}).get("status")
+        if status == "ready":
+            click.echo(f"Ready: {template_id} ({t.get('digest', '')})")
+            click.echo(f"  Boot it with Sandbox(template_id={template_id!r})")
+            return
+        if status in ("failed", "error"):
+            raise click.ClickException(f"import failed: {t.get('error') or 'see the daemon log'}")
+        _time.sleep(2)
+
+
+@templates.command("delete")
+@click.argument("template_id")
+def templates_delete(template_id):
+    """Delete a template. Sandboxes already running from it keep running."""
+    _volume_call(_daemon_client().delete_template, template_id)
+    click.echo(f"Deleted template {template_id}")

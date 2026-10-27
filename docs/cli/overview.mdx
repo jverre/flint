@@ -30,6 +30,16 @@ The `flint` CLI groups commands under daemon control, backend selection, and age
 
 The CLI talks to the daemon over its Unix socket, so it needs the daemon's user (for example `sudo`) or the `flint` group. Set `FLINT_URL` and `FLINT_API_KEY` to use TCP instead. See [Connecting](/api-reference/overview#connecting).
 
+## Templates
+
+Importing and deleting need an admin (the daemon's socket is one). See [Templates](/sdk/templates).
+
+| Command | Description |
+|---------|-------------|
+| `flint templates list` | List templates, their status and image |
+| `flint templates import <name> <image>` | Import a container image as a template; `--tenant`, `--disk`, `--registry-user` |
+| `flint templates delete <name>` | Delete a template; running sandboxes keep running |
+
 ## Backends
 
 | Command | Description |

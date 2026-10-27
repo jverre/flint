@@ -5,8 +5,8 @@
 - TCP needs an API token, ``Authorization: Bearer flint_<id>_<secret>``
   (``?token=`` on WebSockets). Only a hash of the secret is stored.
   ``admin`` tokens can do everything. ``service`` tokens are for the
-  builder's backend: VMs, volumes and templates, but not daemon config or
-  tokens. A service token pinned to tenants sees only their resources;
+  builder's backend: VMs, volumes and booting templates, but not creating or
+  deleting templates, daemon config or tokens. A service token pinned to tenants sees only their resources;
   others' look like they don't exist.
 - A browser that signed in with SSO (``sso.py``) sends its token in the
   ``flint_session`` cookie instead. Such a request must come from the
@@ -208,6 +208,8 @@ _PUBLIC = re.compile(r"^/(health|ui(/.*)?|auth(/.*)?)?$")
 # server has decoded by now) never makes a path public.
 _DOT_SEGMENT = re.compile(r"(^|/)\.\.?(/|$)")
 _ADMIN_ONLY = re.compile(r"^/(config|v1/tokens|v1/audit)(/.*)?$")
+# Readable by everyone, changed only by an admin: a template is what VMs boot.
+_ADMIN_WRITES = re.compile(r"^/templates(/.*)?$")
 _VM_PATH = re.compile(r"^/vms/([^/]+)(/.*)?$")
 
 
@@ -358,6 +360,8 @@ class AuthMiddleware:
                                      "or create a token with `flint token create`)")
         if _ADMIN_ONLY.match(path) and not principal.is_admin:
             raise AuthError(403, "Admin token required")
+        if _ADMIN_WRITES.match(path) and scope.get("method", "GET") not in ("GET", "HEAD", "OPTIONS") and not principal.is_admin:
+            raise AuthError(403, "Only an admin can import or delete templates")
         m = _VM_PATH.match(path)
         if m and not principal.is_admin and principal.tenants:
             tenant = self._vm_tenant(m.group(1))

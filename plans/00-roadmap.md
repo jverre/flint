@@ -62,8 +62,9 @@ model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
 - Service credential on the daemon; Unix socket by default. *Done (#41):
   trusted socket, admin/service tokens (hashed) on TCP, `flint token`,
   `flint ui`.*
-- `tenant` on every VM, volume and template build. *Done (#41), with
-  tenant-scoped tokens, events and lookups.*
+- `tenant` on every VM and volume; templates are shared or one tenant's.
+  *Done (#41), with tenant-scoped tokens, events and lookups. Templates are
+  now imported by admins only ([04](04-template-import.md)).*
 - No VM↔VM traffic across tenants; VMs can't reach host services or the
   control plane. *Done: every VM is isolated from every other, tested.*
 - Secrets encrypted at rest, write-only, redacted on read. *Done (#40).*
@@ -73,7 +74,7 @@ model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
   *Done.*
 - Per-tenant quotas. *Done on the single daemon (#43).*
 - Written threat model. *Done (#44).*
-- Implemented in the completion pass: disposable VM template builds, native
+- Implemented in the completion pass: disposable VM template imports, native
   nftables, tenant peer-network opt-in, per-VM IO/network ceilings, and
   deletion that retains resources after wipe failures.
 - Cluster policies remain plaintext; that is outside the single-host scope.
@@ -81,7 +82,7 @@ model is [docs/architecture/security.mdx](../docs/architecture/security.mdx).
 **Done when** an end-to-end test with two tenants proves every boundary in the
 threat model, on both Linux backends. The strengthened
 `test_two_tenants_are_isolated` checks peer opt-in/revocation and the contents
-of disk/snapshot inodes after deletion. The template build-and-boot flow now
+of disk/snapshot inodes after deletion. The template import-and-boot flow
 runs in both daemon CI jobs. A skipped run is not completion evidence.
 
 ### Phase 2: one API, many surfaces

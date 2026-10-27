@@ -121,7 +121,7 @@ def test_register_rejects_duplicate_name():
         async def bridge_terminal(self, entry, websocket): raise NotImplementedError
         def check_entry_alive(self, entry): return False, None
         def recover_row(self, row): return "dead", None
-        def build_template(self, name, dockerfile, rootfs_size_mb=500): raise NotImplementedError
+        def import_template(self, name, image, rootfs_size_mb=500, auth=None): raise NotImplementedError
         def delete_template_artifact(self, template_id, template=None): pass
 
     with pytest.raises(ValueError):
