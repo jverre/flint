@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,25 +8,33 @@ import (
 	"strconv"
 )
 
+// fileInfo describes a file in /files/stat and /files/list replies.
+type fileInfo struct {
+	Path  string `json:"path,omitempty"` // stat only
+	Name  string `json:"name,omitempty"` // list only
+	Size  int64  `json:"size"`
+	IsDir bool   `json:"is_dir"`
+	Mode  string `json:"mode"` // permission bits, octal
+}
+
+func newFileInfo(info os.FileInfo) fileInfo {
+	return fileInfo{Size: info.Size(), IsDir: info.IsDir(), Mode: fmt.Sprintf("%04o", info.Mode().Perm())}
+}
+
 func handleFileRead(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if os.IsNotExist(err) {
-			status = http.StatusNotFound
-		}
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+		fsError(w, err)
 		return
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
-		http.Error(w, `{"error":"not a regular file"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "not a regular file")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -39,23 +46,18 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleFileWrite(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
-	modeStr := r.URL.Query().Get("mode")
 	mode := os.FileMode(0644)
-	if modeStr != "" {
-		m, err := strconv.ParseUint(modeStr, 8, 32)
-		if err == nil {
-			mode = os.FileMode(m)
-		}
+	if m, err := strconv.ParseUint(r.URL.Query().Get("mode"), 8, 32); err == nil {
+		mode = os.FileMode(m)
 	}
 	// Streamed to the file: no size limit, and no copy of it in memory.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	_, err = io.Copy(f, r.Body)
@@ -63,108 +65,78 @@ func handleFileWrite(w http.ResponseWriter, r *http.Request) {
 		err = closeErr
 	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"write failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, "write failed: "+err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }
 
 func handleFileStat(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if os.IsNotExist(err) {
-			status = http.StatusNotFound
-		}
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+		fsError(w, err)
 		return
 	}
-	resp := map[string]any{
-		"path":   path,
-		"size":   info.Size(),
-		"is_dir": info.IsDir(),
-		"mode":   fmt.Sprintf("%04o", info.Mode().Perm()),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	resp := newFileInfo(info)
+	resp.Path = path
+	writeJSON(w, resp)
 }
 
 func handleFileList(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if os.IsNotExist(err) {
-			status = http.StatusNotFound
-		}
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), status)
+		fsError(w, err)
 		return
 	}
-	result := make([]map[string]any, 0, len(entries))
+	result := make([]fileInfo, 0, len(entries))
 	for _, e := range entries {
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		result = append(result, map[string]any{
-			"name":   e.Name(),
-			"size":   info.Size(),
-			"is_dir": e.IsDir(),
-			"mode":   fmt.Sprintf("%04o", info.Mode().Perm()),
-		})
+		fi := newFileInfo(info)
+		fi.Name = e.Name()
+		result = append(result, fi)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"entries": result})
+	writeJSON(w, map[string]any{"entries": result})
 }
 
 func handleFileMkdir(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
-	parents := r.URL.Query().Get("parents") == "true"
-	var err error
-	if parents {
-		err = os.MkdirAll(path, 0755)
-	} else {
-		err = os.Mkdir(path, 0755)
+	mkdir := os.Mkdir
+	if r.URL.Query().Get("parents") == "true" {
+		mkdir = os.MkdirAll
 	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+	if err := mkdir(path, 0755); err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }
 
 func handleFileDelete(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
+	path, ok := requirePath(w, r)
+	if !ok {
 		return
 	}
-	recursive := r.URL.Query().Get("recursive") == "true"
-	var err error
-	if recursive {
-		err = os.RemoveAll(path)
-	} else {
-		err = os.Remove(path)
+	remove := os.Remove
+	if r.URL.Query().Get("recursive") == "true" {
+		remove = os.RemoveAll
 	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+	if err := remove(path); err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }

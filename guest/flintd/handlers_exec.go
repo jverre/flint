@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"time"
 )
@@ -16,19 +15,22 @@ type execRequest struct {
 }
 
 type execResponse struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Stdout string `json:"stdout"`
+	Stderr string `json:"stderr"`
+	// ExitCode must stay the last field: when the output is too large to
+	// buffer, the host daemon streams the reply through and finds the exit
+	// code by matching `"exit_code": N}` at its end
+	// (src/flint/daemon/server.py, exec_command).
+	ExitCode int `json:"exit_code"`
 }
 
 func handleExec(w http.ResponseWriter, r *http.Request) {
 	var req execRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if len(req.Cmd) == 0 {
-		http.Error(w, `{"error":"cmd is required"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "cmd is required")
 		return
 	}
 
@@ -37,21 +39,11 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		timeout = 60 * time.Second
 	}
 
-	// Start a non-PTY process with early subscription to avoid missing output
-	h, ch, err := startProcessSubscribed(startProcessRequest{
-		Cmd: req.Cmd,
-		Env: req.Env,
-		Cwd: req.Cwd,
-		Pty: false,
-	})
+	// Subscribe before the process starts, so no output is missed.
+	h, ch, err := startProcessSubscribed(startProcessRequest{Cmd: req.Cmd, Env: req.Env, Cwd: req.Cwd})
 	if err != nil {
 		// Command failed to start (e.g., binary not found) — return as exit_code 127
-		resp := execResponse{
-			Stderr:   err.Error() + "\n",
-			ExitCode: 127,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		writeJSON(w, execResponse{Stderr: err.Error() + "\n", ExitCode: 127})
 		return
 	}
 
@@ -82,18 +74,10 @@ loop:
 				break loop
 			}
 		case <-timer.C:
-			// Timeout — kill the process
-			h.cancel()
-			exitCode = -1
+			h.cancel() // kills the process; exit code stays -1
 			break loop
 		}
 	}
 
-	resp := execResponse{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, execResponse{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode})
 }

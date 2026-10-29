@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,63 +20,46 @@ type unmountRequest struct {
 
 func handleMountNFS(w http.ResponseWriter, r *http.Request) {
 	var req mountNFSRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err.Error()), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Source == "" || req.Target == "" {
-		http.Error(w, `{"error":"source and target are required"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "source and target are required")
 		return
 	}
-
-	// Validate target path to prevent path traversal.
 	if !strings.HasPrefix(req.Target, "/") {
-		http.Error(w, `{"error":"target must be an absolute path"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "target must be an absolute path")
 		return
 	}
-
-	// Create mount point directory.
 	if err := os.MkdirAll(req.Target, 0755); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"mkdir %s: %s"}`, req.Target, err.Error()), http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("mkdir %s: %v", req.Target, err))
 		return
 	}
 
-	// Build mount command.
 	args := []string{"-t", "nfs"}
 	if req.Options != "" {
 		args = append(args, "-o", req.Options)
 	}
 	args = append(args, req.Source, req.Target)
-
-	cmd := exec.Command("mount", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"mount failed: %s: %s"}`, err.Error(), string(output)), http.StatusInternalServerError)
+	if output, err := exec.Command("mount", args...).CombinedOutput(); err != nil {
+		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("mount failed: %v: %s", err, output))
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(fmt.Sprintf(`{"ok":true,"target":"%s"}`, req.Target)))
+	writeJSON(w, map[string]any{"ok": true, "target": req.Target})
 }
 
 func handleUnmountNFS(w http.ResponseWriter, r *http.Request) {
 	var req unmountRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err.Error()), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Target == "" {
-		http.Error(w, `{"error":"target is required"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "target is required")
 		return
 	}
-
-	cmd := exec.Command("umount", req.Target)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"umount failed: %s: %s"}`, err.Error(), string(output)), http.StatusInternalServerError)
+	if output, err := exec.Command("umount", req.Target).CombinedOutput(); err != nil {
+		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("umount failed: %v: %s", err, output))
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }

@@ -1,133 +1,94 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
 	"syscall"
 )
 
 func handleProcessCreate(w http.ResponseWriter, r *http.Request) {
 	var req startProcessRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if len(req.Cmd) == 0 {
-		http.Error(w, `{"error":"cmd is required"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "cmd is required")
 		return
 	}
-
 	h, err := startProcess(req)
 	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]any{"pid": h.pid})
+	// 201: the host's runtime checks for it.
+	writeJSONStatus(w, http.StatusCreated, map[string]int{"pid": h.pid})
 }
 
 func handleProcessList(w http.ResponseWriter, r *http.Request) {
 	procs := pm.list()
-	result := make([]map[string]any, 0, len(procs))
+	result := make([]processInfo, 0, len(procs))
 	for _, h := range procs {
-		result = append(result, h.toJSON())
+		result = append(result, h.info())
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"processes": result})
+	writeJSON(w, map[string]any{"processes": result})
 }
 
 func handleProcessGet(w http.ResponseWriter, r *http.Request) {
-	pid, err := strconv.Atoi(r.PathValue("pid"))
-	if err != nil {
-		http.Error(w, `{"error":"invalid pid"}`, http.StatusBadRequest)
-		return
+	if h, ok := requestProcess(w, r); ok {
+		writeJSON(w, h.info())
 	}
-	h, err := requireProcess(pid)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(h.toJSON())
 }
 
 func handleProcessInput(w http.ResponseWriter, r *http.Request) {
-	pid, err := strconv.Atoi(r.PathValue("pid"))
-	if err != nil {
-		http.Error(w, `{"error":"invalid pid"}`, http.StatusBadRequest)
-		return
-	}
-	h, err := requireProcess(pid)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+	h, ok := requestProcess(w, r)
+	if !ok {
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB max
 	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+		jsonError(w, http.StatusBadRequest, "read body failed")
 		return
 	}
 	if err := h.writeInput(data); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }
 
 func handleProcessSignal(w http.ResponseWriter, r *http.Request) {
-	pid, err := strconv.Atoi(r.PathValue("pid"))
-	if err != nil {
-		http.Error(w, `{"error":"invalid pid"}`, http.StatusBadRequest)
-		return
-	}
-	h, err := requireProcess(pid)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+	h, ok := requestProcess(w, r)
+	if !ok {
 		return
 	}
 	var body struct {
 		Signal int `json:"signal"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	if err := h.sendSignal(syscall.Signal(body.Signal)); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }
 
 func handleProcessResize(w http.ResponseWriter, r *http.Request) {
-	pid, err := strconv.Atoi(r.PathValue("pid"))
-	if err != nil {
-		http.Error(w, `{"error":"invalid pid"}`, http.StatusBadRequest)
-		return
-	}
-	h, err := requireProcess(pid)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+	h, ok := requestProcess(w, r)
+	if !ok {
 		return
 	}
 	var body struct {
 		Cols uint16 `json:"cols"`
 		Rows uint16 `json:"rows"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	if err := h.resize(body.Cols, body.Rows); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeOK(w)
 }
