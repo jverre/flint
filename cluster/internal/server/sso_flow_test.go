@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/jverre/flint/cluster/internal/auth"
+	"github.com/jverre/flint/cluster/internal/httpx"
+	"github.com/jverre/flint/cluster/internal/sso"
 	"golang.org/x/oauth2"
 )
 
@@ -41,16 +44,16 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 	f.Server = httptest.NewServer(mux)
 	t.Cleanup(f.Close)
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"issuer": f.URL, "authorization_endpoint": f.URL + "/authorize",
+		httpx.WriteJSON(w, 200, map[string]any{"issuer": f.URL, "authorization_endpoint": f.URL + "/authorize",
 			"token_endpoint": f.URL + "/token", "jwks_uri": f.URL + "/jwks", "response_types_supported": []string{"code"},
 			"subject_types_supported": []string{"public"}, "id_token_signing_alg_values_supported": []string{"RS256"}})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
+		httpx.WriteJSON(w, 200, jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
 	})
 	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		code := randomString()
+		code := oauth2.GenerateVerifier()
 		f.mu.Lock()
 		f.codes[code] = q
 		f.mu.Unlock()
@@ -64,7 +67,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		f.mu.Unlock()
 		if q == nil || q.Get("code_challenge_method") != "S256" ||
 			q.Get("code_challenge") != oauth2.S256ChallengeFromVerifier(r.Form.Get("code_verifier")) {
-			writeJSON(w, 400, map[string]any{"error": "invalid_grant"})
+			httpx.WriteJSON(w, 400, map[string]any{"error": "invalid_grant"})
 			return
 		}
 		claims := map[string]any{"iss": f.URL, "aud": q.Get("client_id"), "sub": q.Get("login"), "nonce": q.Get("nonce"),
@@ -77,7 +80,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		payload, _ := json.Marshal(claims)
 		jws, _ := signer.Sign(payload)
 		idToken, _ := jws.CompactSerialize()
-		writeJSON(w, 200, map[string]any{"access_token": "at", "token_type": "Bearer", "expires_in": 3600, "id_token": idToken})
+		httpx.WriteJSON(w, 200, map[string]any{"access_token": "at", "token_type": "Bearer", "expires_in": 3600, "id_token": idToken})
 	})
 	return f
 }
@@ -96,9 +99,11 @@ func ssoReplicas(t *testing.T, idp *fakeIdP) []*Server {
 	os.WriteFile(path, data, 0o600)
 	rs := replicas(t, 2)
 	for _, s := range rs {
-		if err := s.loadSSO(context.Background(), path); err != nil {
+		svc, err := sso.New(context.Background(), path, s.store, s.auth)
+		if err != nil {
 			t.Fatal(err)
 		}
+		s.sso = svc
 	}
 	return rs
 }
@@ -134,7 +139,7 @@ func signIn(t *testing.T, a, b *Server, login, query string) *httptest.ResponseR
 
 func session(t *testing.T, w *httptest.ResponseRecorder) []*http.Cookie {
 	for _, c := range w.Result().Cookies() {
-		if c.Name == sessionCookie && c.Value != "" {
+		if c.Name == auth.SessionCookie && c.Value != "" {
 			if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
 				t.Errorf("session cookie must be HttpOnly and SameSite=Lax: %+v", c)
 			}
@@ -195,7 +200,7 @@ func TestSSOSessionRefusesOtherOrigins(t *testing.T) {
 	if w := do(rs[0], "POST", "/auth/logout", s, map[string]string{"Origin": "http://flint.test"}, ""); w.Code != 200 {
 		t.Fatalf("logout: %d", w.Code)
 	}
-	tokenCache.Range(func(k, _ any) bool { tokenCache.Delete(k); return true }) // another replica's cache expires
+	rs[1].auth.ForgetCached() // another replica's cache expires
 	if w := do(rs[1], "GET", "/auth/me", s, nil, ""); w.Code != 401 {
 		t.Fatalf("session still works after logout: %d", w.Code)
 	}
@@ -251,28 +256,5 @@ func TestSSOForgedOrStaleLoginIsRefused(t *testing.T) {
 	}
 	if w := signIn(t, rs[0], rs[0], "admin", "?next=//evil.example/x"); w.Header().Get("Location") != "/ui/" {
 		t.Fatalf("redirected off-site: %s", w.Header().Get("Location"))
-	}
-}
-
-func TestSSOConfigChecks(t *testing.T) {
-	base := `"providers":[{"id":"g","type":"google","client_id":"c","client_secret":"s"}]`
-	for bad, why := range map[string]string{
-		`{"public_url":"https://f",` + base + `,"rules":[{"kind":"admin"}]}`:                                                                              "matches everyone",
-		`{"public_url":"https://f",` + base + `,"rules":[{"email":"a@b","kind":"admin","tenants":["x"]}]}`:                                                "only service rules",
-		`{"public_url":"https://f",` + base + `,"rules":[]}`:                                                                                              "nobody could sign in",
-		`{` + base + `,"rules":[{"email":"a@b","kind":"admin"}]}`:                                                                                         "public_url",
-		`{"public_url":"https://f","providers":[{"id":"a","type":"auth0","client_id":"c","client_secret":"s"}],"rules":[{"email":"a@b","kind":"admin"}]}`: "needs \"domain\"",
-		`{"public_url":"https://f",` + base + `,"rules":[{"emial":"a@b","kind":"admin"}]}`:                                                                "unknown field",
-	} {
-		if _, err := parseSSOConfig([]byte(bad)); err == nil || !strings.Contains(err.Error(), why) {
-			t.Errorf("%s: got %v, want %q", bad, err, why)
-		}
-	}
-	rules := []ssoRule{{Kind: "admin", GithubTeam: "acme/platform"}, {Kind: "service", EmailDomain: "acme.com", Tenants: []string{"acme"}}}
-	if r := matchRule(rules, identity{Provider: "github", GithubTeams: []string{"Acme/Platform"}}); r == nil || r.Kind != "admin" {
-		t.Error("team rule")
-	}
-	if r := matchRule(rules, identity{Email: "x@acme.com.evil.io", EmailVerified: true}); r != nil {
-		t.Error("lookalike domain matched")
 	}
 }
