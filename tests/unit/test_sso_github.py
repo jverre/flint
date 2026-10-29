@@ -79,12 +79,18 @@ def flint(tmp_path):
                   {"github_org": "acme", "kind": "service", "tenants": ["acme"]}],
     })
 
-    class _Daemon:
-        cluster = None
-        manager = None
+    class _Services:
+        cluster_mode = False
+        eventlog = None
         tokens = TokenStore(str(tmp_path / "flint.db"))
 
-    srv.app.state.daemon, srv.app.state.sso = _Daemon(), sso.SSO(config)
+        def start(self, loop):
+            pass
+
+        def get_vm(self, vm_id):
+            return None
+
+    srv.app.state.services, srv.app.state.sso = _Services(), sso.SSO(config)
     if not any(m.cls is SessionMiddleware for m in srv.app.user_middleware):
         srv.app.add_middleware(SessionMiddleware, secret_key="test", session_cookie=sso.LOGIN_COOKIE)
     yield srv.app

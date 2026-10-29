@@ -26,9 +26,7 @@ def _prepare_api_state(daemon, directory: Path, uid: int, gid: int) -> None:
         temporary.unlink(missing_ok=True)
         with sqlite3.connect(temporary) as target:
             target.executescript(_SCHEMA)
-            rows = daemon.tokens._conn.execute(
-                "SELECT id, kind, secret_hash, tenants, name, created_at, expires_at, identity FROM api_tokens"
-            ).fetchall()
+            rows = daemon.tokens.export_rows()
             target.executemany("INSERT INTO api_tokens VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         temporary.chmod(0o600)
         os.chown(temporary, uid, gid)
@@ -73,11 +71,11 @@ def _prepare_api_state(daemon, directory: Path, uid: int, gid: int) -> None:
 def serve(daemon) -> None:
     if os.geteuid() != 0:
         raise RuntimeError("The Linux runtime needs root; its public API runs under a separate unprivileged identity")
-    from .server import _listen_unix, _listen_tcp
+    from .listeners import listen_tcp, listen_unix
     uid, gid = identity("service:api:" + config._DATA_KEY)
     api_directory = Path(config.STATE_DIR) / "api"
     _prepare_api_state(daemon, api_directory, uid, gid)
-    sockets = [_listen_unix(config.DAEMON_SOCKET), _listen_tcp(config.DAEMON_HOST, config.DAEMON_PORT)]
+    sockets = [listen_unix(config.DAEMON_SOCKET), listen_tcp(config.DAEMON_HOST, config.DAEMON_PORT)]
     path = os.path.join(config.STATE_DIR, "runtime.sock")
     # The public listener already excludes another active daemon.
     if os.path.lexists(path):
@@ -90,7 +88,7 @@ def serve(daemon) -> None:
     def metrics():
         while not stop_metrics.wait(1):
             try:
-                daemon.metrics._sample_all()
+                daemon.metrics.sample()
             except Exception:
                 config.log.exception("Runtime metrics sampling failed")
     threading.Thread(target=metrics, daemon=True, name="runtime-metrics").start()
@@ -108,7 +106,7 @@ def serve(daemon) -> None:
         process = subprocess.Popen(parser_command(uid, gid, readonly=readonly,
             writable={str(api_directory): "/api"}, command=command),
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, start_new_session=True)
-        daemon._api_process = process
+        daemon.api_process = process
         config.log.info("Public API supervisor pid=%d; parser uid=%d; privileged runtime pid=%d", process.pid, uid, os.getpid())
         code = process.wait()
         if code:

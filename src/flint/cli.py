@@ -19,7 +19,7 @@ def start(port, data_dir, state_dir, backend):
     """Start the Flint manager daemon."""
     _set_daemon_env(port, data_dir, state_dir, backend)
     _check_backend(backend)
-    from flint.daemon.server import FlintDaemon
+    from flint.daemon.lifecycle import FlintDaemon
     FlintDaemon().run()
 
 
@@ -138,7 +138,7 @@ def agent(token, advertise, listen, port, snapd_port, name, zone, labels, data_d
         if result.returncode != 0:
             raise click.ClickException(f"join failed: {result.stderr.strip() or result.stdout.strip()}")
         click.echo(f"Joined the cluster as {result.stdout.strip()}", err=True)
-    from flint.daemon.server import FlintDaemon
+    from flint.daemon.lifecycle import FlintDaemon
     FlintDaemon().run()
 
 

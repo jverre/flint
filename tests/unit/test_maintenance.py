@@ -205,9 +205,7 @@ def test_starting_migration_receiver_is_fenced_before_running():
     entry = SimpleNamespace(
         vm_id=VM, pid=123, state=SandboxState.STARTING, availability="restartable"
     )
-    agent.daemon = SimpleNamespace(
-        manager=SimpleNamespace(_lock=threading.Lock(), _sandboxes={VM: entry})
-    )
+    agent.daemon = SimpleNamespace(manager=SimpleNamespace(entries=lambda: [entry]))
     agent._fence_lock = threading.Lock()
     agent._lease_deadline = time.monotonic() + 10
     agent.snapd = SimpleNamespace(fence=lambda ttl, vms: recorded.append((ttl, vms)))
