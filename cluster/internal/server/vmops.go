@@ -119,13 +119,15 @@ func (s *Server) placeAndCreate(ctx context.Context, v *VM, req placeReq, snap *
 			if len(cr.Snapshot.Peers) == 0 {
 				cr.Snapshot.Peers = s.peersFor(ctx, snap.ID, h.ID)
 			}
-		} else if v.TemplateID != "default" && !hostHasTemplate(h, v.TemplateID) {
-			ts, err := s.templateSnapshotFor(ctx, v.TemplateID, h.HostClass)
-			if err != nil {
+		} else if v.TemplateID != "default" {
+			// Always name the current snapshot: a host holding an older import
+			// of this template replaces it rather than booting the stale copy.
+			if ts, err := s.templateSnapshotFor(ctx, v.TemplateID, h.HostClass); err == nil {
+				cr.TemplateSnapshot = &snapshotRef{ID: ts.ID, Peers: s.peersFor(ctx, ts.ID, h.ID)}
+			} else if !hostHasTemplate(h, v.TemplateID) {
 				errs = append(errs, h.Name+": "+err.Error())
 				continue
 			}
-			cr.TemplateSnapshot = &snapshotRef{ID: ts.ID, Peers: s.peersFor(ctx, ts.ID, h.ID)}
 		}
 		info, err := s.createOnHost(ctx, h, cr)
 		if err != nil {

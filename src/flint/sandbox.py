@@ -231,10 +231,6 @@ class Sandbox:
 
     # ── New high-level methods ──────────────────────────────────────────────
 
-    def run_command(self, cmd: str, timeout: float = 60) -> CommandResult:
-        """Run a shell command. Returns structured result."""
-        return self._commands.run(cmd, timeout=timeout)
-
     def run_code(self, code: str, runtime: str | None = None, timeout: float = 60) -> CommandResult:
         """Execute code with auto-detected runtime (python/node)."""
         resp = _get_client().run_code(self._id, code, runtime=runtime, timeout=timeout)

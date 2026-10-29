@@ -314,15 +314,18 @@ func (s *Server) reconcileReportedVM(ctx context.Context, h *Host, v *VM, hv hos
 	}
 }
 
-// syncTemplates records template snapshots hosts publish and finishes builds.
+// syncTemplates finishes imports: the import host's published snapshot
+// becomes the template's only one, so every other host refetches it.
 func (s *Server) syncTemplates(ctx context.Context, h *Host, ts []HostTemplate) {
 	for _, t := range ts {
 		if t.ID == "default" {
 			continue
 		}
 		tmpl, err := s.getTemplate(ctx, t.ID)
-		if err != nil {
-			continue // a template only this host knows (built before it joined)
+		if err != nil || tmpl.BuildHost != h.ID {
+			// Unknown here (imported before the host joined), or a copy this
+			// host restored: only the import host publishes a template.
+			continue
 		}
 		if t.SnapshotID != "" {
 			if _, err := s.getSnapshot(ctx, t.SnapshotID); isNotFound(err) {
@@ -330,7 +333,11 @@ func (s *Server) syncTemplates(ctx context.Context, h *Host, ts []HostTemplate) 
 					Backend: h.Backend, HostClass: h.HostClass, SourceHost: h.ID, Uploaded: true})
 			}
 		}
-		if tmpl.BuildHost == h.ID && tmpl.Status == "building" && (t.Status == "ready" && t.SnapshotID != "" || t.Status == "error") {
+		if tmpl.Status == "building" && (t.Status == "ready" && t.SnapshotID != "" || t.Status == "error") {
+			if t.Status == "ready" {
+				s.db.Exec(ctx, `DELETE FROM snapshots WHERE kind = 'template' AND template_id = ? AND id <> ?`, t.ID, t.SnapshotID)
+				s.db.Exec(ctx, `UPDATE templates SET image = ?, digest = ? WHERE id = ?`, t.Image, t.Digest, t.ID)
+			}
 			s.db.Exec(ctx, `UPDATE templates SET status = ?, error = ?, updated_at = ? WHERE id = ?`, t.Status, t.Error, nowMs(), t.ID)
 			s.emit(ctx, "template."+t.Status, tmpl.Tenant, "", h.ID, map[string]any{"template_id": t.ID})
 		}
@@ -388,7 +395,7 @@ func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Hos
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// handleHostSnapshot registers a snapshot a host made on its own (a template build).
+// handleHostSnapshot registers a snapshot a host made on its own (a template import).
 func (s *Server) handleHostSnapshot(w http.ResponseWriter, r *http.Request, h *Host) {
 	var sn Snapshot
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&sn); err != nil || sn.ID == "" || sn.Kind != "template" {

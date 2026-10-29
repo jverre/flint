@@ -402,20 +402,35 @@ def test_credentials_and_tenants_are_isolated(cluster, hosts, make_vm):
 
 
 @pytest.mark.slow
-def test_template_built_on_one_host_boots_on_another(cluster, hosts, make_vm):
-    from flint.core._template_build import _generate_dockerfile  # what the SDK's Template sends
+def test_template_imported_on_one_host_boots_on_another(cluster, hosts, make_vm):
+    name = "cluster-e2e-tpl"
 
-    dockerfile = _generate_dockerfile("alpine:3.20", [{"type": "run", "cmd": "echo built-in-template > /etc/tpl-marker"}])
-    r = cluster.api.post("/templates/build", json={"name": "cluster-e2e-tpl", "tenant": TENANT, "dockerfile": dockerfile})
-    assert r.status_code == 200, r.text
-    tid, builder = r.json()["template_id"], r.json()["build_host"]
+    def import_image(image: str) -> tuple[str, dict]:
+        r = cluster.api.post("/templates", json={"name": name, "tenant": TENANT, "image": image, "rootfs_size_mb": 1024})
+        assert r.status_code == 200, r.text
+        tid, importer = r.json()["template_id"], r.json()["build_host"]
+        get = lambda: cluster.api.get(f"/templates/{tid}").json()["template"]
+        wait_for(lambda: get()["status"] in ("ready", "error"), 900, "the template import")
+        t = get()
+        assert t["status"] == "ready", f"template import failed: {t.get('error')}\n{cluster.diagnostics()}"
+        return importer, t
+
     try:
-        status = lambda: cluster.api.get(f"/templates/{tid}").json()["template"]["status"]
-        wait_for(lambda: status() in ("ready", "error"), 900, "the template build")
-        assert status() == "ready", f"template build failed\n{cluster.diagnostics()}"
-        other = next(n for n, h in hosts.items() if h.host_id != builder)
-        vm = make_vm(on=other, template_id=tid)
+        importer, first = import_image("public.ecr.aws/docker/library/alpine:3.20")
+        other = next(n for n, h in hosts.items() if h.host_id != importer)
+        vm = make_vm(on=other, template_id=first["template_id"])
         assert host_of(cluster, vm) == other
-        assert vm.read_file("/etc/tpl-marker") == b"built-in-template\n"
+        assert vm.commands.run("command -v python3").exit_code != 0
+        # Re-import on the same host while `other` keeps its copy of the first
+        # image: its next VM must boot the new image, not the stale copy.
+        cluster.api.post(f"/v1/hosts/{hosts[other].host_id}/cordon")
+        try:
+            importer2, second = import_image("public.ecr.aws/docker/library/python:3.12-alpine")
+        finally:
+            cluster.api.post(f"/v1/hosts/{hosts[other].host_id}/uncordon")
+        assert importer2 == importer and second["digest"] != first["digest"], (first, second)
+        vm = make_vm(on=other, template_id=second["template_id"])
+        r = vm.commands.run("python3 --version")
+        assert r.exit_code == 0 and "3.12" in r.stdout, f"{r}\n{cluster.diagnostics()}"
     finally:
-        cluster.api.delete(f"/templates/{tid}")
+        cluster.api.delete(f"/templates/{name}")

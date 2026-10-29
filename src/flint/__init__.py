@@ -1,4 +1,4 @@
-__all__ = ["Sandbox", "CommandResult", "Template", "TemplateInfo", "Volume", "Agent", "configure", "main"]
+__all__ = ["Sandbox", "CommandResult", "Template", "Volume", "configure", "main"]
 
 # Imported on first use, so `flint start`/`flint agent` can set FLINT_* before
 # flint.core.config reads them (the CLI is imported through this package).
@@ -6,9 +6,7 @@ _EXPORTS = {
     "Sandbox": "flint.sandbox",
     "CommandResult": "flint.sandbox",
     "Template": "flint.template",
-    "TemplateInfo": "flint.template",
     "Volume": "flint.volume",
-    "Agent": "flint.agents",
     "configure": "flint.sandbox",
 }
 

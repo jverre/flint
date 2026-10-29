@@ -1,4 +1,4 @@
-"""Templates screen — merges daemon-built templates with the agents catalog."""
+"""Templates screen — templates built by the daemon."""
 
 from __future__ import annotations
 
@@ -7,12 +7,6 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Static
-
-from flint.agents.catalog import list_agents
-
-
-def _is_agent_row(row_key: str | None) -> bool:
-    return bool(row_key) and row_key.startswith("agent:")
 
 
 class InspectModal(ModalScreen[None]):
@@ -87,10 +81,8 @@ class TemplatesScreen(Screen):
 
         # Built templates (daemon side).
         templates = self.app.state.templates or []
-        built_names: set[str] = set()
         for t in templates:
             name = t.get("template_id") or t.get("name") or "-"
-            built_names.add(name)
             # Status derived from any artifact's status.
             artifacts = t.get("artifacts") or {}
             status = "ready"
@@ -104,18 +96,6 @@ class TemplatesScreen(Screen):
                 status,
                 (t.get("description") or "")[:60],
                 key=f"template:{name}",
-            )
-
-        # Agent catalog.
-        for agent in list_agents():
-            tag = "agent (built)" if agent.name in built_names else "agent"
-            status = "buildable" if agent.name not in built_names else "ready"
-            tbl.add_row(
-                agent.name,
-                tag,
-                status,
-                agent.description[:60],
-                key=f"agent:{agent.name}",
             )
 
     def action_refresh(self) -> None:
@@ -132,12 +112,8 @@ class TemplatesScreen(Screen):
         key = self._current_row_key()
         if not key:
             return
-        if key.startswith("template:"):
-            template_id = key.split(":", 1)[1]
-            self.run_worker(lambda: self._launch_template(template_id), thread=True, exclusive=False)
-        elif key.startswith("agent:"):
-            agent_name = key.split(":", 1)[1]
-            self.run_worker(lambda: self._launch_agent(agent_name), thread=True, exclusive=False)
+        template_id = key.split(":", 1)[1]
+        self.run_worker(lambda: self._launch_template(template_id), thread=True, exclusive=False)
 
     def _launch_template(self, template_id: str) -> None:
         self.app.call_from_thread(self.app.notify, f"Launching {template_id}…")
@@ -151,58 +127,25 @@ class TemplatesScreen(Screen):
                 self.app.notify, f"Launch failed: {e}", severity="error"
             )
 
-    def _launch_agent(self, agent_name: str) -> None:
-        self.app.call_from_thread(
-            self.app.notify,
-            f"Deploying {agent_name} (builds template if missing — may take minutes)…",
-        )
-        try:
-            from flint.agents.agent import Agent
-            agent = Agent.deploy(agent_name)
-            self.app.call_from_thread(
-                self.app.notify, f"Agent {agent_name} started in {agent.sandbox.id[:8]}"
-            )
-        except Exception as e:
-            self.app.call_from_thread(
-                self.app.notify, f"Deploy failed: {e}", severity="error"
-            )
-
     def action_inspect(self) -> None:
         key = self._current_row_key()
         if not key:
             return
-        if key.startswith("template:"):
-            template_id = key.split(":", 1)[1]
-            t = next(
-                (t for t in (self.app.state.templates or []) if (t.get("template_id") or t.get("name")) == template_id),
-                None,
-            )
-            if t is None:
-                return
-            artifacts = t.get("artifacts") or {}
-            body = [
-                f"[dim]template_id[/]  {template_id}",
-                f"[dim]name[/]         {t.get('name', '-')}",
-                f"[dim]description[/]  {t.get('description', '-')}",
-                "",
-                "[dim]artifacts[/]",
-            ]
-            for backend, a in artifacts.items():
-                body.append(f"  {backend}: {a.get('status', '-')} @ {a.get('template_dir', '-')}")
-            self.app.push_screen(InspectModal(template_id, "\n".join(body)))
-        else:
-            agent_name = key.split(":", 1)[1]
-            agent = next((a for a in list_agents() if a.name == agent_name), None)
-            if agent is None:
-                return
-            body = "\n".join([
-                f"[dim]name[/]         {agent.name}",
-                f"[dim]version[/]      {agent.version}",
-                f"[dim]description[/]  {agent.description}",
-                f"[dim]homepage[/]     {agent.homepage}",
-                f"[dim]license[/]      {agent.license}",
-                f"[dim]rootfs_size[/]  {agent.rootfs_size_mb} MiB",
-                f"[dim]tags[/]         {', '.join(agent.tags)}",
-                f"[dim]image[/]        {agent.docker_image}",
-            ])
-            self.app.push_screen(InspectModal(agent.name, body))
+        template_id = key.split(":", 1)[1]
+        t = next(
+            (t for t in (self.app.state.templates or []) if (t.get("template_id") or t.get("name")) == template_id),
+            None,
+        )
+        if t is None:
+            return
+        artifacts = t.get("artifacts") or {}
+        body = [
+            f"[dim]template_id[/]  {template_id}",
+            f"[dim]name[/]         {t.get('name', '-')}",
+            f"[dim]description[/]  {t.get('description', '-')}",
+            "",
+            "[dim]artifacts[/]",
+        ]
+        for backend, a in artifacts.items():
+            body.append(f"  {backend}: {a.get('status', '-')} @ {a.get('template_dir', '-')}")
+        self.app.push_screen(InspectModal(template_id, "\n".join(body)))

@@ -447,6 +447,10 @@ class ClusterAgent:
             status = art.get("status")
             status = "error" if status == "failed" else status
             rep = {"id": t["template_id"], "status": status}
+            if t.get("digest"):
+                rep["image"], rep["digest"] = t.get("image", ""), t["digest"]
+            if status == "error" and t.get("error"):
+                rep["error"] = t["error"][-1024:]
             pub = self._templates.get(t["template_id"])
             if pub and status == "ready":
                 rep["snapshot_id"] = pub
@@ -472,14 +476,28 @@ class ClusterAgent:
                 self._save_json(self._templates_path, self._templates)
 
     def ensure_template(self, template_id: str, ref: dict) -> None:
-        """Install a template built on another host from its snapshot."""
-        from flint.core._template_registry import register_template_artifact, template_snapshot_exists
+        """Install the template's current snapshot, unless this host already has it.
+
+        ``ref`` is the snapshot the control plane says is current. A copy from an
+        older import is replaced, so a re-imported template boots everywhere.
+        """
+        from flint.core._template_registry import get_template, register_template_artifact, template_snapshot_exists
 
         kind = self.daemon.backend.kind
-        if template_snapshot_exists(template_id, backend_kind=kind):
+
+        def current() -> bool:
+            if not template_snapshot_exists(template_id, backend_kind=kind):
+                return False
+            if self._templates.get(template_id) == ref["id"]:
+                return True
+            # Importing here right now: keep booting the local template until
+            # the new one is published.
+            return (get_template(template_id) or {}).get("status") == "building"
+
+        if current():
             return
-        with self._lock:  # one import per template at a time
-            if template_snapshot_exists(template_id, backend_kind=kind):
+        with self._lock:  # one install per template at a time
+            if current():
                 return
             dest = os.path.join(config.TEMPLATES_DIR, template_id)
             staging = os.path.join(config.TEMPLATES_DIR, f".import-{template_id}-{uuid.uuid4().hex[:8]}")

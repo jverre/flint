@@ -52,7 +52,6 @@
             "group": "Python SDK",
             "pages": [
               "sdk/sandbox",
-              "sdk/agents",
               "sdk/commands",
               "sdk/pty",
               "sdk/templates",
@@ -70,7 +69,6 @@
               "cli/overview",
               "cli/start",
               "cli/backends",
-              "cli/agents",
               "cli/app",
               "cli/list",
               "cli/stop"

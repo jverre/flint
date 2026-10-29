@@ -1,151 +1,80 @@
-"""Public Template API for Flint — E2B-style builder interface."""
+"""Public Template API for Flint: container images that sandboxes boot from."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 
-from flint._client.client import DaemonClient
-from flint.core.config import DAEMON_URL
+from flint.sandbox import _get_client
 
 
-@dataclass
-class TemplateInfo:
+@dataclass(frozen=True)
+class Template:
+    """A root disk and golden snapshot made from a container image.
+
+    Build and push the image with your usual tooling, then import it once (an
+    admin token is required). Every sandbox created from it boots in
+    milliseconds::
+
+        from flint import Sandbox, Template
+
+        t = Template.import_image("python", "python:3.12-slim")
+        sandbox = Sandbox(template_id=t.template_id)
+
+    Flint pins the tag to the digest it pulled (``t.digest``), so a template
+    never changes when the tag moves; import again to update it. Without
+    ``tenant`` every tenant can boot the template; with one, only that tenant.
+    """
+
     template_id: str
     name: str
     status: str
+    tenant: str = ""
+    image: str | None = None
+    digest: str | None = None
+    error: str | None = None
 
+    @classmethod
+    def import_image(cls, name: str, image: str, *, rootfs_size_mb: int = 2048, tenant: str | None = None,
+                     registry_auth: dict | None = None, timeout: float = 1200.0,
+                     poll_interval: float = 2.0) -> Template:
+        """Import ``image`` as template ``name`` and wait until it is ready.
 
-def _get_client() -> DaemonClient:
-    from flint.sandbox import _get_client as _shared
-    return _shared()
-
-
-class Template:
-    """Fluent builder for custom sandbox templates.
-
-    Usage::
-
-        template = (
-            Template("python-data-science")
-            .from_ubuntu_image("22.04")
-            .apt_install("python3", "python3-pip")
-            .pip_install("numpy", "pandas")
-            .set_workdir("/workspace")
-            .build()
-        )
-
-        sandbox = Sandbox(template_id=template.template_id)
-    """
-
-    def __init__(self, name: str, rootfs_size_mb: int = 500) -> None:
-        self._name = name
-        self._rootfs_size_mb = rootfs_size_mb
-        self._base_image: str | None = None
-        self._steps: list[dict] = []
-        self._dockerfile: str | None = None
-
-    # ── Base image methods ──────────────────────────────────────────────────
-
-    def from_ubuntu_image(self, tag: str = "22.04") -> Template:
-        self._base_image = f"ubuntu:{tag}"
-        return self
-
-    def from_python_image(self, tag: str = "3.11-slim") -> Template:
-        self._base_image = f"python:{tag}"
-        return self
-
-    def from_node_image(self, tag: str = "20-slim") -> Template:
-        self._base_image = f"node:{tag}"
-        return self
-
-    def from_alpine_image(self, tag: str = "3.19") -> Template:
-        self._base_image = f"alpine:{tag}"
-        return self
-
-    def from_image(self, image: str) -> Template:
-        self._base_image = image
-        return self
-
-    def from_dockerfile(self, dockerfile: str) -> Template:
-        self._dockerfile = dockerfile
-        return self
-
-    # ── Operation methods ───────────────────────────────────────────────────
-
-    def apt_install(self, *packages: str) -> Template:
-        self._steps.append({"type": "apt_install", "packages": list(packages)})
-        return self
-
-    def pip_install(self, *packages: str) -> Template:
-        self._steps.append({"type": "pip_install", "packages": list(packages)})
-        return self
-
-    def npm_install(self, *packages: str) -> Template:
-        self._steps.append({"type": "npm_install", "packages": list(packages)})
-        return self
-
-    def run_cmd(self, cmd: str) -> Template:
-        self._steps.append({"type": "run", "cmd": cmd})
-        return self
-
-    def copy(self, src: str, dest: str) -> Template:
-        self._steps.append({"type": "copy", "src": src, "dest": dest})
-        return self
-
-    def set_workdir(self, path: str) -> Template:
-        self._steps.append({"type": "workdir", "path": path})
-        return self
-
-    def set_envs(self, **envs: str) -> Template:
-        self._steps.append({"type": "env", "envs": envs})
-        return self
-
-    def git_clone(self, repo: str, dest: str = "") -> Template:
-        self._steps.append({"type": "git_clone", "repo": repo, "dest": dest})
-        return self
-
-    # ── Build ───────────────────────────────────────────────────────────────
-
-    def _to_dockerfile(self) -> str:
-        if self._dockerfile is not None:
-            return self._dockerfile
-        if self._base_image is None:
-            raise ValueError("No base image set. Call from_ubuntu_image(), from_image(), etc. first.")
-        from flint.core._template_build import _generate_dockerfile
-        return _generate_dockerfile(self._base_image, self._steps)
-
-    def build(self, poll_interval: float = 2.0, timeout: float = 1200.0) -> TemplateInfo:
-        """Build the template via the daemon. Blocks until complete."""
-        dockerfile = self._to_dockerfile()
-        client = _get_client()  # shared: don't close it
-        result = client.build_template(
-            name=self._name,
-            dockerfile=dockerfile,
-            rootfs_size_mb=self._rootfs_size_mb,
-        )
-        template_id = result["template_id"]
-
-        # Poll until build completes.  The build runs in a background
-        # thread on the daemon — the template may not appear in the
-        # registry for a short window after the POST returns, so treat
-        # None as "not yet registered" rather than an error.
-        start = time.monotonic()
+        ``registry_auth`` (``{"username": ..., "password": ...}``) is for private
+        registries; Flint uses it for this pull only and never stores it.
+        ``rootfs_size_mb`` is the template's disk; the image must fit in it.
+        """
+        client = _get_client()
+        template_id = client.import_template(name, image, rootfs_size_mb=rootfs_size_mb, tenant=tenant,
+                                             registry_auth=registry_auth)["template_id"]
+        deadline = time.monotonic() + timeout
         while True:
-            elapsed = time.monotonic() - start
-            if elapsed > timeout:
-                raise RuntimeError(
-                    f"Template {template_id} build timed out after {timeout}s"
-                )
+            # The import runs in the background; the template may take a
+            # moment to appear, so None means "not registered yet".
             info = client.get_template(template_id)
             if info is not None:
-                status = info.get("status", "unknown")
-                if status == "ready":
-                    return TemplateInfo(
-                        template_id=template_id,
-                        name=self._name,
-                        status="ready",
-                    )
-                if status in ("failed", "error"):  # a daemon says failed, a cluster error
-                    raise RuntimeError(f"Template build failed: {template_id}: {info.get('error') or 'see daemon log'}")
+                if info.get("status") == "ready":
+                    return cls._from(info)
+                if info.get("status") in ("failed", "error"):  # a daemon says failed, a cluster error
+                    raise RuntimeError(f"Importing template {template_id} failed: {info.get('error') or 'see the daemon log'}")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Importing template {template_id} took longer than {timeout:.0f}s")
             time.sleep(poll_interval)
+
+    @classmethod
+    def get(cls, template_id: str) -> Template | None:
+        info = _get_client().get_template(template_id)
+        return cls._from(info) if info is not None else None
+
+    @classmethod
+    def list(cls) -> list[Template]:
+        return [cls._from(t) for t in _get_client().list_templates()]
+
+    def delete(self) -> None:
+        """Delete the template. Running sandboxes keep working (admin only)."""
+        _get_client().delete_template(self.template_id)
+
+    @classmethod
+    def _from(cls, d: dict) -> Template:
+        return cls(template_id=d["template_id"], name=d.get("name", d["template_id"]), status=d.get("status", ""),
+                   tenant=d.get("tenant") or "", image=d.get("image"), digest=d.get("digest"), error=d.get("error"))

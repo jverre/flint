@@ -216,7 +216,8 @@ CREATE TABLE IF NOT EXISTS templates (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     tenant     TEXT NOT NULL DEFAULT '',
-    dockerfile TEXT NOT NULL DEFAULT '',
+    image      TEXT NOT NULL DEFAULT '',
+    digest     TEXT NOT NULL DEFAULT '',
     rootfs_mb  INTEGER NOT NULL DEFAULT 500,
     status     TEXT NOT NULL,
     build_host TEXT,
@@ -303,6 +304,8 @@ var addedColumns = []struct{ table, column, def string }{
 	{"tokens", "identity", "TEXT NOT NULL DEFAULT ''"}, // who signed in, for SSO sessions
 	{"events", "actor", "TEXT NOT NULL DEFAULT ''"},    // who caused it (audit.go)
 	{"events", "actor_name", "TEXT NOT NULL DEFAULT ''"},
+	{"templates", "image", "TEXT NOT NULL DEFAULT ''"},  // the image a template was imported from
+	{"templates", "digest", "TEXT NOT NULL DEFAULT ''"}, // and the exact manifest
 }
 
 func (d *DB) addColumns(ctx context.Context, exec func(context.Context, string, ...any) (sql.Result, error)) error {

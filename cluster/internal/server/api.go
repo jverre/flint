@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"github.com/jverre/flint/cluster/internal/webui"
 
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,10 +59,12 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /v1/audit", admin(s.handleAuditList))
 	mux.HandleFunc("GET /v1/audit/verify", admin(s.handleAuditVerify))
 
-	mux.HandleFunc("POST /templates/build", auth(s.handleBuildTemplate))
+	// Anyone may boot a template they can see; only an admin creates or deletes one.
+	mux.HandleFunc("POST /templates", admin(s.handleImportTemplate))
+	mux.HandleFunc("POST /templates/build", auth(handleBuildRemoved))
 	mux.HandleFunc("GET /templates", auth(s.handleListTemplates))
 	mux.HandleFunc("GET /templates/{id}", auth(s.handleGetTemplate))
-	mux.HandleFunc("DELETE /templates/{id}", auth(s.handleDeleteTemplate))
+	mux.HandleFunc("DELETE /templates/{id}", admin(s.handleDeleteTemplate))
 
 	mux.HandleFunc("/volumes", auth(notInCluster("volumes")))
 	mux.HandleFunc("/volumes/{rest...}", auth(notInCluster("volumes")))
@@ -495,75 +499,105 @@ func slugify(name string) string {
 	return s
 }
 
-// handleBuildTemplate builds on one host. When done, the host publishes the
-// result as a snapshot; other hosts of the same class restore it on demand.
-func (s *Server) handleBuildTemplate(w http.ResponseWriter, r *http.Request) {
+// imageRe matches flint.core._template_build._IMAGE_RE: a reference is only
+// ever a name to the registry client, never anything a shell would read.
+var imageRe = regexp.MustCompile(`^(?i)[a-z0-9][a-z0-9._\-/:]*(@sha256:[a-f0-9]{64})?$`)
+
+func handleBuildRemoved(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusGone, `Dockerfile builds were removed. Build and push the image with your own tooling, `+
+		`then import it: POST /templates {"name": ..., "image": ...}`)
+}
+
+// handleImportTemplate imports a container image on one Linux host. When done,
+// the host publishes the result as a snapshot; other hosts of the same class
+// restore it on demand. Admin only (see the route).
+func (s *Server) handleImportTemplate(w http.ResponseWriter, r *http.Request) {
 	p := principal(r)
 	var body struct {
-		Name       string `json:"name"`
-		Dockerfile string `json:"dockerfile"`
-		RootfsMB   int    `json:"rootfs_size_mb"`
-		Tenant     string `json:"tenant"`
+		Name     string `json:"name"`
+		Image    string `json:"image"`
+		RootfsMB *int   `json:"rootfs_size_mb"`
+		Tenant   string `json:"tenant"`
+		Auth     *struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"registry_auth"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil || body.Name == "" || body.Dockerfile == "" {
-		writeErr(w, 400, "name and dockerfile are required")
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		writeErr(w, 400, "name and image are required")
 		return
 	}
-	tenant, err := p.resolveTenant(body.Tenant)
-	if err != nil {
-		code, detail := statusFor(err)
-		writeErr(w, code, detail)
+	if len(body.Image) > 512 || !imageRe.MatchString(body.Image) {
+		writeErr(w, 400, "image must be a container image reference, e.g. python:3.12-slim")
 		return
 	}
-	if body.RootfsMB == 0 {
-		body.RootfsMB = 500
+	rootfsMB := 2048
+	if body.RootfsMB != nil {
+		rootfsMB = *body.RootfsMB
+	}
+	if rootfsMB < 64 || rootfsMB > 16384 {
+		writeErr(w, 400, "rootfs_size_mb must be an integer between 64 and 16384")
+		return
+	}
+	if body.Auth != nil && (body.Auth.Username == "" || body.Auth.Password == "") {
+		writeErr(w, 400, `registry_auth must be {"username": ..., "password": ...}`)
+		return
+	}
+	tenant := "" // every tenant may boot it
+	if body.Tenant != "" {
+		var err error
+		if tenant, err = p.resolveTenant(body.Tenant); err != nil {
+			code, detail := statusFor(err)
+			writeErr(w, code, detail)
+			return
+		}
 	}
 	id := slugify(body.Name)
 	if id == "default" {
-		writeErr(w, 400, "cannot rebuild the default template")
+		writeErr(w, 400, "the default template can't be replaced")
 		return
 	}
-	// IDs are one namespace: a rebuild must not replace another tenant's
-	// template (or a shared one), whose VMs would then run this Dockerfile.
+	// IDs are one namespace: an import must not replace a template whose VMs
+	// belong to another owner.
 	taken := func() bool {
 		t, err := s.getTemplate(r.Context(), id)
 		if err != nil || t.Tenant == tenant {
 			return false
 		}
-		if t.Tenant == "" || p.CanTenant(t.Tenant) {
-			writeErr(w, 409, "template "+id+" already exists")
-		} else {
-			writeErr(w, 403, "template "+id+" already exists for another tenant")
+		owner := "every tenant"
+		if t.Tenant != "" {
+			owner = "tenant " + t.Tenant
 		}
+		writeErr(w, 409, "template "+id+" already exists for "+owner+"; delete it first or pick another name")
 		return true
 	}
 	if taken() {
 		return
 	}
-	cands, err := s.candidates(r.Context(), placeReq{TemplateID: "default"})
+	h, err := s.importHost(r.Context())
 	if err != nil {
 		writeErr(w, 503, err.Error())
 		return
 	}
-	h := cands[0]
 	now := nowMs()
-	res, err := s.db.Exec(r.Context(), `INSERT INTO templates (id, name, tenant, dockerfile, rootfs_mb, status, build_host, error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'building', ?, '', ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, dockerfile = excluded.dockerfile,
+	res, err := s.db.Exec(r.Context(), `INSERT INTO templates (id, name, tenant, rootfs_mb, status, build_host, error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'building', ?, '', ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name,
 		rootfs_mb = excluded.rootfs_mb, status = 'building', build_host = excluded.build_host, error = '', updated_at = excluded.updated_at
 		WHERE templates.tenant = excluded.tenant`,
-		id, body.Name, tenant, body.Dockerfile, body.RootfsMB, h.ID, now, now)
+		id, body.Name, tenant, rootfsMB, h.ID, now, now)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 && taken() { // another tenant claimed it meanwhile
+	if n, _ := res.RowsAffected(); n == 0 && taken() { // claimed for another owner meanwhile
 		return
 	}
-	// A rebuild replaces the template's snapshots.
-	s.db.Exec(r.Context(), `DELETE FROM snapshots WHERE kind = 'template' AND template_id = ?`, id)
+	req := map[string]any{"name": body.Name, "image": body.Image, "rootfs_size_mb": rootfsMB}
+	if body.Auth != nil { // passed through for this pull only, never stored
+		req["registry_auth"] = map[string]string{"username": body.Auth.Username, "password": body.Auth.Password}
+	}
 	var out map[string]any
-	if err := s.agentDo(r.Context(), h, http.MethodPost, "/templates/build",
-		map[string]any{"name": body.Name, "dockerfile": body.Dockerfile, "rootfs_size_mb": body.RootfsMB}, &out, 60*time.Second); err != nil {
+	if err := s.agentDo(r.Context(), h, http.MethodPost, "/templates", req, &out, 60*time.Second); err != nil {
 		s.db.Exec(r.Context(), `UPDATE templates SET status = 'error', error = ? WHERE id = ?`, err.Error(), id)
 		code, detail := statusFor(err)
 		writeErr(w, code, detail)
@@ -572,8 +606,24 @@ func (s *Server) handleBuildTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"template_id": id, "status": "building", "build_host": h.ID})
 }
 
+// importHost picks the Linux host with the most room: imports run in a
+// builder VM, which macOS hosts don't have.
+func (s *Server) importHost(ctx context.Context) (*Host, error) {
+	cands, err := s.candidates(ctx, placeReq{TemplateID: "default"})
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range cands {
+		if strings.HasPrefix(h.Backend, "linux-") {
+			return h, nil
+		}
+	}
+	return nil, errors.New("no Linux host can import templates")
+}
+
 func (s *Server) templateDict(t *Template) map[string]any {
 	return map[string]any{"template_id": t.ID, "name": t.Name, "status": t.Status, "tenant": t.Tenant,
+		"image": t.Image, "digest": t.Digest, "rootfs_size_mb": t.RootfsMB,
 		"build_host": t.BuildHost, "error": t.Error, "created_at": float64(t.CreatedAt) / 1000}
 }
 
@@ -626,10 +676,6 @@ func (s *Server) handleDeleteTemplate(w http.ResponseWriter, r *http.Request) {
 	t, err := s.getTemplate(r.Context(), id)
 	if err != nil || (t.Tenant != "" && !principal(r).CanTenant(t.Tenant)) {
 		writeErr(w, 404, "Template not found")
-		return
-	}
-	if p := principal(r); t.Tenant == "" && len(p.Tenants) > 0 && !p.IsAdmin() {
-		writeErr(w, 403, "shared templates can only be deleted by an admin")
 		return
 	}
 	hosts, _ := s.listHosts(r.Context())

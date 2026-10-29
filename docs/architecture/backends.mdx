@@ -3,7 +3,7 @@ title: "Backend plugins"
 description: "The pluggable hypervisor layer."
 ---
 
-Flint's hypervisor support is pluggable. The daemon itself is hypervisor-agnostic — it delegates every VM-level operation (boot, pause, resume, kill, recover, template-build) to a **backend plugin**. Three backends ship in the box, and third parties can add more.
+Flint's hypervisor support is pluggable. The daemon itself is hypervisor-agnostic — it delegates every VM-level operation (boot, pause, resume, kill, recover, template import) to a **backend plugin**. Three backends ship in the box, and third parties can add more.
 
 ## The contract
 
@@ -24,7 +24,7 @@ Plus a lifecycle method set:
 - `ensure_runtime_ready()` — one-time host setup (e.g. create the `br-flint` bridge on Linux).
 - `ensure_default_template()` — build or register the default template on daemon startup.
 - `create`, `kill`, `pause`, `resume`, `recover_row` — per-sandbox lifecycle.
-- `build_template`, `delete_template_artifact` — template operations.
+- `import_template`, `delete_template_artifact` — template operations.
 
 See `src/flint/core/backends/base.py` in the repo for the full ABC.
 

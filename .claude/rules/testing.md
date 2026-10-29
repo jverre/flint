@@ -23,8 +23,7 @@ Key flows:
    pause/resume and is isolated between sandboxes.
 5. **Isolation & network** — network policy round-trips, credential headers
    are injected by the proxy and never visible inside the VM.
-6. **Templates & agents** — build a template, boot from it; agent build/deploy
-   (`tests/test_agents.py`, slow — run when touching agents or templates).
+6. **Templates** — build a template, boot from it.
 7. **Observability** — events and logs WebSockets deliver lifecycle events.
 
 A run where tests are **skipped** is not a pass. The `sandbox` fixture skips

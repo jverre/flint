@@ -1,4 +1,4 @@
-"""Bounded build admission and a host-supervised, disposable worker process."""
+"""Bounded template-import admission and a host-supervised, disposable worker process."""
 from __future__ import annotations
 
 import contextvars
@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import signal
-import shutil
 import subprocess
 import sys
 import threading
@@ -36,9 +35,9 @@ class Admission:
             except FileNotFoundError:
                 continue
             if pending:
-                raise BuildBusy("A previous build still needs cleanup; restart the daemon to retry it")
+                raise BuildBusy("A previous import still needs cleanup; restart the daemon to retry it")
         if not _slots.acquire(blocking=False):
-            raise BuildBusy("Build capacity is full; retry later")
+            raise BuildBusy("Import capacity is full; retry later")
         self.released = False
 
     def __enter__(self):
@@ -117,8 +116,6 @@ def _cleanup(job: Path) -> None:
         marker.unlink()
     if Path(group).exists():
         os.rmdir(group)
-    if shutil.which("docker"):
-        subprocess.run(["docker", "rm", "-f", "flint-appliance-" + job.name], capture_output=True, timeout=30)
     from ._wipe import wipe_tree
     for directory in (Path(config.DATA_DIR) / ".builder").glob("prepare-" + job.name + "-*"):
         wipe_tree(str(directory))
@@ -156,8 +153,10 @@ def recover_builds() -> None:
                     os.replace(retired, destination)
             elif destination.exists():
                 # The new template is in place: finish publishing it.
+                from ._template_build import read_source
                 register_template_artifact(data["template_id"], data.get("name", data["template_id"]), data["kind"],
-                                           str(destination), status="ready", rootfs_size_mb=data.get("rootfs_size_mb"))
+                                           str(destination), status="ready", rootfs_size_mb=data.get("rootfs_size_mb"),
+                                           source=read_source(str(destination)))
                 data["published"] = True
         wipe_tree(str(stage))
         wipe_tree(str(retired))
@@ -173,18 +172,18 @@ def _supervise(command: list[str], body: bytes, log, env: dict, timeout: float) 
         process.communicate(body, timeout=timeout)
         return process.returncode
     except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"Template build exceeded host deadline of {timeout}s") from exc
+        raise TimeoutError(f"Template import exceeded host deadline of {timeout}s") from exc
     finally:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=10)
 
 
-def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
+def run_build(kind: str, name: str, image: str, size_mb: int, auth: dict | None = None) -> dict:
     if not _admitted.get():
         with Admission():
-            return run_build(kind, name, dockerfile, size_mb)
-    from ._template_build import _slugify
+            return run_build(kind, name, image, size_mb, auth)
+    from ._template_build import _slugify, read_source
     from ._template_registry import register_template_artifact, update_template_artifact_status
     from ._wipe import wipe_tree
     from ._limits import cgroup_limits
@@ -193,7 +192,8 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
     template_id = _slugify(name)
     job = _root() / uuid.uuid4().hex
     job.mkdir(mode=0o700)
-    journal = {"kind": kind, "template_id": template_id, "name": name, "rootfs_size_mb": size_mb}
+    # Registry credentials go to the worker on stdin only, never to the journal.
+    journal = {"kind": kind, "template_id": template_id, "name": name, "image": image, "rootfs_size_mb": size_mb}
     _atomic(job / "job.json", journal)
     group = f"/sys/fs/cgroup/flint-builds/{job.name}"
     stage = Path(config.TEMPLATES_DIR) / (".build-" + job.name)
@@ -207,13 +207,10 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
                "FLINT_BUILD_VETH_IP": veth_ip}
         with (job / "worker.log").open("wb") as log:
             result = _supervise([sys.executable, "-m", __name__],
-                                json.dumps({"kind": kind, "name": name, "dockerfile": dockerfile,
-                                            "rootfs_size_mb": size_mb}).encode(), log, env, _TIMEOUT)
+                                json.dumps({"kind": kind, "name": name, "image": image,
+                                            "rootfs_size_mb": size_mb, "auth": auth}).encode(), log, env, _TIMEOUT)
         if result:
-            with (job / "worker.log").open("rb") as log:
-                log.seek(0, 2)
-                log.seek(max(0, log.tell() - 4096))
-                raise RuntimeError(log.read().decode(errors="replace"))
+            raise RuntimeError(_worker_error(job / "worker.log"))
         _cleanup(job)
         _release_veth_ip(reservation)
         # Recovery rolls an interrupted swap back (old template restored) or
@@ -224,7 +221,8 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
             os.replace(destination, retired)
         os.replace(stage, destination)
         fsync_path(config.TEMPLATES_DIR)
-        register_template_artifact(template_id, name, kind, str(destination), status="ready", rootfs_size_mb=size_mb)
+        register_template_artifact(template_id, name, kind, str(destination), status="ready", rootfs_size_mb=size_mb,
+                                   source=read_source(str(destination)))
         _atomic(job / "job.json", {**journal, "published": True})
         wipe_tree(str(retired))
         _finish(job)
@@ -248,6 +246,18 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
         raise
 
 
+def _worker_error(path: Path) -> str:
+    """The worker's failure, for the API: its last exception line, else the log tail."""
+    with path.open("rb") as log:
+        log.seek(0, 2)
+        log.seek(max(0, log.tell() - 8192))
+        tail = log.read().decode(errors="replace").strip()
+    for line in reversed(tail.splitlines()):
+        if re.match(r"^[A-Za-z_.]*(Error|Exception): ", line):
+            return line.split(": ", 1)[1]
+    return tail[-4096:]
+
+
 def _worker() -> None:
     # If the daemon dies, the worker cannot publish a late success. Its cgroup
     # and pre-created journal let the next daemon stop any remaining children.
@@ -259,7 +269,7 @@ def _worker() -> None:
     request = json.load(sys.stdin)
     from .backends.registry import get_backend
     backend = get_backend(request.pop("kind"))
-    backend.build_template(**request)
+    backend.import_template(**request)
     from ._artifacts import fsync_path
     from ._template_build import _slugify
     for path in Path(output_dir(_slugify(request["name"]))).rglob("*"):

@@ -24,9 +24,9 @@ const HOSTS: Host[] = [
 
 const TEMPLATES: Template[] = [
   { template_id: "default", name: "Default (Alpine)", status: "ready", created_at: now() - 864e5 / 1000 * 20 },
-  { template_id: "python-3-12", name: "python-3.12", status: "ready", created_at: now() - 6 * 86400, rootfs_size_mb: 412 },
-  { template_id: "node-22", name: "node-22", status: "ready", created_at: now() - 9 * 86400, rootfs_size_mb: 298 },
-  { template_id: "ubuntu-24-04", name: "ubuntu-24.04", status: "ready", created_at: now() - 20 * 86400, rootfs_size_mb: 611 },
+  { template_id: "python-3-12", name: "python-3.12", image: "index.docker.io/library/python:3.12-slim", digest: "sha256:ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", status: "ready", created_at: now() - 6 * 86400, rootfs_size_mb: 412 },
+  { template_id: "node-22", name: "node-22", image: "index.docker.io/library/node:22-slim", digest: "sha256:ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", status: "ready", created_at: now() - 9 * 86400, rootfs_size_mb: 298 },
+  { template_id: "ubuntu-24-04", name: "ubuntu-24.04", image: "index.docker.io/library/ubuntu:24.04", digest: "sha256:ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12", status: "ready", created_at: now() - 20 * 86400, rootfs_size_mb: 611 },
 ];
 
 const SEED: [string, string, string, string, number, string][] = [
@@ -241,10 +241,10 @@ on("POST", /^\/vms\/([^/]+)\/exec$/, (_m, _q, b) => { const c = ((b as { cmd?: s
 
 on("GET", /^\/templates$/, () => json({ templates: mode() === "daemon" ? TEMPLATES.map((t) => ({ ...t, artifacts: { "linux-firecracker": { status: t.status } } })) : TEMPLATES }));
 on("GET", /^\/templates\/([^/]+)$/, (m) => { const t = TEMPLATES.find((x) => x.template_id === m[1]); return t ? json({ template: { ...t, host_classes: ["epyc-9454"] } }) : err(404, "Template not found"); });
-on("POST", /^\/templates\/build$/, (_m, _q, b) => {
-  const p = b as { name: string }; const id = p.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+on("POST", /^\/templates$/, (_m, _q, b) => {
+  const p = b as { name: string; image: string }; const id = p.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
   const t: Template = { template_id: id, name: p.name, status: "building", created_at: now(), build_host: "h-ams-1" }; TEMPLATES.push(t);
-  setTimeout(() => { t.status = "ready"; emit({ type: "template.ready", template_id: id }); }, 8000);
+  setTimeout(() => { t.status = "ready"; t.image = p.image; t.digest = "sha256:" + "0".repeat(64); emit({ type: "template.ready", template_id: id }); }, 8000);
   return json({ template_id: id, status: "building", build_host: "h-ams-1" });
 });
 on("DELETE", /^\/templates\/([^/]+)$/, (m) => { const i = TEMPLATES.findIndex((t) => t.template_id === m[1]); if (m[1] === "default") return err(400, "cannot delete the default template"); if (i >= 0) TEMPLATES.splice(i, 1); return json({ ok: true }); });

@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import websockets.sync.client as ws_sync
 
-from flint.core._template_registry import register_template_artifact, update_template_artifact_status
+from flint.core._template_registry import register_template_artifact
 from flint.core.config import (
     AGENT_PORT,
     DATA_DIR,
@@ -498,23 +498,8 @@ class MacOSVirtualizationBackend(HostBackend):
             return "paused", None
         return "dead", None
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        template_id = name.lower().replace(" ", "-")
-        template_dir = os.path.join(TEMPLATES_DIR, template_id, self.kind)
-        os.makedirs(template_dir, exist_ok=True)
-        register_template_artifact(
-            template_id,
-            name,
-            self.kind,
-            template_dir,
-            status="failed",
-            rootfs_size_mb=rootfs_size_mb,
-        )
-        update_template_artifact_status(template_id, self.kind, "failed")
-        raise NotImplementedError(
-            "Custom macOS template building is not implemented yet. "
-            "Use the default template with FLINT_VZ_KERNEL_PATH and FLINT_VZ_ROOTFS_PATH."
-        )
+    def import_template(self, name: str, image: str, rootfs_size_mb: int = 500, auth: dict | None = None) -> dict:
+        raise NotImplementedError("Template imports need a Linux hypervisor; macOS runs the default template only.")
 
     def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
         if not template:

@@ -1,173 +1,93 @@
 ---
 title: "Templates"
-description: "Build custom sandbox environments from Docker images."
+description: "Boot sandboxes from your own container images."
 ---
 
-By default, sandboxes use a minimal Alpine Linux rootfs. If you need Python packages, system libraries, or a specific runtime pre-installed, you can build a custom template.
+By default, sandboxes boot a minimal Alpine Linux rootfs. To give them your runtime, packages and tools, import a container image as a template. Sandboxes created from it start just as fast as from the default one.
 
-On Linux, templates build inside disposable jailed VMs with a fresh Docker cache. The builder cannot reach the host, other tenants, private networks or cloud metadata. It creates a filesystem image that Flint copies out and boots in another jail to create the golden snapshot. Once built, you can create sandboxes from your template just like the default one - with the same fast startup time.
+Build and push the image with the tooling you already use (Docker, CI, a registry), then import it once. Importing a template needs an **admin** token; any token can boot the templates its tenant can see.
 
-## Building a template
+## Importing an image
 
 <Tabs>
   <Tab title="Python SDK">
     ```python
-    from flint import Template, Sandbox
+    from flint import Sandbox, Template
 
-    template = (Template("my-python-env")
-        .from_python_image("3.11-slim")
-        .pip_install("numpy", "pandas", "scikit-learn")
-        .build())
+    t = Template.import_image("python", "python:3.12-slim")
+    print(t.digest)  # sha256:... the exact image the template holds
 
-    sandbox = Sandbox(template_id=template.template_id)
-    result = sandbox.run_code("import numpy; print(numpy.__version__)")
+    sandbox = Sandbox(template_id=t.template_id)
+    print(sandbox.commands.run("python3 --version").stdout)
     ```
 
-    The `Template` class uses a fluent builder - each method returns `self` so you can chain calls.
-
-    **Constructor**
+    `import_image` blocks until the template is ready and raises if the import fails, with the reason.
 
     <ParamField path="name" type="str" required>
-      Human-readable name for this template.
+      The template's name; its ID is derived from it. Importing to an existing name replaces that template once the new image is ready.
     </ParamField>
 
-    <ParamField path="rootfs_size_mb" type="int" default="500">
-      Size of the rootfs image in MB. Increase this if you're installing large packages.
+    <ParamField path="image" type="str" required>
+      A container image reference: `python:3.12-slim`, `ghcr.io/acme/app:1.4`, or pinned with `@sha256:...`. Images must be `linux/amd64`.
+    </ParamField>
+
+    <ParamField path="rootfs_size_mb" type="int" default="2048">
+      The template's disk in MiB, from 64 to 16384. The image must fit, with room left for what sandboxes write.
+    </ParamField>
+
+    <ParamField path="tenant" type="str">
+      Only this tenant's sandboxes may boot the template. Without it, every tenant's can.
+    </ParamField>
+
+    <ParamField path="registry_auth" type="dict">
+      `{"username": ..., "password": ...}` for a private registry. Flint uses it for this pull only and never stores it.
     </ParamField>
   </Tab>
+  <Tab title="CLI">
+    ```bash
+    flint templates import python python:3.12-slim
+
+    # A private registry: you are prompted for the password, or pipe it in
+    echo "$GHCR_TOKEN" | flint templates import app ghcr.io/acme/app:1.4 \
+      --registry-user acme-bot --registry-password-stdin --tenant acme
+    ```
+  </Tab>
   <Tab title="REST API">
-    `POST /templates/build`
+    `POST /templates`
 
     ```bash
-    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/templates/build \
+    curl -H "Authorization: Bearer $FLINT_API_KEY" -X POST http://localhost:9100/templates \
       -H "Content-Type: application/json" \
-      -d '{
-        "name": "my-python-env",
-        "dockerfile": "FROM python:3.11-slim\nRUN pip install numpy pandas",
-        "rootfs_size_mb": 500
-      }'
+      -d '{"name": "python", "image": "python:3.12-slim"}'
     ```
 
-    <ParamField body="name" type="string" required>
-      Human-readable name.
-    </ParamField>
-
-    <ParamField body="dockerfile" type="string" required>
-      Full Dockerfile contents.
-    </ParamField>
-
-    <ParamField body="rootfs_size_mb" type="int" default="500">
-      Rootfs image size in MB, from 64 to 16384.
-    </ParamField>
-
-    **Response** `200` - returns immediately, build happens in background
-
-    ```json
-    {"template_id": "tpl_abc123", "status": "building"}
-    ```
-
-    Poll `GET /templates/{template_id}` until `status` is `"ready"`.
+    The import runs in the background. Poll `GET /templates/{template_id}` until `status` is `"ready"`. See the [API reference](/api-reference/templates) for every field.
   </Tab>
 </Tabs>
 
-## Base image methods
+## What Flint does with the image
 
-Pick one:
+- **Pins it.** A tag is resolved to its digest once, at import. The template never changes when the tag moves; import again to update it.
+- **Keeps its environment.** The image's `ENV` (including `PATH`) applies to every command run in the sandbox, as with `docker run`. `ENTRYPOINT` and `CMD` don't run: sandboxes run what you send them.
+- **Adds Flint's guest agent** and a small static toolset used at boot, so minimal and distroless images work. If the image has no `/bin/sh`, the bundled one stands in.
+- **Never runs the image outside a VM.** The image is pulled and turned into a disk inside a disposable, jailed builder VM; its code first runs when the template's golden snapshot is taken, in a jailed VM like any sandbox.
 
-```python
-.from_ubuntu_image("22.04")
-.from_python_image("3.11-slim")
-.from_node_image("20-slim")
-.from_alpine_image("3.19")
-.from_image("myregistry/myimage:tag")       # any Docker image
-.from_dockerfile("FROM ubuntu:22.04\n...")  # raw Dockerfile
-```
-
-## Installing packages
+## Listing and deleting
 
 ```python
-.apt_install("git", "curl", "build-essential")
-.pip_install("numpy", "pandas")
-.npm_install("typescript", "ts-node")
+for t in Template.list():
+    print(t.template_id, t.status, t.image)
+
+Template.get("python").delete()  # admin only; running sandboxes keep running
 ```
 
-## Other operations
-
-```python
-.run_cmd("curl -fsSL https://example.com/install.sh | sh")
-.copy("./local-file.txt", "/app/file.txt")
-.set_workdir("/app")
-.set_envs(NODE_ENV="production", DEBUG="false")
-.git_clone("https://github.com/example/repo", "/app/repo")
+```bash
+flint templates list
+flint templates delete python
 ```
 
-## TemplateInfo
+You can't delete the `default` template.
 
-`build()` blocks until the template is ready and returns a `TemplateInfo`:
+## How long an import takes
 
-```python
-info.template_id  # "tpl_abc123" - use with Sandbox(template_id=...)
-info.name         # "my-python-env"
-info.status       # "ready"
-```
-
-## Listing templates
-
-<Tabs>
-  <Tab title="REST API">
-    `GET /templates`
-
-    ```bash
-    curl -H "Authorization: Bearer $FLINT_API_KEY" http://localhost:9100/templates
-    ```
-
-    ```json
-    {
-      "templates": [
-        {"template_id": "default",    "name": "Default",       "status": "ready"},
-        {"template_id": "tpl_abc123", "name": "my-python-env", "status": "ready"}
-      ]
-    }
-    ```
-  </Tab>
-</Tabs>
-
-## Deleting a template
-
-<Tabs>
-  <Tab title="REST API">
-    `DELETE /templates/{template_id}`
-
-    ```bash
-    curl -H "Authorization: Bearer $FLINT_API_KEY" -X DELETE http://localhost:9100/templates/tpl_abc123
-    ```
-
-    You can't delete the `"default"` template.
-  </Tab>
-</Tabs>
-
-## Full example - Node.js environment
-
-```python
-from flint import Template, Sandbox
-
-template = (Template("node-app", rootfs_size_mb=800)
-    .from_node_image("20-slim")
-    .apt_install("git")
-    .npm_install("express", "axios")
-    .set_workdir("/app")
-    .set_envs(NODE_ENV="production")
-    .build())
-
-sandbox = Sandbox(template_id=template.template_id)
-result = sandbox.run_code(
-    "const express = require('express'); console.log('express loaded')",
-    runtime="node"
-)
-print(result.stdout)  # express loaded
-sandbox.kill()
-```
-
-## A note on build time
-
-Building a template can take anywhere from 30 seconds to a few minutes depending on what you're installing. The `build()` call blocks until it's done. Templates are cached after that though, so `Sandbox(template_id=...)` is just as fast as the default template.
+Pulling and converting depends on the image size: typically 20 seconds to a few minutes. After that, `Sandbox(template_id=...)` restores the template's snapshot and is as fast as the default template.

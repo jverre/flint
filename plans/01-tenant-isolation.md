@@ -37,7 +37,7 @@ table is `docs/architecture/security.mdx`.
 | **Secrets** | Injected by proxy, never in the guest, encrypted at rest, never returned by the API | Done on the single daemon (#40): sealed with Fernet (`secret.key` or `FLINT_SECRET_KEY`), redacted on every read, write-only (a redacted value sent back keeps the credential), dropped when the VM dies; the proxy's rules file lives in a 0700 tmpfs dir. The cluster's VM `spec` still holds policies in plaintext |
 | **Storage** | No shared writable layers across tenants; rootfs, snapshots, pause state and volumes wiped on delete | Done (#42): private files are discarded (hole punched, or zeroed) before removal, `vm.wiped` reports it; r2nfs wipes a deleted image's overlay and collects its unshared chunks. Volumes have a tenant and mount only into its VMs (#41). Not a forensic erase; remote-store chunks stay. The cluster doesn't serve volumes yet (`501`) |
 | **Resources** | Per-VM CPU, memory, disk IO, network limits; per-tenant quotas (VM count, vCPU, RAM, disk) | Per-VM cgroups and fixed VM sizes on both VMMs. The single daemon enforces per-tenant VM, vCPU, memory and volume-GiB quotas (#43); the cluster only a VM count. Cgroup v2 CPU/memory/PID ceilings and root-disk `io.max`, plus TAP shaping/policing on both Linux backends |
-| **Template builds** | A tenant's build can't reach the host, other tenants or private networks | Disposable jailed builder VM on the selected backend, with private disk/cache and public-only egress. The host Docker daemon builds only the fixed trusted appliance; exported artifacts are streamed out with a size bound and never mounted on the host. Abandoned builders are killed and wiped during recovery |
+| **Template imports** | Image content can't reach or run on the host, other tenants or private networks | Admin-only imports ([04](04-template-import.md)). Images are pulled and converted in a disposable jailed builder VM with a private disk and public-only egress; nothing from the image runs there. The disk is streamed out with a size bound and never mounted on the host. No host Docker. Abandoned builders are killed and wiped during recovery |
 | **Telemetry** | Every event, log line and metric tagged with tenant; queries scoped by tenant | Every single-daemon event carries `tenant` and `/events` sends a token only its tenants' (#41); per-VM logs, metrics and terminals are scoped by the VM's tenant. Events are still in memory only. The cluster stores events with `tenant` and filters `/v1/events?tenant=` |
 
 ## Work items
@@ -78,7 +78,7 @@ means the token's only tenant, else `default`.*
 - Daemon listens on a Unix socket by default; TCP requires a token.
 - Two credentials: `service` (create/manage VMs for any tenant) and `admin`
   (config, host operations). Stored hashed.
-- `tenant` required on `POST /vms`, volumes and template builds when
+- `tenant` required on `POST /vms` and volumes when
   multi-tenant mode is on; defaults to `default` in `flint start --dev`.
 - `GET /vms?tenant=` and all events carry `tenant`.
 
@@ -139,8 +139,7 @@ Linux backends:
 
 A run where the VM fixtures skip is not a pass.
 
-The daemon CI matrix also runs `test_template_build_and_run` on both backends,
-with a live host listener and cloud-metadata probes during the Dockerfile's
-`RUN` steps. `tests/maintenance/test_network_linux.py` exercises the nftables
+The daemon CI matrix also runs `test_template_import_and_boot` on both
+backends: a real image import, a boot, and the failure and permission paths. `tests/maintenance/test_network_linux.py` exercises the nftables
 rules with real TCP stacks. Local unit/kernel checks are not a substitute for
 a passing, non-skipped hypervisor run of the strengthened flows.

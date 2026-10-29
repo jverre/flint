@@ -272,12 +272,14 @@ class DaemonClient:
 
     # ── Template methods ───────────────────────────────────────────────────
 
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        resp = self._http.post(
-            "/templates/build",
-            json={"name": name, "dockerfile": dockerfile, "rootfs_size_mb": rootfs_size_mb, **({"tenant": self._tenant} if self._tenant else {})},
-            timeout=600.0,
-        )
+    def import_template(self, name: str, image: str, *, rootfs_size_mb: int = 2048, tenant: str | None = None,
+                        registry_auth: dict | None = None) -> dict:
+        body = {"name": name, "image": image, "rootfs_size_mb": rootfs_size_mb}
+        if tenant:
+            body["tenant"] = tenant
+        if registry_auth:
+            body["registry_auth"] = registry_auth
+        resp = self._http.post("/templates", json=body, timeout=60.0)
         _raise_for_status(resp)
         return resp.json()
 

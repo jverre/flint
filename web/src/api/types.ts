@@ -95,6 +95,8 @@ export interface Template {
   status: string; // building | ready | failed | error
   created_at?: number;
   tenant?: string;
+  image?: string;
+  digest?: string;
   build_host?: string;
   error?: string;
   rootfs_size_mb?: number;

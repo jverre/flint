@@ -231,6 +231,8 @@ type HostTemplate struct {
 	ID         string `json:"id"`
 	Status     string `json:"status"`
 	SnapshotID string `json:"snapshot_id,omitempty"`
+	Image      string `json:"image,omitempty"`
+	Digest     string `json:"digest,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
 
@@ -381,23 +383,24 @@ func (s *Server) listSnapshots(ctx context.Context, where string, args ...any) (
 
 // Template is a cluster template; its artifacts are per-host-class snapshots.
 type Template struct {
-	ID         string `json:"template_id"`
-	Name       string `json:"name"`
-	Tenant     string `json:"tenant,omitempty"`
-	Dockerfile string `json:"-"`
-	RootfsMB   int    `json:"rootfs_size_mb"`
-	Status     string `json:"status"`
-	BuildHost  string `json:"build_host,omitempty"`
-	Error      string `json:"error,omitempty"`
-	CreatedAt  int64  `json:"created_at_ms"`
-	UpdatedAt  int64  `json:"updated_at_ms"`
+	ID        string `json:"template_id"`
+	Name      string `json:"name"`
+	Tenant    string `json:"tenant,omitempty"`
+	Image     string `json:"image,omitempty"`
+	Digest    string `json:"digest,omitempty"`
+	RootfsMB  int    `json:"rootfs_size_mb"`
+	Status    string `json:"status"`
+	BuildHost string `json:"build_host,omitempty"`
+	Error     string `json:"error,omitempty"`
+	CreatedAt int64  `json:"created_at_ms"`
+	UpdatedAt int64  `json:"updated_at_ms"`
 }
 
 func (s *Server) getTemplate(ctx context.Context, id string) (*Template, error) {
 	var t Template
 	var bh sql.NullString
-	err := s.db.QueryRow(ctx, `SELECT id, name, tenant, dockerfile, rootfs_mb, status, build_host, error, created_at, updated_at FROM templates WHERE id = ?`, id).
-		Scan(&t.ID, &t.Name, &t.Tenant, &t.Dockerfile, &t.RootfsMB, &t.Status, &bh, &t.Error, &t.CreatedAt, &t.UpdatedAt)
+	err := s.db.QueryRow(ctx, `SELECT id, name, tenant, image, digest, rootfs_mb, status, build_host, error, created_at, updated_at FROM templates WHERE id = ?`, id).
+		Scan(&t.ID, &t.Name, &t.Tenant, &t.Image, &t.Digest, &t.RootfsMB, &t.Status, &bh, &t.Error, &t.CreatedAt, &t.UpdatedAt)
 	t.BuildHost = bh.String
 	return &t, err
 }
@@ -416,7 +419,7 @@ func (s *Server) templateFor(ctx context.Context, id, tenant string) (*Template,
 }
 
 func (s *Server) listTemplates(ctx context.Context) ([]*Template, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, name, tenant, dockerfile, rootfs_mb, status, build_host, error, created_at, updated_at FROM templates ORDER BY created_at`)
+	rows, err := s.db.Query(ctx, `SELECT id, name, tenant, image, digest, rootfs_mb, status, build_host, error, created_at, updated_at FROM templates ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +428,7 @@ func (s *Server) listTemplates(ctx context.Context) ([]*Template, error) {
 	for rows.Next() {
 		var t Template
 		var bh sql.NullString
-		if err := rows.Scan(&t.ID, &t.Name, &t.Tenant, &t.Dockerfile, &t.RootfsMB, &t.Status, &bh, &t.Error, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Tenant, &t.Image, &t.Digest, &t.RootfsMB, &t.Status, &bh, &t.Error, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		t.BuildHost = bh.String

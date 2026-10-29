@@ -837,49 +837,58 @@ async def logs_ws(websocket: WebSocket, vm_id: str):
 
 # ── Template endpoints ──────────────────────────────────────────────────────
 
-_build_threads: dict[str, threading.Thread] = {}
-_template_build_lock = threading.RLock()
+_import_threads: dict[str, threading.Thread] = {}
+_template_lock = threading.RLock()
+
+_BUILD_REMOVED = ("Dockerfile builds were removed. Build and push the image with your own tooling, "
+                  "then import it: POST /templates {\"name\": ..., \"image\": ...}")
+
+
+@app.post("/templates")
+def import_template_endpoint(body: dict, request: Request):
+    with _template_lock:
+        return _start_template_import(body, request)
 
 
 @app.post("/templates/build")
-def build_template_endpoint(body: dict, request: Request):
-    with _template_build_lock:
-        return _start_template_build(body, request)
+def build_template_endpoint():
+    raise HTTPException(410, _BUILD_REMOVED)
 
 
-def _start_template_build(body: dict, request: Request):
-    """Build a template. With ``tenant`` (or a token pinned to one tenant) it
-    belongs to that tenant; otherwise it belongs to the caller's default tenant."""
-    name = body.get("name")
-    dockerfile = body.get("dockerfile")
-    rootfs_size_mb = body.get("rootfs_size_mb", 500)
-    if type(rootfs_size_mb) is not int or not 64 <= rootfs_size_mb <= 16384:
-        raise HTTPException(400, "rootfs_size_mb must be an integer between 64 and 16384")
-    if not name or not dockerfile:
-        raise HTTPException(status_code=400, detail="name and dockerfile are required")
-
+def _start_template_import(body: dict, request: Request):
+    """Import a template from a container image (admin only, see auth.py). With
+    ``tenant`` only that tenant's VMs can boot it; without, every tenant's can."""
+    from flint.core._template_build import validate_auth, validate_image
     from flint.core._template_registry import _slugify
     from flint.core._template_registry import claim_template, update_template_artifact_status
+    name = body.get("name")
+    rootfs_size_mb = body.get("rootfs_size_mb", 2048)
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(400, "name is required")
+    if type(rootfs_size_mb) is not int or not 64 <= rootfs_size_mb <= 16384:
+        raise HTTPException(400, "rootfs_size_mb must be an integer between 64 and 16384")
+    try:
+        image = validate_image(body.get("image"))
+        auth = validate_auth(body.get("registry_auth"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     template_id = _slugify(name)
     if template_id == DEFAULT_TEMPLATE_ID:
-        raise HTTPException(status_code=400, detail="The default template can't be rebuilt this way")
-    if template_id in _build_threads and _build_threads[template_id].is_alive():
-        raise HTTPException(409, "A build for this template is already running")
+        raise HTTPException(400, "The default template can't be replaced")
+    if template_id in _import_threads and _import_threads[template_id].is_alive():
+        raise HTTPException(409, f"Template '{template_id}' is already being imported")
     daemon = _get_daemon()
     tenant = ""
-    if not daemon.cluster:
-        principal = principal_of(request)
-        tenant = principal.resolve_tenant(body.get("tenant"))
+    if not daemon.cluster:  # the control plane owns tenancy in a cluster
+        tenant = principal_of(request).resolve_tenant(body["tenant"]) if body.get("tenant") else ""
         existing = get_template(template_id)
-        if existing is not None and not existing.get("tenant") and principal.is_admin and not body.get("tenant"):
-            tenant = ""  # an admin rebuilding a template shared before tenancy keeps it shared
         if existing is not None and existing.get("tenant", "") != tenant:
-            visible = _template_for(principal, template_id) is not None
-            raise HTTPException(status_code=409 if visible else 403,
-                                detail=f"Template '{template_id}' already exists" + ("" if visible else " for another tenant"))
+            owner = f"tenant '{existing['tenant']}'" if existing.get("tenant") else "every tenant"
+            raise HTTPException(409, f"Template '{template_id}' already exists for {owner}; "
+                                     "delete it first or pick another name")
         if getattr(daemon, "runtime", None):
-            return daemon.runtime.request("template.build", name=name, dockerfile=dockerfile,
-                                          rootfs_size_mb=rootfs_size_mb, tenant=tenant)
+            return daemon.runtime.request("template.import", name=name, image=image, rootfs_size_mb=rootfs_size_mb,
+                                          tenant=tenant, auth=auth)
     from flint.core._build_job import Admission, BuildBusy
     try:
         admission = Admission()
@@ -896,25 +905,25 @@ def _start_template_build(body: dict, request: Request):
     except Exception:
         admission.release()
         raise
-    print(f"POST /templates/build — building {template_id}...")
+    print(f"POST /templates — importing {template_id} from {image}")
 
-    def _run_build():
+    def _run_import():
         try:
             with admission:
-                daemon.backend.build_template(name, dockerfile, rootfs_size_mb=rootfs_size_mb)
-            print(f"Template {template_id} built successfully")
+                daemon.backend.import_template(name, image, rootfs_size_mb=rootfs_size_mb, auth=auth)
+            print(f"Template {template_id} imported")
         except Exception as e:
             update_template_artifact_status(template_id, daemon.backend.kind, "failed", error=str(e))
-            print(f"Template {template_id} build failed: {e}")
-            log.exception("Template build failed: %s", template_id)
+            print(f"Template {template_id} import failed: {e}")
+            log.exception("Template import failed: %s", template_id)
         finally:
-            with _template_build_lock:
-                _build_threads.pop(template_id, None)
+            with _template_lock:
+                _import_threads.pop(template_id, None)
 
-    t = threading.Thread(target=_run_build, daemon=True, name=f"build-{template_id}")
+    t = threading.Thread(target=_run_import, daemon=True, name=f"import-{template_id}")
     try:
         t.start()
-        _build_threads[template_id] = t
+        _import_threads[template_id] = t
     except Exception as exc:
         admission.release()
         update_template_artifact_status(template_id, daemon.backend.kind, "failed", error=str(exc))
@@ -941,9 +950,9 @@ def get_template_endpoint(template_id: str, request: Request):
 
 @app.delete("/templates/{template_id}")
 def delete_template_endpoint(template_id: str, request: Request):
-    with _template_build_lock:
-        if template_id in _build_threads and _build_threads[template_id].is_alive():
-            raise HTTPException(409, "Cannot delete a template while its build is running")
+    with _template_lock:
+        if template_id in _import_threads and _import_threads[template_id].is_alive():
+            raise HTTPException(409, "Cannot delete a template while it is being imported")
         return _delete_template_endpoint(template_id, request)
 
 
@@ -951,12 +960,9 @@ def _delete_template_endpoint(template_id: str, request: Request):
     print(f"DELETE /templates/{template_id}")
     if template_id == DEFAULT_TEMPLATE_ID:
         raise HTTPException(status_code=400, detail="Cannot delete default template")
-    principal = principal_of(request)
-    tmpl = _template_for(principal, template_id)
+    tmpl = _template_for(principal_of(request), template_id)
     if tmpl is None:
         raise HTTPException(status_code=404, detail="Template not found")
-    if not tmpl.get("tenant") and principal.tenants and not principal.is_admin:
-        raise HTTPException(status_code=403, detail="Shared templates can only be deleted by an admin")
     daemon = _get_daemon()
     if getattr(daemon, "runtime", None):
         return daemon.runtime.request("template.delete", template_id=template_id)

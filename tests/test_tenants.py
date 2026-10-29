@@ -80,6 +80,10 @@ def test_service_token_cant_administer(tenants):
         assert c.get("/config").status_code == 403
         assert c.post("/v1/tokens", json={"kind": "admin"}).status_code == 403
         assert c.get("/v1/tokens").status_code == 403
+        # Templates are what every VM boots: a service token reads them, only an admin changes them.
+        assert c.get("/templates").status_code == 200
+        assert c.post("/templates", json={"name": "mine", "image": "alpine:3.20"}).status_code == 403
+        assert c.delete("/templates/default").status_code == 403
 
 
 def test_revoked_token_is_refused(daemon_only):

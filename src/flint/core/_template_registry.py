@@ -122,11 +122,15 @@ def register_template_artifact(
     *,
     status: str = "ready",
     rootfs_size_mb: int | None = None,
+    source: dict | None = None,
 ) -> None:
     registry = _load_registry()
     existing = _normalize_entry(registry.get(template_id, {"name": name, "created_at": time.time()}))
     existing["name"] = name
     existing.pop("error", None)
+    if source:
+        # The image and the exact digest the published template was made from.
+        existing["image"], existing["digest"] = source["image"], source["digest"]
     existing["status"] = status
     existing["template_dir"] = template_dir if backend_kind == "linux-firecracker" else existing.get("template_dir", template_dir)
     existing["rootfs_size_mb"] = rootfs_size_mb if rootfs_size_mb is not None else existing.get("rootfs_size_mb")
@@ -192,7 +196,7 @@ def update_template_artifact_status(template_id: str, backend_kind: str, status:
     artifacts[backend_kind] = artifact
     entry["artifacts"] = artifacts
     # Same as register_template_artifact: the template's status follows its
-    # latest build. The SDK's Template.build() polls it.
+    # latest import. The SDK's Template.import_image() polls it.
     entry["status"] = status
     registry[template_id] = entry
     _save_registry(registry)

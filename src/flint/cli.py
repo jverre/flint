@@ -727,133 +727,73 @@ def volumes_unmount(vm_id, path):
     click.echo(f"Unmounted {path}")
 
 
-# ── Agent commands ─────────────────────────────────────────────────────────
+# ── Templates ──────────────────────────────────────────────────────────────
 
 @cli.group()
-def agents():
-    """Manage pre-packaged AI agents."""
-    pass
+def templates():
+    """Templates: container images sandboxes boot from (import and delete need an admin)."""
 
 
-@agents.command(name="list")
-def agents_list():
-    """List all available agents in the catalog."""
-    from flint.agents.catalog import list_agents
-    catalog = list_agents()
-    if not catalog:
-        click.echo("No agents available.")
-        return
-    click.echo("Available agents:\n")
-    for defn in catalog:
-        click.echo(f"  {defn.name:<12} {defn.description}")
-        click.echo(f"  {'':12} repo: {defn.repo}")
-        click.echo(f"  {'':12} license: {defn.license}  tags: {', '.join(defn.tags)}")
-        click.echo()
+@templates.command("list")
+def templates_list():
+    """List templates."""
+    tpls = _volume_call(_daemon_client().list_templates)
+    for t in tpls:
+        image = (t.get("image") or "-").removeprefix("index.docker.io/library/")
+        status = t.get("status", "")
+        click.echo(f"  {t['template_id']:<24} {status:<9} {t.get('tenant') or 'all tenants':<16} {image}")
+        if status in ("failed", "error") and t.get("error"):
+            click.echo(f"  {'':<24} {t['error'].splitlines()[-1]}")
 
 
-@agents.command()
+@templates.command("import")
 @click.argument("name")
-def info(name):
-    """Show detailed information about an agent."""
-    from flint.agents.catalog import get_agent
-    defn = get_agent(name)
-    if defn is None:
-        click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
-        raise SystemExit(1)
-    click.echo(f"Name:         {defn.name}")
-    click.echo(f"Description:  {defn.description}")
-    click.echo(f"Repository:   {defn.repo}")
-    click.echo(f"Version:      {defn.version}")
-    click.echo(f"Homepage:     {defn.homepage}")
-    click.echo(f"License:      {defn.license}")
-    click.echo(f"Tags:         {', '.join(defn.tags)}")
-    click.echo(f"Rootfs size:  {defn.rootfs_size_mb} MB")
-    if defn.default_env:
-        click.echo(f"Default env:")
-        for k, v in defn.default_env.items():
-            click.echo(f"  {k}={v}")
+@click.argument("image")
+@click.option("--disk", "rootfs_size_mb", type=int, default=2048, show_default=True,
+              help="Disk size in MiB; the image must fit, with room for what the VMs write")
+@click.option("--tenant", default=None, help="Only this tenant's VMs may boot it (default: every tenant)")
+@click.option("--registry-user", default=None, help="Log in to a private registry as this user")
+@click.option("--registry-password-stdin", is_flag=True, default=False,
+              help="Read the registry password or token from stdin (otherwise you are prompted)")
+@click.option("--no-wait", is_flag=True, default=False, help="Return once the import has started")
+def templates_import(name, image, rootfs_size_mb, tenant, registry_user, registry_password_stdin, no_wait):
+    """Import a container image as a template: NAME IMAGE, like `python python:3.12-slim`.
 
-
-@agents.command()
-@click.argument("name", required=False, default=None)
-@click.option("--all", "build_all", is_flag=True, default=False, help="Build all agents in the catalog")
-@click.option("--force", is_flag=True, default=False, help="Rebuild even if already cached")
-@click.option("--rootfs-size", type=int, default=None, help="Override rootfs size in MB")
-def build(name, build_all, force, rootfs_size):
-    """Pre-build agent template(s) for instant deploys.
-
-    Build a single agent by name, or use --all to build every agent in the
-    catalog. Subsequent deploys will boot from the cached snapshot in
-    milliseconds instead of rebuilding the image from scratch.
+    Build and push the image with your usual tooling first. Flint pulls it
+    once, pins the tag to its digest and snapshots it; importing to an
+    existing NAME replaces that template once the new image is ready.
     """
-    _require_daemon()
+    auth = None
+    if registry_user:
+        password = (click.get_text_stream("stdin").read().strip() if registry_password_stdin
+                    else click.prompt("Registry password or token", hide_input=True))
+        auth = {"username": registry_user, "password": password}
+    elif registry_password_stdin:
+        raise click.UsageError("--registry-password-stdin needs --registry-user")
+    client = _daemon_client()
+    started = _volume_call(client.import_template, name, image, rootfs_size_mb=rootfs_size_mb, tenant=tenant,
+                           registry_auth=auth)
+    template_id = started["template_id"]
+    if no_wait:
+        click.echo(f"Importing {image} as {template_id}; check with `flint templates list`")
+        return
+    click.echo(f"Importing {image} as {template_id}...")
+    import time as _time
+    while True:
+        t = _volume_call(client.get_template, template_id)
+        status = (t or {}).get("status")
+        if status == "ready":
+            click.echo(f"Ready: {template_id} ({t.get('digest', '')})")
+            click.echo(f"  Boot it with Sandbox(template_id={template_id!r})")
+            return
+        if status in ("failed", "error"):
+            raise click.ClickException(f"import failed: {t.get('error') or 'see the daemon log'}")
+        _time.sleep(2)
 
-    if not build_all and name is None:
-        click.echo("Error: Provide an agent name or use --all.", err=True)
-        raise SystemExit(1)
 
-    from flint.agents.agent import Agent
-
-    if build_all:
-        from flint.agents.catalog import list_agents
-        targets = [defn.name for defn in list_agents()]
-        click.echo(f"Building {len(targets)} agent template(s)...")
-    else:
-        from flint.agents.catalog import get_agent
-        if get_agent(name) is None:
-            click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
-            raise SystemExit(1)
-        targets = [name]
-
-    for agent_name in targets:
-        status = "force-rebuilding" if force else "building"
-        click.echo(f"  [{status}] {agent_name}...")
-        info = Agent.build(agent_name, rootfs_size_mb=rootfs_size, force=force)
-        click.echo(f"  [ready]    {agent_name} -> {info.template_id}")
-
-    click.echo(f"\nDone! {len(targets)} agent template(s) ready for instant deploy.")
-
-
-@agents.command()
-@click.argument("name")
-@click.option("--env", "-e", multiple=True, help="Environment variables (KEY=VALUE)")
-@click.option("--rootfs-size", type=int, default=None, help="Override rootfs size in MB")
-@click.option("--no-internet", is_flag=True, default=False, help="Disable internet access")
-@click.option("--force-build", is_flag=True, default=False, help="Force template rebuild even if cached")
-def deploy(name, env, rootfs_size, no_internet, force_build):
-    """Build (if needed) and deploy an agent in a Flint microVM."""
-    _require_daemon()
-
-    from flint.agents.catalog import get_agent
-    defn = get_agent(name)
-    if defn is None:
-        click.echo(f"Error: Unknown agent '{name}'. Run 'flint agents list' to see available agents.", err=True)
-        raise SystemExit(1)
-
-    # Parse environment variables
-    env_dict: dict[str, str] = {}
-    for entry in env:
-        if "=" not in entry:
-            click.echo(f"Error: Invalid env format '{entry}'. Use KEY=VALUE.", err=True)
-            raise SystemExit(1)
-        k, v = entry.split("=", 1)
-        env_dict[k] = v
-
-    click.echo(f"Deploying {defn.name}...")
-    click.echo(f"  Building template (this may take a few minutes on first run)...")
-
-    from flint.agents.agent import Agent
-    agent = Agent.deploy(
-        name,
-        env=env_dict or None,
-        rootfs_size_mb=rootfs_size,
-        allow_internet_access=not no_internet,
-        force_build=force_build,
-    )
-
-    click.echo(f"  Agent '{agent.name}' deployed successfully!")
-    click.echo(f"  Sandbox ID: {agent.sandbox.id}")
-    click.echo(f"  Template:   {agent.template_info.template_id}")
-    click.echo()
-    click.echo(f"  Run commands:  flint agents exec {agent.sandbox.id[:8]} '<command>'")
-    click.echo(f"  Stop agent:    flint stop {agent.sandbox.id[:8]}")
+@templates.command("delete")
+@click.argument("template_id")
+def templates_delete(template_id):
+    """Delete a template. Sandboxes already running from it keep running."""
+    _volume_call(_daemon_client().delete_template, template_id)
+    click.echo(f"Deleted template {template_id}")
