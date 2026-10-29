@@ -2,23 +2,18 @@ import hashlib
 import json
 import logging
 import os
-import platform
 
 log = logging.getLogger(__name__)
 
 
-def _default_dirs() -> tuple[str, str]:
-    system = platform.system()
-    if system == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/flint")
-        return f"{base}/data", f"{base}/state"
-    return "/var/lib/flint/data", "/var/lib/flint/state"
+# Where the daemon is (shared with its clients, which must not import core).
+from flint._settings import (  # noqa: E402,F401
+    API_KEY, CREDENTIALS_PATH, DAEMON_HOST, DAEMON_PORT, DAEMON_SOCKET, DAEMON_URL, DEFAULT_TEMPLATE_ID,
+    STATE_DIR, TENANT, TERM_COLS, TERM_ROWS, default_dirs, stored_token,
+)
 
 # ── Env-var-driven directories ────────────────────────────────────────────
-_DEFAULT_DATA_DIR, _DEFAULT_STATE_DIR = _default_dirs()
-DAEMON_PORT = int(os.environ.get("FLINT_PORT", "9100"))
-DATA_DIR = os.environ.get("FLINT_DATA_DIR", _DEFAULT_DATA_DIR)
-STATE_DIR = os.environ.get("FLINT_STATE_DIR", _DEFAULT_STATE_DIR)
+DATA_DIR = os.environ.get("FLINT_DATA_DIR", default_dirs()[0])
 
 # Debug log to file
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -61,40 +56,10 @@ POOL_WORKERS = 4
 NETNS_POOL_SIZE = int(os.environ.get("FLINT_NETNS_POOL_SIZE", "8"))
 
 TEMPLATES_DIR = f"{DATA_DIR}/.templates"
-DEFAULT_TEMPLATE_ID = "default"
-
-TERM_COLS = 120
-TERM_ROWS = 40
 
 # ── Daemon ────────────────────────────────────────────────────────────────
-DAEMON_HOST = os.environ.get("FLINT_HOST", "127.0.0.1")
-# The daemon's Unix socket. Whoever can open it is an admin, so it is only
-# accessible to the daemon's user (and the `flint` group, if there is one).
-# TCP needs an API token.
-DAEMON_SOCKET = os.environ.get("FLINT_SOCKET", f"{STATE_DIR}/flint.sock")
-# Where clients (SDK, CLI, TUI) send requests: the local daemon's socket by
-# default, a daemon over TCP (FLINT_URL=http://127.0.0.1:9100 with
-# FLINT_API_KEY), or a cluster's control plane (FLINT_URL=https://...).
-DAEMON_URL = os.environ.get("FLINT_URL", f"unix://{DAEMON_SOCKET}").rstrip("/")
 # Written at the daemon's first start: an admin token for TCP clients (the web UI).
 ADMIN_TOKEN_PATH = f"{STATE_DIR}/admin.token"
-# `flint login` keeps sign-in tokens here, per server URL (0600).
-CREDENTIALS_PATH = os.environ.get("FLINT_CREDENTIALS", os.path.expanduser("~/.config/flint/credentials.json"))
-
-
-def stored_token(url: str) -> str:
-    """The unexpired token `flint login` stored for ``url``, or ""."""
-    import time
-    try:
-        with open(CREDENTIALS_PATH) as f:
-            cred = json.load(f).get(url.rstrip("/")) or {}
-    except (OSError, ValueError):
-        return ""
-    return cred.get("token", "") if (cred.get("expires_at") or float("inf")) > time.time() else ""
-
-
-API_KEY = os.environ.get("FLINT_API_KEY", "") or stored_token(DAEMON_URL)
-TENANT = os.environ.get("FLINT_TENANT", "")
 DAEMON_DIR = STATE_DIR
 DAEMON_STATE_PATH = f"{STATE_DIR}/state.json"
 DAEMON_PID_PATH = f"{STATE_DIR}/flintd.pid"

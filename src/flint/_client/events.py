@@ -12,15 +12,18 @@ events emitted while disconnected are gone.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Callable
 
 from websockets.exceptions import WebSocketException
 
-from flint.core.config import DAEMON_URL, log
+from flint._settings import DAEMON_URL
 from flint._client.client import auth_headers
 from flint._client.transport import ws_connect
+
+log = logging.getLogger("flint.client")
 
 
 class EventStream:

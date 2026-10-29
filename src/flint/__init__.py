@@ -1,4 +1,7 @@
-__all__ = ["Sandbox", "CommandResult", "Template", "TemplateInfo", "Volume", "Agent", "configure", "main"]
+_ERRORS = ("FlintError", "APIError", "InvalidRequest", "Unauthorized", "Forbidden", "NotFound", "Conflict",
+           "LimitExceeded", "Unavailable")
+
+__all__ = ["Sandbox", "CommandResult", "Template", "TemplateInfo", "Volume", "Agent", "configure", "main", *_ERRORS]
 
 # Imported on first use, so `flint start`/`flint agent` can set FLINT_* before
 # flint.core.config reads them (the CLI is imported through this package).
@@ -10,6 +13,7 @@ _EXPORTS = {
     "Volume": "flint.volume",
     "Agent": "flint.agents",
     "configure": "flint.sandbox",
+    **dict.fromkeys(_ERRORS, "flint.errors"),
 }
 
 

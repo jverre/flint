@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+import flint
 from flint._client.client import DaemonClient
 
 
@@ -56,10 +57,13 @@ def test_cluster_does_not_retry_answers_that_will_not_change(monkeypatch):
         httpx.Response(503, json={"detail": "VM creation failed: capacity_exhausted: no host"}),
         httpx.Response(409, json={"detail": "VM is Paused, not running"}),
     ])
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(flint.Unavailable) as unavailable:
         c.create()
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(flint.Conflict) as conflict:
         c.pause("vm-1")
+    # Still the httpx errors callers caught before, with the daemon's explanation.
+    assert isinstance(conflict.value, httpx.HTTPStatusError) and conflict.value.response.status_code == 409
+    assert conflict.value.detail == "VM is Paused, not running" and "capacity_exhausted" in str(unavailable.value)
     assert len(seen) == 2
 
 
