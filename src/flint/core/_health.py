@@ -47,15 +47,13 @@ class HealthMonitor:
         if not self._manager:
             return
 
-        with self._manager._lock:
-            entries = list(self._manager._sandboxes.items())
-
         now = time.time()
-        for vm_id, entry in entries:
+        for entry in self._manager.entries():
+            vm_id = entry.vm_id
             if entry.state != SandboxState.RUNNING:
                 continue
 
-            alive, detail = self._manager._backend.check_entry_alive(entry)
+            alive, detail = self._manager.backend.check_entry_alive(entry)
 
             if alive:
                 if self._store:

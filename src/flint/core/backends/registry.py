@@ -22,6 +22,7 @@ import threading
 from dataclasses import dataclass
 from typing import Type
 
+from ..config import log
 from .base import BackendPlugin
 
 
@@ -71,20 +72,20 @@ def register(plugin_cls: Type[BackendPlugin]) -> None:
         _by_kind[kind] = plugin_cls
 
 
+_BUILTINS = (
+    "flint.core.backends.linux_firecracker",
+    "flint.core.backends.linux_cloud_hypervisor",
+    "flint.core.backends.macos_vz",
+)
+
+
 def _load_builtins() -> None:
     # Each import triggers a top-level register() call.
-    try:
-        importlib.import_module("flint.core.backends.linux_firecracker")
-    except Exception:  # pragma: no cover - optional backend
-        pass
-    try:
-        importlib.import_module("flint.core.backends.linux_cloud_hypervisor")
-    except Exception:  # pragma: no cover - optional backend
-        pass
-    try:
-        importlib.import_module("flint.core.backends.macos_vz")
-    except Exception:  # pragma: no cover - optional backend
-        pass
+    for module in _BUILTINS:
+        try:
+            importlib.import_module(module)
+        except Exception:  # pragma: no cover - optional backend
+            log.debug("backend module %s unavailable", module, exc_info=True)
 
 
 def _load_entry_points() -> None:

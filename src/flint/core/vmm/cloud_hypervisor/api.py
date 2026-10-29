@@ -3,8 +3,8 @@
 Cloud-Hypervisor exposes a REST API at ``--api-socket`` implementing
 ``/api/v1/vm.{create,boot,pause,resume,snapshot,restore,delete,info}`` and
 ``/api/v1/vmm.{ping,shutdown}``. This module wraps that protocol in the same
-raw-HTTP-over-UDS style used by :mod:`_firecracker` so both backends can run in
-a jailer-style environment where only the control socket is reachable.
+raw-HTTP-over-UDS style as the Firecracker client, since the VMM runs jailed
+and only its control socket is reachable.
 """
 
 from __future__ import annotations
@@ -13,8 +13,9 @@ import json
 import socket
 import time
 
-from .config import log
-from ._jailfs import connect_unix
+from ...config import log
+from ..._jailfs import connect_unix
+from ..common import log_tail
 
 _RESPONSE_TIMEOUT = 60.0
 
@@ -139,18 +140,8 @@ def wait_for_api_socket(
             s.close()
 
 
-def _format_log_tail(log_path: str | None, nbytes: int = 1000) -> str:
-    if not log_path:
-        return ""
-    try:
-        with open(log_path, "rb") as f:
-            try:
-                f.seek(-nbytes, 2)
-            except OSError:
-                f.seek(0)
-            tail = f.read().decode(errors="replace").strip()
-    except OSError:
-        return ""
+def _format_log_tail(log_path: str | None) -> str:
+    tail = log_tail(log_path, 1000).strip()
     return f"\nCloud-hypervisor log ({log_path}):\n{tail}" if tail else ""
 
 

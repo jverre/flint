@@ -1,25 +1,28 @@
+"""The default template's golden snapshot for Firecracker: boot once, snapshot, keep."""
+
+from __future__ import annotations
+
 import json
 import os
-import subprocess
 import time
 import urllib.request
 import uuid
 
-from .config import (
+from ...config import (
     log, SOURCE_ROOTFS, KERNEL_PATH, BOOT_ARGS, GUEST_MAC, GOLDEN_TAP,
-    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT, JAILER_SHARED_DIR,
+    GOLDEN_NS, GOLDEN_DIR, GUEST_IP, AGENT_PORT,
 )
-from ._netns import _delete_netns, _setup_netns_pyroute2, _enter_netns, _restore_netns
-from ._firecracker import _wait_for_api_socket, _fc_put, _fc_patch, _fc_status_ok
-from ._artifacts import dig_holes, shared_readonly, sparse_copy
-from ._jailer import JailSpec, build_jailer_command, cleanup_jailer, make_private
-from ._jailfs import copy_out
-
-_GOLDEN_FILES = ("rootfs.ext4", "vmstate", "mem")
+from ...net.netns import _delete_netns, _setup_netns_pyroute2, _enter_netns, _restore_netns
+from ..._artifacts import dig_holes, sparse_copy
+from ..._jailfs import copy_out
+from ..common import log_tail, stop_process
+from . import api
+from .boot import TEMPLATE_FILES
+from .jail import FirecrackerJail
 
 
 def golden_snapshot_exists() -> bool:
-    return all(os.path.exists(f"{GOLDEN_DIR}/{f}") for f in _GOLDEN_FILES)
+    return all(os.path.exists(f"{GOLDEN_DIR}/{f}") for f in TEMPLATE_FILES)
 
 
 def create_golden_snapshot(
@@ -37,85 +40,69 @@ def create_golden_snapshot(
     every sandbox's jail has it.
     """
     log.info("Creating golden snapshot (dir=%s)...", snapshot_dir)
-    spec = JailSpec(vm_id=f"golden-{uuid.uuid4().hex[:12]}", ns_name=ns_name)
-    from ._build_job import register_vm
-    register_vm(spec.vm_id, ns_name, "linux-firecracker")
-    socket_path = spec.socket_path_on_host
-    log_path = f"{spec.chroot_base}/firecracker.log"  # outside the chroot
+    jail = FirecrackerJail(f"golden-{uuid.uuid4().hex[:12]}")
+    from ..._build_job import register_vm
+    register_vm(jail.vm_id, ns_name, "linux-firecracker")
+    socket_path = jail.socket_path
     process = None
 
     _delete_netns(ns_name)
     try:
-        os.makedirs(spec.chroot_root)
-        os.chown(spec.chroot_root, *spec.identity)
-        os.link(shared_readonly(KERNEL_PATH, JAILER_SHARED_DIR), f"{spec.chroot_root}/vmlinux")
-        sparse_copy(source_rootfs, f"{spec.chroot_root}/rootfs.ext4")
-        make_private(f"{spec.chroot_root}/rootfs.ext4", spec.vm_id)
+        os.makedirs(jail.root)
+        os.chown(jail.root, *jail.identity)
+        jail.link_shared(KERNEL_PATH, "/vmlinux")
+        sparse_copy(source_rootfs, jail.host_path("/rootfs.ext4"))
+        jail.give("/rootfs.ext4")
 
         # The golden VM needs no internet; it only has to bring flintd up.
         _setup_netns_pyroute2(ns_name, tap_name, internet=False)
 
-        with open(log_path, "w") as log_fd:
-            process = subprocess.Popen(
-                build_jailer_command(spec),
-                stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        process = jail.spawn(ns_name)
         log.info("Golden VM started in ns %s (pid=%d)", ns_name, process.pid)
 
-        _wait_for_api_socket(socket_path, process=process, log_path=log_path, vm_id=spec.vm_id)
-        _fc_put(socket_path, "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
-        _fc_put(socket_path, "/drives/rootfs", {
+        api.put(socket_path, "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
+        api.put(socket_path, "/drives/rootfs", {
             "drive_id": "rootfs", "path_on_host": "rootfs.ext4",
             "is_root_device": True, "is_read_only": False,
         })
-        _fc_put(socket_path, "/network-interfaces/eth0", {
+        api.put(socket_path, "/network-interfaces/eth0", {
             "iface_id": "eth0", "guest_mac": GUEST_MAC, "host_dev_name": tap_name,
         })
-        _fc_put(socket_path, "/actions", {"action_type": "InstanceStart"})
+        api.put(socket_path, "/actions", {"action_type": "InstanceStart"})
 
-        _wait_for_ready(log_path)
+        _wait_for_ready(jail.log_path)
         _wait_for_agent_and_warm_up(ns_name)
 
-        resp = _fc_patch(socket_path, "/vm", {"state": "Paused"})
-        if not _fc_status_ok(resp):
+        resp = api.set_vm_state(socket_path, "Paused")
+        if not api.status_ok(resp):
             raise RuntimeError(f"Failed to pause golden VM: {resp}")
         log.info("Golden VM paused")
 
-        resp = _fc_put(socket_path, "/snapshot/create", {
+        resp = api.put(socket_path, "/snapshot/create", {
             "snapshot_type": "Full", "snapshot_path": "vmstate", "mem_file_path": "mem",
         })
-        if not _fc_status_ok(resp):
+        if not api.status_ok(resp):
             raise RuntimeError(f"Golden snapshot creation failed: {resp}")
 
         # Copy out of the jail (without following links: the template image
         # ran in this VMM), then swap all files in at once.
         os.makedirs(snapshot_dir, exist_ok=True)
-        for name in _GOLDEN_FILES:
-            copy_out(f"{spec.chroot_root}/{name}", f"{snapshot_dir}/{name}.tmp")
+        for name in TEMPLATE_FILES:
+            copy_out(jail.host_path(f"/{name}"), f"{snapshot_dir}/{name}.tmp")
         # Guest memory is mostly zeros; holes keep per-VM copies and page cache small.
         dig_holes(f"{snapshot_dir}/mem.tmp")
-        for name in _GOLDEN_FILES:
+        for name in TEMPLATE_FILES:
             os.chmod(f"{snapshot_dir}/{name}.tmp", 0o644)
             os.replace(f"{snapshot_dir}/{name}.tmp", f"{snapshot_dir}/{name}")
             log.info("Golden %s: %d bytes", name, os.path.getsize(f"{snapshot_dir}/{name}"))
     except Exception:
-        try:
-            with open(log_path) as f:
-                log.error("Golden snapshot failed — firecracker log:\n%s", f.read()[-2000:])
-        except OSError:
-            pass
+        log.error("Golden snapshot failed — firecracker log:\n%s", log_tail(jail.log_path))
         raise
     finally:
-        if process is not None:
-            process.kill()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+        stop_process(process, timeout=5)
         _delete_netns(ns_name)
-        cleanup_jailer(spec.chroot_base, spec.vm_id)
-        for name in _GOLDEN_FILES:
+        jail.cleanup()
+        for name in TEMPLATE_FILES:
             try:
                 os.unlink(f"{snapshot_dir}/{name}.tmp")
             except FileNotFoundError:

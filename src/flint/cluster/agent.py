@@ -53,19 +53,19 @@ def host_class(backend) -> str:
     except OSError:
         pass
     vmm = "unknown-vmm"
-    binary = config.FIRECRACKER_BINARY if backend.kind == "linux-firecracker" else config.CH_BINARY
+    binary = backend.vmm_binary()
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=5).stdout
         vmm = out.strip().splitlines()[0] if out.strip() else vmm
     except Exception:
         pass
     migration = ""
-    if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+    if config.SHARED_ROOTFS_DIR:
         from flint.core._shared_rootfs import configured_pool
         pool = configured_pool()
         migration = f"|pool={pool.pool_id}|gateway={os.environ.get('FLINT_MIGRATION_GATEWAY_IP','')}"
     group = os.environ.get("FLINT_MIGRATION_COMPATIBILITY_GROUP", "")
-    if group and backend.kind == "linux-cloud-hypervisor":
+    if group and backend.supports_live_migration:
         return f"{backend.kind}|{cpu}|validated:{group}{migration}"
     return f"{backend.kind}|{cpu}|{platform.release()}|{vmm}{migration}"
 
@@ -87,7 +87,7 @@ def capacity() -> dict:
         disk_free = st.f_bavail * st.f_frsize // (1 << 20)
     except OSError:
         disk_free = 0
-    from flint.core import _netns
+    from flint.core.net import netns as _netns
 
     max_vms = config.MAX_VMS or max(1, min(250, mem_total // 256))
     return {
@@ -306,12 +306,9 @@ class ClusterAgent:
             raise RuntimeError("this host's lease has lapsed")
 
     def _patch_state(self) -> dict:
-        mgr = self.daemon.manager
-        with mgr._lock:
-            processes = {e.vm_id: e.pid for e in mgr._sandboxes.values()
-                         if e.state == SandboxState.RUNNING and e.pid > 1}
-        binary = config.FIRECRACKER_BINARY if self.daemon.backend.kind == "linux-firecracker" else config.CH_BINARY
-        return self._inventory.report(binary, processes)
+        processes = {e.vm_id: e.pid for e in self.daemon.manager.entries()
+                     if e.state == SandboxState.RUNNING and e.pid > 1}
+        return self._inventory.report(self.daemon.backend.vmm_binary(), processes)
 
     def _vm_reports(self) -> list[dict]:
         mgr = self.daemon.manager
@@ -359,7 +356,7 @@ class ClusterAgent:
     def export_pause(self, vm_id: str, snapshot_id: str, upload: str = "sync") -> dict:
         """Snapshot a paused VM's files into the store."""
         row = self.daemon._state_store.get_sandbox(vm_id)
-        if not row or row["state"] != SandboxState.PAUSED.value:
+        if not row or row.state != SandboxState.PAUSED:
             raise RuntimeError(f"{vm_id} is not paused")
         root, files = self.daemon.backend.pause_files(row)
         res = self.snapd.create(snapshot_id, "pause", root, files, upload=upload,

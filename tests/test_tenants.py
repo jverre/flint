@@ -370,7 +370,7 @@ print("proxy cannot read host resources or change its network")
         assert json.loads(out)["headers"].get("x-flint-auth") == secret, out
         import sqlite3
         from pathlib import Path
-        from flint.core._proxy import _RULES_DIR
+        from flint.core.net.proxy import _RULES_DIR
         with sqlite3.connect(os.path.join(TEST_STATE_DIR, "flint.db")) as db:
             proxy_ns = db.execute("SELECT ns_name FROM sandboxes WHERE vm_id = ?", (a1,)).fetchone()[0]
         a.pause(a1)

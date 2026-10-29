@@ -95,7 +95,7 @@ class StorageBackend(ABC):
         req = urllib.request.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
 
-        from ..backends.linux_firecracker import _enter_netns, _restore_netns
+        from ..net.netns import _enter_netns, _restore_netns
         orig_fd = _enter_netns(ns_name)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:

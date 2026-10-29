@@ -74,8 +74,8 @@ class LifecycleManager:
         now = time.time()
         error_rows = self._store.list_in_state(SandboxState.ERROR) + self._store.list_in_state(SandboxState.DELETING)
         for row in error_rows:
-            vm_id = row["vm_id"]
-            deleting = row["state"] == SandboxState.DELETING.value
+            vm_id = row.vm_id
+            deleting = row.state == SandboxState.DELETING
             updated_at = row.get("deletion_attempt_at", 0) if deleting else row.get("state_changed_at", row["updated_at"])
             if now - updated_at >= (5 if deleting else self._error_cleanup_delay):
                 sid = vm_id[:8]

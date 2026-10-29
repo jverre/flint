@@ -146,6 +146,22 @@ def test_pty_session(sandbox):
         pty.kill()
 
 
+def test_terminal_websocket_runs_an_interactive_shell(sandbox):
+    """The web UI's terminal: a shell on a PTY, bridged over one WebSocket."""
+    from .conftest import ws_connect
+
+    term = ws_connect(f"/vms/{sandbox.id}/terminal")
+    try:
+        term.send(b"echo term-$((40+2))\n")
+        out = b""
+        deadline = time.monotonic() + 15
+        while b"term-42" not in out and time.monotonic() < deadline:
+            out += term.recv(timeout=5)
+        assert b"term-42" in out, out[-300:]
+    finally:
+        term.close()
+
+
 # ── Concurrent execution ─────────────────────────────────────────────────────
 
 
@@ -198,10 +214,16 @@ def test_pause_and_resume(sandbox):
     sandbox.pause()
     listed = {vm["vm_id"]: vm["state"] for vm in api.get(f"{BASE_URL}/vms", timeout=10.0).json()["vms"]}
     assert listed.get(sandbox.id) == "Paused", f"paused VM missing from GET /vms: {listed}"
+    again = api.post(f"{BASE_URL}/vms/{sandbox.id}/pause", timeout=30.0)
+    assert again.status_code == 409, f"pausing a paused VM: {again.status_code} {again.text}"
     sandbox.resume()
     result = sandbox.commands.run("cat /tmp/persist.txt")
     assert result.exit_code == 0
     assert "persisted" in result.stdout
+    again = api.post(f"{BASE_URL}/vms/{sandbox.id}/resume", timeout=30.0)
+    assert again.status_code == 409, f"resuming a running VM: {again.status_code} {again.text}"
+    unknown = api.post(f"{BASE_URL}/vms/00000000-0000-4000-8000-000000000000/resume", timeout=30.0)
+    assert unknown.status_code == 404, f"resuming an unknown VM: {unknown.status_code} {unknown.text}"
 
 
 # ── Filesystem operations ────────────────────────────────────────────────────

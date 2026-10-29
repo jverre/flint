@@ -13,7 +13,7 @@ import pytest
 
 from flint.cluster import maintenance
 from flint.core import _shared_rootfs as disks
-from flint.core._migration_network import MigrationNetwork
+from flint.core.net.migration_network import MigrationNetwork
 
 VM = "07ce885b-bf8a-41c3-a9c5-6dc9f09cba11"
 POOL = "ec01ae4c-24d2-4cf5-842b-e53f13352074"
@@ -219,7 +219,7 @@ def test_starting_migration_receiver_is_fenced_before_running():
 
 
 def test_migration_api_refuses_unprotected_tcp():
-    from flint.core import _cloud_hypervisor as ch
+    from flint.core.vmm.cloud_hypervisor import api as ch
 
     with pytest.raises(ValueError, match="authenticated"):
         ch.vm_send_migration("ignored", "tcp:10.0.0.2:1234")
@@ -311,7 +311,7 @@ def test_rehearsal_probe_records_continuity_and_connection_resets():
 def test_paused_source_is_never_resumed_against_receiver_disk_writes(monkeypatch):
     from types import SimpleNamespace
     from flint.cluster.live_migration import LiveMigration
-    from flint.core import _cloud_hypervisor as ch
+    from flint.core.vmm.cloud_hypervisor import api as ch
 
     entry = SimpleNamespace(
         socket_path="test", backend_metadata={"maintenance": {"live_phase": "sent"}}
@@ -349,7 +349,7 @@ def test_failed_disk_allocation_does_not_block_other_vms(pool, tmp_path, monkeyp
 def test_receiver_is_not_ready_until_network_cutover_finishes(monkeypatch):
     from types import SimpleNamespace
     from flint.cluster.live_migration import LiveMigration
-    from flint.core import _cloud_hypervisor as ch
+    from flint.core.vmm.cloud_hypervisor import api as ch
 
     entry = SimpleNamespace(
         backend_metadata={

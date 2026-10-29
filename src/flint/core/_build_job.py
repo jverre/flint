@@ -92,9 +92,9 @@ def output_dir(template_id: str) -> str:
 
 def _cleanup(job: Path) -> None:
     from ._limits import stop_processes, vm_cgroup
-    from ._netns import _delete_netns
-    from ._jailer import JailSpec, cleanup_jailer
-    from ._ch_jail import ChJail
+    from .net.netns import _delete_netns
+    from .vmm.firecracker.jail import FirecrackerJail
+    from .vmm.cloud_hypervisor.jail import CloudHypervisorJail
     # Stop the worker and all its host subprocesses before touching resources.
     group = f"/sys/fs/cgroup/flint-builds/{job.name}"
     stop_processes(group)
@@ -106,9 +106,9 @@ def _cleanup(job: Path) -> None:
         stop_processes(vm_cgroup(vm_id, kind))
         _delete_netns(ns)
         if kind == "linux-firecracker":
-            cleanup_jailer(JailSpec(vm_id, ns).chroot_base, vm_id)
+            FirecrackerJail(vm_id).cleanup()
         elif kind == "linux-cloud-hypervisor":
-            ChJail(vm_id).cleanup()
+            CloudHypervisorJail(vm_id).cleanup()
         else:
             raise RuntimeError("Invalid builder backend")
         (Path(config.STATE_DIR) / "builders" / (vm_id + ".json")).unlink(missing_ok=True)
@@ -189,7 +189,7 @@ def run_build(kind: str, name: str, dockerfile: str, size_mb: int) -> dict:
     from ._wipe import wipe_tree
     from ._limits import cgroup_limits
     from ._artifacts import fsync_path
-    from ._netns import _allocate_veth_ip, _release_veth_ip
+    from .net.netns import _allocate_veth_ip, _release_veth_ip
     template_id = _slugify(name)
     job = _root() / uuid.uuid4().hex
     job.mkdir(mode=0o700)

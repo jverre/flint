@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from flint.core._migration_network import MigrationNetwork
+from flint.core.net.migration_network import MigrationNetwork
 from flint.core._shared_rootfs import SharedRootfs
 
 
@@ -96,8 +96,8 @@ class Gateway:
                 with self.lock:
                     namespace = f"fmg-{vm_id}"
                     if self.namespace_exists(vm_id):
-                        from flint.core._migration_network import run
-                        from flint.core._netns import _release_veth_ip
+                        from flint.core.net.migration_network import run
+                        from flint.core.net.netns import _release_veth_ip
 
                         run("ip", "netns", "del", namespace)
                         _release_veth_ip(namespace)
@@ -156,12 +156,15 @@ def main() -> None:
     import ssl
     import uvicorn
     from fastapi import FastAPI, HTTPException
-    from flint.core._netns import ensure_host_firewall, reserve_existing_veth_ips
+    from flint.core import config
+    from flint.core.net.netns import ensure_host_firewall, reserve_existing_veth_ips
 
+    if not config.SHARED_ROOTFS_DIR:
+        raise SystemExit("FLINT_SHARED_ROOTFS_DIR is required")
     reserve_existing_veth_ips()
     ensure_host_firewall()
     gateway = Gateway(
-        SharedRootfs(os.environ["FLINT_SHARED_ROOTFS_DIR"]),
+        SharedRootfs(config.SHARED_ROOTFS_DIR),
         os.environ.get("FLINT_GATEWAY_STATE_DIR", "/var/lib/flint/gateway"),
         set(os.environ["FLINT_MIGRATION_PEERS"].split(",")),
     )
@@ -191,8 +194,6 @@ def main() -> None:
             raise ValueError("unknown network action")
         except (KeyError, ValueError, OSError) as exc:
             raise HTTPException(409, str(exc)) from exc
-
-    from flint.core import config
 
     identity = config.CLUSTER_IDENTITY_DIR
     uvicorn.run(

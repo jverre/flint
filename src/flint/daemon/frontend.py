@@ -1,15 +1,13 @@
 """Unprivileged API-side adapters for the local Linux runtime."""
 from __future__ import annotations
 
-import asyncio
-import base64
 from contextlib import nullcontext
-import json
 import re
 import threading
 from types import SimpleNamespace
 
-from flint.core import _guest_http
+from flint.core.guest import GuestAgent, bridge_terminal
+from flint.core.policy import as_json
 
 from .runtime_protocol import RuntimeClient
 
@@ -38,7 +36,7 @@ class Manager:
         return Record(**result) if result else None
 
     def create(self, **kwargs):
-        return self.client.request("vm.create", **{k: v for k, v in kwargs.items() if v is not None})
+        return self.client.request("vm.create", **{k: as_json(v) for k, v in kwargs.items() if v is not None})
 
     def pause(self, sandbox_id):
         return self.client.request("vm.pause", sandbox_id=sandbox_id)
@@ -50,7 +48,7 @@ class Manager:
         return self.client.request("vm.timeout", sandbox_id=sandbox_id, timeout_seconds=timeout_seconds, policy=policy)
 
     def update_network_policy(self, sandbox_id, policy):
-        return self.client.request("vm.policy.set", sandbox_id=sandbox_id, policy=policy)
+        return self.client.request("vm.policy.set", sandbox_id=sandbox_id, policy=as_json(policy))
 
     def get_network_policy(self, sandbox_id):
         return self.client.request("vm.policy.get", sandbox_id=sandbox_id)
@@ -63,46 +61,8 @@ class Manager:
         # All HTTP response parsing and guest-controlled bytes stay here.
         return self.client.request("vm.connect", sandbox_id=sandbox_id)
 
-    async def _call(self, sandbox_id, method, path, body=None, timeout=65):
-        sock = await asyncio.to_thread(self.connect_agent, sandbox_id)
-        return await _guest_http.call(sock, method, path, body, timeout)
-
     async def bridge_terminal(self, sandbox_id, websocket):
-        from websockets.asyncio.client import connect
-        await websocket.accept()
-        status, body = await self._call(sandbox_id, "POST", "/processes",
-            json.dumps({"cmd": ["/bin/sh", "-i"], "pty": True, "cols": 120, "rows": 40}).encode())
-        if status != 201:
-            await websocket.close(code=1011, reason="Failed to create PTY process")
-            return
-        pid = json.loads(body)["pid"]
-        sock = await asyncio.to_thread(self.connect_agent, sandbox_id)
-        try:
-            await _guest_http.wait_connected(sock)
-            async with connect(f"ws://guest/processes/{pid}/output", sock=sock, proxy=None) as guest:
-                async def output():
-                    async for message in guest:
-                        event = json.loads(message)
-                        if event.get("type") == "exit":
-                            return
-                        if event.get("type") in ("stdout", "stderr") and event.get("data"):
-                            await websocket.send_bytes(base64.b64decode(event["data"]))
-                async def input_():
-                    while True:
-                        data = await websocket.receive_bytes()
-                        await self._call(sandbox_id, "POST", f"/processes/{pid}/input", data, 5)
-                tasks = [asyncio.create_task(output()), asyncio.create_task(input_())]
-                try:
-                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        task.result()
-                finally:
-                    for task in tasks:
-                        task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            sock.close()
-            await self._call(sandbox_id, "POST", f"/processes/{pid}/signal", json.dumps({"signal": 9}).encode(), 5)
+        await bridge_terminal(GuestAgent(lambda: self.connect_agent(sandbox_id)), websocket)
 
 
 class Volumes:

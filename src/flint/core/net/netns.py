@@ -13,7 +13,7 @@ import threading
 from pyroute2 import netns as pynetns
 from pyroute2 import IPRoute, NetNS
 
-from .config import (
+from ..config import (
     HOST_TAP_MAC, HOST_IP, GUEST_IP, GUEST_MAC,
     BRIDGE_NAME, BRIDGE_IP, BRIDGE_CIDR, VETH_SUBNET, PROXY_PORT,
     HOST_INPUT_CHAIN, HOST_FORWARD_CHAIN, log,
@@ -246,7 +246,7 @@ def storage_endpoints() -> tuple[tuple[str, str, int], ...]:
     workspaces) and NBD (exclusive volumes); plus the S3 Files endpoint when
     that backend is configured.
     """
-    from . import config
+    from .. import config
 
     endpoints = [(BRIDGE_IP, "tcp", port) for port in (config.R2NFS_PORT, config.NBD_PORT, config.NBD_RO_PORT)]
     if config.STORAGE_BACKEND == "s3_files" and config.S3_FILES_NFS_ENDPOINT:
@@ -444,7 +444,7 @@ def _setup_netns_pyroute2(ns_name: str, tap_name: str, *, internet: bool = True,
     else:
         veth_ip = ""
     _apply_netns_firewall(ns_name, veth_ns)
-    from ._limits import network_limits
+    from .._limits import network_limits
     network_limits(ns_name, tap_name)
     return veth_ip
 
@@ -463,7 +463,7 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
 
     if not internet:
         _apply_netns_firewall(ns_name, None)
-        from ._limits import network_limits
+        from .._limits import network_limits
         network_limits(ns_name, tap_name)
         return ""
 
@@ -489,7 +489,7 @@ def _setup_netns_subprocess(ns_name: str, tap_name: str, *, internet: bool = Tru
     run_in_ns(["ip", "link", "set", veth_ns, "up"])
     run_in_ns(["ip", "route", "add", "default", "via", BRIDGE_IP])
     _apply_netns_firewall(ns_name, veth_ns)
-    from ._limits import network_limits
+    from .._limits import network_limits
     network_limits(ns_name, tap_name)
     return veth_ip
 
@@ -513,7 +513,7 @@ def _remove_proxy_redirect(ns_name: str) -> None:
 
 def reconcile_namespace(ns_name: str, *, proxy: bool = False) -> None:
     """Upgrade a recovered namespace and reapply its host-enforced ceilings."""
-    from ._limits import network_limits
+    from .._limits import network_limits
     result = subprocess.run(["ip", "-n", ns_name, "-j", "-4", "addr", "show"],
                             check=True, text=True, capture_output=True)
     links = json.loads(result.stdout)

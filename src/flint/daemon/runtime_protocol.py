@@ -83,7 +83,11 @@ class RuntimeClient:
             from flint.core._quotas import QuotaExceeded
             from flint.core._volumes import VolumeError
             from flint.core._wipe import WipeError
+            from flint.core.errors import BY_NAME as SANDBOX_ERRORS
             error = result["error"]
+            if error["kind"] in SANDBOX_ERRORS:
+                # The API's exception handler maps these to their status.
+                raise SANDBOX_ERRORS[error["kind"]](error["detail"])
             errors = {"ValueError": ValueError, "RuntimeError": RuntimeError, "WipeError": WipeError,
                       "QuotaExceeded": QuotaExceeded, "AuthError": AuthError, "VolumeError": VolumeError}
             kind = errors.get(error["kind"], RuntimeError)

@@ -104,8 +104,6 @@ class Runtime:
     def connect(self, sandbox_id: str):
         # Returns with the connection still in progress: a guest that drops
         # the SYN must not hold one of the runtime's request slots.
-        if self.daemon.manager.get_entry(sandbox_id) is None:
-            raise ValueError("VM not found")
         return self.daemon.manager.connect_agent(sandbox_id)
 
     def usage(self, tenant: str):

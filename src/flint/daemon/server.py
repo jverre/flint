@@ -15,23 +15,25 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 import uvicorn
 
-from flint.core.backends import get_host_backend
+from flint.core.backends import resolve_backend
 from flint.core.config import (
     log, DAEMON_HOST, DAEMON_PORT, DAEMON_DIR, DAEMON_STATE_PATH, DAEMON_PID_PATH,
     TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, DAEMON_SOCKET, ADMIN_TOKEN_PATH,
     DAEMON_DB_PATH, HEALTH_CHECK_INTERVAL, ERROR_CLEANUP_DELAY,
     WORKSPACE_DIR,
 )
+from flint.core.errors import SandboxError, SandboxNotFound
 from flint.core.manager import SandboxManager
-from flint.core.types import SandboxState
+from flint.core.policy import NetworkPolicy, PolicyError
+from flint.core.types import Maintenance, SandboxState
 from flint.core._template_registry import (
     list_templates as _local_list_templates, get_template as _local_get_template, delete_template as _delete_template,
 )
 from flint.core._volumes import DEFAULT_SIZE_GIB, Volumes, VolumeError
 from flint.core._quotas import QuotaExceeded, Quotas, Usage
 from flint.core import _nfs_server
-from flint.core import _guest_http
-from flint.core._guest_http import GuestAgentError
+from flint.core.guest import http as _guest_http
+from flint.core.guest.http import GuestAgentError
 from flint.core._metrics import MetricsSampler
 from flint.core import _logs
 from flint.daemon import events as _events
@@ -67,6 +69,13 @@ async def _auth_error(_request: Request, e: AuthError):
 async def _guest_agent_error(_request: Request, e: GuestAgentError):
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": e.detail}, status_code=e.status)
+
+
+@app.exception_handler(SandboxError)
+async def _sandbox_error(_request: Request, e: SandboxError):
+    """The one place the manager's errors become HTTP statuses (404 not found, 409 wrong state…)."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": e.detail}, status_code=e.status or 500)
 
 
 @app.exception_handler(QuotaExceeded)
@@ -146,32 +155,12 @@ def _require_entry(vm_id: str):
     return entry
 
 
-def _validate_network_policy(policy: object) -> None:
-    """Basic schema validation for a network policy dict. Raises HTTPException on invalid input."""
-    if not isinstance(policy, dict):
-        raise HTTPException(status_code=400, detail="Network policy must be a JSON object")
-    allow = policy.get("allow")
-    if allow is not None:
-        if not isinstance(allow, dict):
-            raise HTTPException(status_code=400, detail="'allow' must be a JSON object mapping domains to rule lists")
-        for domain, rules in allow.items():
-            if not isinstance(domain, str):
-                raise HTTPException(status_code=400, detail=f"Domain key must be a string, got {type(domain).__name__}")
-            if not isinstance(rules, list):
-                raise HTTPException(status_code=400, detail=f"Rules for domain '{domain}' must be a list")
-            for rule in rules:
-                if not isinstance(rule, dict):
-                    raise HTTPException(status_code=400, detail=f"Each rule for domain '{domain}' must be a JSON object")
-                for transform in rule.get("transform", []):
-                    if not isinstance(transform, dict):
-                        raise HTTPException(status_code=400, detail=f"Each transform for domain '{domain}' must be a JSON object")
-                    headers = transform.get("headers")
-                    if headers is not None and not isinstance(headers, dict):
-                        raise HTTPException(status_code=400, detail=f"Transform headers for domain '{domain}' must be a JSON object")
-                    if isinstance(headers, dict):
-                        for k, v in headers.items():
-                            if not isinstance(k, str) or not isinstance(v, str):
-                                raise HTTPException(status_code=400, detail=f"Header names and values must be strings (domain '{domain}')")
+def _parse_network_policy(policy: object) -> NetworkPolicy:
+    """Parse a network policy's JSON where it enters the API. Raises HTTPException(400) on invalid input."""
+    try:
+        return NetworkPolicy.parse(policy)
+    except PolicyError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 _state_write_lock = threading.Lock()
@@ -297,7 +286,7 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     network_policy = data.get("network_policy")
     if network_policy is not None:
-        _validate_network_policy(network_policy)
+        network_policy = _parse_network_policy(network_policy)
     vm_id = data.get("vm_id") or None
     availability = data.get("availability") or ""
     tenant = data.get("tenant") or tenant
@@ -359,7 +348,7 @@ async def create_vm(request: Request, template_id: str = DEFAULT_TEMPLATE_ID, al
     try:
         with reservation:
             vm_id = await asyncio.to_thread(_create)  # to_thread keeps the caller (eventlog.actor)
-    except QuotaExceeded:
+    except (QuotaExceeded, SandboxError):
         raise
     except _Unfenced as e:
         log.exception("POST /vms — %s", e)
@@ -506,6 +495,8 @@ async def pause_vm(vm_id: str, request: Request):
 
     try:
         snap = await asyncio.to_thread(_pause)
+    except SandboxError:
+        raise
     except Exception as e:
         log.exception("POST /vms/%s/pause — failed", vm_id[:8])
         print(f"POST /vms/{vm_id[:8]}/pause — failed: {e}")
@@ -527,6 +518,8 @@ def resume_vm(vm_id: str):
     mgr = _require_manager()
     try:
         mgr.resume(vm_id)
+    except SandboxError:
+        raise
     except Exception as e:
         log.exception("POST /vms/%s/resume — failed", vm_id[:8])
         print(f"POST /vms/{vm_id[:8]}/resume — failed: {e}")
@@ -565,6 +558,8 @@ async def checkpoint_vm(vm_id: str, request: Request):
                 parent=data.get("parent") or "", upload=data.get("upload") or "sync",
             ),
         )
+    except SandboxError:
+        raise
     except Exception as e:
         log.exception("POST /vms/%s/checkpoint — failed", vm_id[:8])
         raise HTTPException(status_code=500, detail=f"Checkpoint failed: {e}")
@@ -606,10 +601,10 @@ async def update_network_policy(vm_id: str, request: Request):
         body = json.loads(await request.body())
     except (json.JSONDecodeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid JSON in request body")
-    _validate_network_policy(body)
+    policy = _parse_network_policy(body)
     if not _get_daemon().backend.supports_network_policy:
         raise HTTPException(status_code=501, detail=f"Network policy isn't supported on the {_get_daemon().backend.name} backend")
-    mgr.update_network_policy(vm_id, body)
+    mgr.update_network_policy(vm_id, policy)
     print(f"PUT /vms/{vm_id[:8]}/network-policy — updated")
     return {"ok": True}
 
@@ -751,7 +746,7 @@ async def terminal_ws(websocket: WebSocket, vm_id: str):
         return
     try:
         await daemon.manager.bridge_terminal(vm_id, websocket)
-    except RuntimeError:
+    except SandboxNotFound:
         print(f"WS /vms/{vm_id[:8]}/terminal — VM not found")
         await websocket.close(code=1011, reason="VM not found")
     except WebSocketDisconnect:
@@ -1058,7 +1053,7 @@ def list_mounts(vm_id: str):
 def mount_volume(vm_id: str, body: dict):
     """Mount a volume (or a subpath of it) into a running sandbox."""
     entry = _require_manager().get_entry(vm_id)
-    if entry and entry.backend_metadata.get("maintenance",{}).get("root_disk"):
+    if entry and Maintenance.of(entry.backend_metadata).root_disk:
         raise HTTPException(409,"host-local volumes are incompatible with migration networking")
     m = _volume_call(
         _require_volumes().mount, vm_id, body.get("volume"), body.get("path"),
@@ -1342,7 +1337,7 @@ def _listen_tcp(host: str, port: int):
 
 class FlintDaemon:
     def __init__(self) -> None:
-        self.backend = get_host_backend()
+        self.backend = resolve_backend()
         self.manager: SandboxManager | None = None
         self.golden_ready: bool = False
         self.started_at: float = 0.0
@@ -1471,7 +1466,7 @@ class FlintDaemon:
 
     def _init_state_store(self) -> None:
         from flint.core._state_store import StateStore
-        self._state_store = StateStore(DAEMON_DB_PATH)
+        self._state_store = StateStore(DAEMON_DB_PATH, publish=_events.publish)
         from flint.core import config as _cfg
         separate_auth = self.backend.kind.startswith("linux-") and not _cfg.CLUSTER_MODE
         migrated = os.path.isfile(os.path.join(DAEMON_DIR, "api", "flint.db"))
@@ -1486,10 +1481,10 @@ class FlintDaemon:
         print("State store initialized.")
 
     def _init_manager(self) -> None:
-        self.manager = SandboxManager(backend=self.backend, state_store=self._state_store)
+        self.manager = SandboxManager(backend=self.backend, state_store=self._state_store, publish=_events.publish)
         self.volumes = Volumes(self._state_store._conn, self.manager, self._state_store)
         self.manager.kill_hooks.extend((self._release_mounts, self._release_storage))
-        self.metrics = MetricsSampler(lambda: list(self.manager._sandboxes.values()) if self.manager else [], self.backend.usage)
+        self.metrics = MetricsSampler(lambda: self.manager.entries() if self.manager else [], self.backend.usage)
         _events.vm_tenant = lambda vm_id: (self.manager.get_dict(vm_id) or {}).get("tenant", "")
         _write_state(self)
 
@@ -1519,7 +1514,7 @@ class FlintDaemon:
                         "existing VMs with the previous Flint release before upgrading this worker."
                     )
             from flint.core._build_job import recover_builds
-            from flint.core._proxy import cleanup_abandoned_proxies
+            from flint.core.net.proxy import cleanup_abandoned_proxies
             cleanup_abandoned_proxies()
             recover_builds()
             cleanup_abandoned_builders()
@@ -1527,17 +1522,13 @@ class FlintDaemon:
         engine = RecoveryEngine(self._state_store, self.manager)
         report = engine.recover()
         if self.backend.kind.startswith("linux-"):
-            from flint.core._netns import reconcile_namespace
+            from flint.core.net.netns import reconcile_namespace
             for row in self._state_store.list_active():
                 if row["state"] not in ("Running", "Paused"):
                     continue
                 reconcile_namespace(row["ns_name"], proxy=bool(row.get("network_policy_json")))
                 if row["state"] == "Running":
-                    policy = self._state_store.get_network_policy(row["vm_id"])
-                    entry = self.manager.get_entry(row["vm_id"])
-                    if policy and entry:
-                        entry.network_policy = json.loads(policy)
-                        self.manager._apply_network_policy(entry, entry.network_policy)
+                    self.manager.restore_network_policy(row["vm_id"])
         self.manager.refresh_tenant_networks()
         print(f"Recovery: {report}")
 

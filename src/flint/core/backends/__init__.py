@@ -3,14 +3,17 @@
 Built-in backends register themselves via :mod:`.registry` side-effects.
 Third-party backends register via the ``flint.backends`` entry-point group.
 Use :func:`resolve_backend` to build a backend by name (or ``None`` for the
-host default).
+host default). The contract every backend implements is
+:class:`~flint.core.backends.base.BackendPlugin`; anything hypervisor-specific
+stays in the backend (and ``BootResult.metadata``), so the rest of core never
+knows about a particular backend's internals.
 """
 
 from __future__ import annotations
 
 import os
 
-from .api import BackendBootResult, BackendPlugin, HostBackend
+from .base import BackendPlugin, BootResult, RecoveryState
 from .registry import (
     BackendInfo,
     BackendNotFound,
@@ -22,15 +25,14 @@ from .registry import (
 )
 
 __all__ = [
-    "BackendBootResult",
     "BackendInfo",
     "BackendNotFound",
     "BackendPlugin",
-    "HostBackend",
+    "BootResult",
+    "RecoveryState",
     "available",
     "default_for_host",
     "get_backend",
-    "get_host_backend",
     "names",
     "register",
     "resolve_backend",
@@ -58,7 +60,3 @@ def resolve_backend(explicit: str | None = None) -> BackendPlugin:
         )
     return get_backend(name)
 
-
-def get_host_backend() -> BackendPlugin:
-    """Backward-compatible shim: delegates to :func:`resolve_backend`."""
-    return resolve_backend()

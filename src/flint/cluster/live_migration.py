@@ -1,4 +1,9 @@
-"""Cluster live migration lifecycle, with a fenced receiver before cutover."""
+"""Cluster live migration lifecycle, with a fenced receiver before cutover.
+
+Each side records where the migration stands as the VM's
+:class:`~flint.core.types.Maintenance` ``live_phase`` (persisted through the
+sandbox manager), so a restart or the control plane can tell what happened.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,12 @@ import os
 import threading
 import time
 
-from flint.core import config, _cloud_hypervisor as ch
-from flint.core._ch_jail import ChJail, JAIL_ROOTFS
-from flint.core._migration_network import configured_network
+from flint.core import config
+from flint.core.vmm.cloud_hypervisor import api as ch
+from flint.core.vmm.cloud_hypervisor.jail import JAIL_ROOTFS, CloudHypervisorJail
+from flint.core.net.migration_network import configured_network
 from flint.core._shared_rootfs import configured_pool
-from flint.core.types import SandboxState, _SandboxEntry
+from flint.core.types import BootResult, LivePhase, Maintenance, SandboxRow, SandboxState, _SandboxEntry
 from .gateway import gateway_request
 from .migration_transport import MigrationRelay
 
@@ -24,12 +30,16 @@ class LiveMigration:
         self.workers: dict[str, threading.Thread] = {}
         self.lock = threading.Lock()
 
-    def _persist(self, entry):
-        self.daemon._state_store.update_sandbox(
-            entry.vm_id,
-            backend_meta_json=json.dumps(entry.backend_metadata),
-            availability=entry.availability,
-        )
+    def _record(self, entry, phase: LivePhase | None = None, *, state: SandboxState | None = None, **changes) -> Maintenance:
+        """Update the VM's maintenance state (``live_phase`` and ``changes``) and persist it."""
+        maintenance = Maintenance.of(entry.backend_metadata)
+        if phase is not None:
+            maintenance.live_phase = phase
+        for name, value in changes.items():
+            setattr(maintenance, name, value)
+        maintenance.save(entry.backend_metadata)
+        self.daemon.manager.save(entry, state=state)
+        return maintenance
 
     @staticmethod
     def _version(socket_path):
@@ -39,7 +49,7 @@ class LiveMigration:
         return json.loads(raw)["version"]
 
     def prepare(self, vm_id: str, body: dict) -> dict:
-        if self.daemon.backend.kind != "linux-cloud-hypervisor":
+        if not self.daemon.backend.supports_live_migration:
             raise ValueError("live migration requires Cloud Hypervisor")
         pool = configured_pool()
         if not pool or pool.pool_id != body["pool_id"]:
@@ -50,7 +60,7 @@ class LiveMigration:
         if disk["vni"] != body["vni"]:
             raise ValueError("migration network identity differs")
         net = configured_network(vm_id, disk["vni"])
-        jail = ChJail(vm_id)
+        jail = CloudHypervisorJail(vm_id)
         mgr = self.daemon.manager
         with self.lock:
             if mgr.get_entry(vm_id) or os.path.exists(jail.base):
@@ -60,7 +70,7 @@ class LiveMigration:
             namespace = ""
             try:
                 jail.prepare()
-                with open(f"{jail.base}/shared-rootfs", "x") as marker:
+                with open(jail.shared_disk_marker, "x") as marker:
                     marker.write(pool.pool_id)
                 disk = pool.attach(
                     vm_id, jail.host_path(JAIL_ROOTFS), expected=body["root_disk"]
@@ -68,56 +78,40 @@ class LiveMigration:
                 gateway_request("prepare", vm_id, internet=body["internet"])
                 namespace, tap = net.setup_compute(body["internet"])
                 process = jail.spawn(namespace)
-                entry = _SandboxEntry(
+                maintenance = Maintenance(
+                    root_disk=disk,
+                    network=body["network"],
+                    live_phase=LivePhase.RECEIVING,
+                    original_availability=body["availability"],
+                )
+                receiver = BootResult(
                     vm_id=vm_id,
                     process=process,
-                    pid=process.pid,
                     vm_dir=jail.root,
-                    socket_path=jail.socket_path,
-                    ns_name=namespace,
-                    guest_ip=config.GUEST_IP,
                     agent_url=f"http://{config.GUEST_IP}:{config.AGENT_PORT}",
-                    agent_healthy=False,
-                    state=SandboxState.STARTING,
+                    guest_ip=config.GUEST_IP,
+                    ns_name=namespace,
+                    socket_path=jail.socket_path,
                     chroot_base=jail.base,
-                    backend_kind=self.daemon.backend.kind,
+                    metadata={
+                        "tap_name": tap,
+                        "veth_ip": "",
+                        "resources": body["resources"],
+                        "maintenance": maintenance.to_json(),
+                    },
+                )
+                entry = _SandboxEntry.from_boot(
+                    receiver,
+                    kind=self.daemon.backend.kind,
                     template_id=body["template_id"],
                     tenant=body["tenant"],
                     # Even ephemeral receivers are fenced until the CP commits.
                     availability=body["availability"]
                     if body["availability"] in ("durable", "restartable")
                     else "restartable",
-                    backend_metadata={
-                        "api_socket": jail.socket_path,
-                        "ns_name": namespace,
-                        "tap_name": tap,
-                        "veth_ip": "",
-                        "resources": body["resources"],
-                        "maintenance": {
-                            "root_disk": disk,
-                            "network": body["network"],
-                            "live_phase": "receiving",
-                            "original_availability": body["availability"],
-                        },
-                    },
-                )
-                self.daemon._state_store.insert_sandbox(
-                    vm_id=vm_id,
-                    pid=process.pid,
-                    vm_dir=jail.root,
-                    socket_path=jail.socket_path,
-                    ns_name=namespace,
                     state=SandboxState.STARTING,
-                    daemon_pid=os.getpid(),
-                    template_id=entry.template_id,
-                    tenant=entry.tenant,
-                    availability=entry.availability,
-                    backend_kind=entry.backend_kind,
-                    chroot_base=jail.base,
-                    backend_meta_json=entry.backend_metadata,
                 )
-                with mgr._lock:
-                    mgr._sandboxes[vm_id] = entry
+                mgr.adopt(entry)
                 self.agent.fence_started(vm_id)
                 version = self._version(jail.socket_path)
                 port = relay.receiver(
@@ -134,25 +128,14 @@ class LiveMigration:
                         )
                         # CH has already resumed the guest. Persist this irreversible
                         # boundary before routing work that can still fail.
-                        entry.backend_metadata["maintenance"]["live_phase"] = "cutover"
-                        entry.backend_metadata["maintenance"]["live_executed"] = True
-                        self._persist(entry)
+                        self._record(entry, LivePhase.CUTOVER, live_executed=True)
                         gateway_request("activate", vm_id)
                         net.announce()
-                        entry.backend_metadata["maintenance"]["live_phase"] = "received"
-                        entry.state = SandboxState.RUNNING
                         entry.agent_healthy = True
-                        self._persist(entry)
-                        self.daemon._state_store.transition_state(
-                            vm_id, SandboxState.RUNNING
-                        )
+                        self._record(entry, LivePhase.RECEIVED, state=SandboxState.RUNNING)
                     except Exception as exc:
-                        if entry.backend_metadata["maintenance"].get("live_executed"):
-                            entry.backend_metadata["maintenance"]["live_phase"] = (
-                                "cutover_failed"
-                            )
-                        entry.backend_metadata["maintenance"]["live_error"] = str(exc)
-                        self._persist(entry)
+                        executed = Maintenance.of(entry.backend_metadata).live_executed
+                        self._record(entry, LivePhase.CUTOVER_FAILED if executed else None, live_error=str(exc))
                         # An uncertain receiver must never be left running.
                         mgr.kill(vm_id)
                     finally:
@@ -172,12 +155,11 @@ class LiveMigration:
                     process.kill()
                     process.wait(timeout=5)
                 if namespace:
-                    from flint.core._netns import _delete_netns
+                    from flint.core.net.netns import _delete_netns
 
                     _delete_netns(namespace)
                 jail.cleanup()
-                with mgr._lock:
-                    mgr._sandboxes.pop(vm_id, None)
+                mgr.untrack(vm_id)
                 raise
 
     def send(self, vm_id: str, body: dict) -> dict:
@@ -196,26 +178,20 @@ class LiveMigration:
             raise ValueError(
                 "running VMM upgrade pair has not been validated and allowed"
             )
-        maintenance = entry.backend_metadata.get("maintenance", {})
-        if not maintenance.get("root_disk") or not maintenance.get("network"):
+        if not Maintenance.of(entry.backend_metadata).migratable:
             raise ValueError("VM was not booted with migration storage and networking")
         relay = MigrationRelay()
         path = os.path.join(entry.vm_dir, "migration-send.sock")
-        maintenance["live_phase"] = "sending"
-        self._persist(entry)
+        self._record(entry, LivePhase.SENDING)
         self.relays[vm_id] = relay
         t0 = time.monotonic()
         try:
             relay.sender(path, body["address"], body["port"], body["target_host"])
             ch.vm_send_migration(entry.socket_path, "unix:/migration-send.sock")
-            entry.state = SandboxState.PAUSED
-            maintenance["live_phase"] = "sent"
-            self._persist(entry)
-            self.daemon._state_store.transition_state(vm_id, SandboxState.PAUSED)
+            self._record(entry, LivePhase.SENT, state=SandboxState.PAUSED)
             return {"transferred": True, "total_ms": (time.monotonic() - t0) * 1000}
         except Exception:
-            maintenance["live_phase"] = "send_failed"
-            self._persist(entry)
+            self._record(entry, LivePhase.SEND_FAILED)
             raise
         finally:
             relay.close()
@@ -233,11 +209,12 @@ class LiveMigration:
             if row and self._alive(row["pid"]):
                 return {"phase": "unknown", "vmm_state": "Unknown"}
             return {"phase": "absent", "vmm_state": "Absent"}
-        meta = entry.backend_metadata.get("maintenance", {})
+        phase = Maintenance.of(entry.backend_metadata).live_phase
         state = "Unknown"
-        if meta.get("live_phase") in ("receiving", "cutover"):
+        if phase in (LivePhase.RECEIVING, LivePhase.CUTOVER):
+            # The VMM is busy receiving: asking it would block.
             return {
-                "phase": meta["live_phase"],
+                "phase": phase.value,
                 "vmm_state": state,
                 "vm": entry.to_dict(),
             }
@@ -251,7 +228,7 @@ class LiveMigration:
             except ProcessLookupError:
                 state = "Absent"
         return {
-            "phase": meta.get("live_phase", "none"),
+            "phase": phase.value if phase else "none",
             "vmm_state": state,
             "vm": entry.to_dict(),
         }
@@ -275,16 +252,12 @@ class LiveMigration:
             entry = self.daemon.manager.get_entry(vm_id)
             row = self.daemon._state_store.get_sandbox(vm_id)
             pid = entry.pid if entry else (row or {}).get("pid", 0)
-            meta = (
-                entry.backend_metadata
-                if entry
-                else json.loads((row or {}).get("backend_meta_json") or "{}")
+            maintenance = Maintenance.of(
+                entry.backend_metadata if entry else SandboxRow.of(row or {}).backend_metadata
             )
-            executed = bool(
-                meta.get("maintenance", {}).get("live_executed")
-            ) or meta.get("maintenance", {}).get("live_phase") in (
-                "received",
-                "cutover_failed",
+            executed = maintenance.live_executed or maintenance.live_phase in (
+                LivePhase.RECEIVED,
+                LivePhase.CUTOVER_FAILED,
             )
             self.daemon.kill_vm(vm_id)
             worker = self.workers.get(vm_id)
@@ -294,7 +267,7 @@ class LiveMigration:
                     raise RuntimeError("migration receiver has not stopped")
             if self._alive(pid):
                 raise RuntimeError("receiver process death is unconfirmed")
-            if not row and os.path.exists(ChJail(vm_id).base):
+            if not row and os.path.exists(CloudHypervisorJail(vm_id).base):
                 raise RuntimeError("untracked destination jail requires reconciliation")
             return {"phase": "absent", "executed": executed}
 
@@ -313,26 +286,16 @@ class LiveMigration:
             raise ValueError(
                 "source did not resume itself; recover from a coherent checkpoint"
             )
-        entry.state = SandboxState.RUNNING
-        entry.backend_metadata.setdefault("maintenance", {})["live_phase"] = (
-            "rolled_back"
-        )
-        self._persist(entry)
-        self.daemon._state_store.transition_state(vm_id, SandboxState.RUNNING)
+        self._record(entry, LivePhase.ROLLED_BACK, state=SandboxState.RUNNING)
         self.agent.fence_started(vm_id)
         return {"vm": entry.to_dict()}
 
     def commit(self, vm_id: str) -> dict:
         entry = self.daemon.manager.get_entry(vm_id)
-        if (
-            not entry
-            or entry.backend_metadata.get("maintenance", {}).get("live_phase")
-            != "received"
-        ):
+        maintenance = Maintenance.of(entry.backend_metadata) if entry else None
+        if not maintenance or maintenance.live_phase != LivePhase.RECEIVED:
             raise ValueError("receiver has not completed")
-        entry.availability = entry.backend_metadata["maintenance"][
-            "original_availability"
-        ]
-        self._persist(entry)
+        entry.availability = maintenance.original_availability
+        self.daemon.manager.save(entry)
         self.agent._arm_fence()
         return {"vm": entry.to_dict()}

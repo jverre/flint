@@ -11,10 +11,14 @@ import time
 
 from . import _secrets
 from .config import log
-from .types import SandboxState
+from .events import EventSink, discard
+from .types import SandboxRow, SandboxState
 from ._state_machine import validate_transition
 
-_SCHEMA = """
+# Rows from before sandboxes recorded their backend were all Firecracker's.
+LEGACY_BACKEND_KIND = "linux-firecracker"
+
+_SCHEMA_TEMPLATE = """
 CREATE TABLE IF NOT EXISTS sandboxes (
     vm_id          TEXT PRIMARY KEY,
     pid            INTEGER NOT NULL,
@@ -34,7 +38,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     daemon_pid     INTEGER,
     error_message  TEXT,
     chroot_base    TEXT,
-    backend_kind   TEXT NOT NULL DEFAULT 'linux-firecracker',
+    backend_kind   TEXT NOT NULL DEFAULT '{legacy_kind}',
     pause_state_ref TEXT,
     backend_meta_json TEXT
 );
@@ -49,6 +53,7 @@ CREATE TABLE IF NOT EXISTS state_log (
     detail     TEXT
 );
 """
+_SCHEMA = _SCHEMA_TEMPLATE.replace("{legacy_kind}", LEGACY_BACKEND_KIND)
 
 
 def _locked(method):
@@ -67,7 +72,10 @@ def _locked(method):
 
 
 class StateStore:
-    def __init__(self, db_path: str) -> None:
+    """Durable sandbox state. ``publish`` is told of every state transition (``vm.state_changed``)."""
+
+    def __init__(self, db_path: str, publish: EventSink = discard) -> None:
+        self._publish = publish
         self._lock = threading.RLock()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -84,15 +92,15 @@ class StateStore:
         try:
             self._conn.execute("ALTER TABLE sandboxes ADD COLUMN chroot_base TEXT")
             self._conn.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Column already exists
         try:
             self._conn.execute("ALTER TABLE sandboxes ADD COLUMN network_policy_json TEXT")
             self._conn.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass  # Column already exists
         for column_def in (
-            "backend_kind TEXT NOT NULL DEFAULT 'linux-firecracker'",
+            f"backend_kind TEXT NOT NULL DEFAULT '{LEGACY_BACKEND_KIND}'",
             "pause_state_ref TEXT",
             "backend_meta_json TEXT",
             "tenant TEXT NOT NULL DEFAULT ''",
@@ -103,14 +111,14 @@ class StateStore:
             try:
                 self._conn.execute(f"ALTER TABLE sandboxes ADD COLUMN {column_def}")
                 self._conn.commit()
-            except Exception:
-                pass
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         for col in ("backend_vm_ref", "runtime_dir", "guest_arch", "transport_ref"):
             try:
                 self._conn.execute(f"ALTER TABLE sandboxes DROP COLUMN {col}")
                 self._conn.commit()
-            except Exception:
-                pass
+            except sqlite3.OperationalError:
+                pass  # Already dropped
         # VMs from before every VM had a tenant belong to the default one.
         self._conn.execute("UPDATE sandboxes SET tenant = 'default' WHERE tenant = ''")
         self._conn.execute("UPDATE sandboxes SET state_changed_at = updated_at WHERE state_changed_at = 0")
@@ -157,7 +165,7 @@ class StateStore:
         boot_time_ms: float | None = None,
         timings_json: dict | None = None,
         chroot_base: str | None = None,
-        backend_kind: str = "linux-firecracker",
+        backend_kind: str = LEGACY_BACKEND_KIND,
         pause_state_ref: str | None = None,
         backend_meta_json: dict | None = None,
         tenant: str = "",
@@ -210,13 +218,11 @@ class StateStore:
         )
         self._conn.commit()
 
-        # Broadcast to event bus if available. Lazy import to avoid a core→daemon
-        # dependency cycle; a no-op during tests that don't run the daemon.
         try:
-            from flint.daemon.events import publish
-            publish("vm.state_changed", vm_id=vm_id, **{"from": from_state.value, "to": new_state.value})
+            self._publish("vm.state_changed", vm_id=vm_id, **{"from": from_state.value, "to": new_state.value})
         except Exception:
-            pass
+            # The transition is recorded; a listener's failure must not undo it.
+            log.exception("publishing vm.state_changed for %s failed", vm_id[:8])
 
     @_locked
     def update_health(self, vm_id: str, timestamp: float | None = None) -> None:
@@ -279,34 +285,34 @@ class StateStore:
         return _secrets.unseal(stored) if stored else None
 
     @_locked
-    def get_sandbox(self, vm_id: str) -> dict | None:
+    def get_sandbox(self, vm_id: str) -> SandboxRow | None:
         row = self._conn.execute("SELECT * FROM sandboxes WHERE vm_id = ?", (vm_id,)).fetchone()
-        return dict(row) if row else None
+        return SandboxRow(row) if row else None
 
     @_locked
-    def list_active(self) -> list[dict]:
+    def list_active(self) -> list[SandboxRow]:
         """Return sandboxes not in Dead state."""
         rows = self._conn.execute(
             "SELECT * FROM sandboxes WHERE state != ?", (SandboxState.DEAD.value,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [SandboxRow(r) for r in rows]
 
     @_locked
-    def list_expired(self, now: float | None = None) -> list[dict]:
+    def list_expired(self, now: float | None = None) -> list[SandboxRow]:
         """Return sandboxes whose timeout has passed."""
         now = now or time.time()
         rows = self._conn.execute(
             "SELECT * FROM sandboxes WHERE timeout_at IS NOT NULL AND timeout_at < ? AND state NOT IN (?, ?, ?)",
             (now, SandboxState.DEAD.value, SandboxState.PAUSED.value, SandboxState.DELETING.value),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [SandboxRow(r) for r in rows]
 
     @_locked
-    def list_in_state(self, state: SandboxState) -> list[dict]:
+    def list_in_state(self, state: SandboxState) -> list[SandboxRow]:
         rows = self._conn.execute(
             "SELECT * FROM sandboxes WHERE state = ?", (state.value,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [SandboxRow(r) for r in rows]
 
     @_locked
     def delete_sandbox(self, vm_id: str) -> None:
