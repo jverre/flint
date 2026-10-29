@@ -56,8 +56,9 @@ class Runtime:
             raise ValueError("Unknown runtime operation")
         if not isinstance(attribution, list) or len(attribution) != 2 or any(not isinstance(s, str) or len(s) > 512 for s in attribution):
             raise ValueError("Invalid actor")
-        if "vm_id" in args and (not isinstance(args["vm_id"], str) or not _VM_ID.fullmatch(args["vm_id"])):
-            raise SandboxNotFound.of(str(args["vm_id"])[:64])  # no VM has another form of ID
+        vm_id = args.get("vm_id")
+        if vm_id is not None and (not isinstance(vm_id, str) or not _VM_ID.fullmatch(vm_id)):
+            raise SandboxNotFound.of(str(vm_id)[:64])  # no VM has another form of ID
         function = self.operations[name]
         # Reject extra fields, including attempted host paths or command names.
         inspect.signature(function).bind(**args)
@@ -150,16 +151,17 @@ class _Handler(socketserver.BaseRequestHandler):
                 runtime.daemon.api_pid = _pid
             try:
                 value = runtime.dispatch(request)
-                if isinstance(value, socket.socket):
-                    with value:
-                        send(conn, {"value": None}, value.fileno())
-                else:
-                    try:
-                        send(conn, {"value": value}, limit=MAX_RESPONSE)
-                    except ValueError as exc:  # raised before anything is written
-                        raise FlintError("Response too large; request fewer items") from exc
             except Exception as exc:
                 send(conn, {"error": wire_error(exc)})
+                return
+            if isinstance(value, socket.socket):
+                with value:
+                    send(conn, {"value": None}, value.fileno())
+                return
+            try:
+                send(conn, {"value": value}, limit=MAX_RESPONSE)
+            except (TypeError, ValueError):  # not JSON, or too large: raised before anything is written
+                send(conn, {"error": wire_error(FlintError("Response too large; request fewer items"))})
         except (OSError, ValueError):
             pass
         finally:
