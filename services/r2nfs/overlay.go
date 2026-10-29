@@ -90,10 +90,10 @@ func (o *OverlayFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0 {
 		// Write mode: always target sandbox layer.
 		return &r2File{
-			name:    filename,
-			key:     o.sandboxPrefix + filename,
-			r2:      o.r2,
-			cache:   o.cache,
+			name:     filename,
+			key:      o.sandboxPrefix + filename,
+			r2:       o.r2,
+			cache:    o.cache,
 			writable: true,
 		}, nil
 	}
@@ -397,8 +397,8 @@ type r2FileInfo struct {
 	modTime time.Time
 }
 
-func (fi *r2FileInfo) Name() string      { return fi.name }
-func (fi *r2FileInfo) Size() int64       { return fi.size }
+func (fi *r2FileInfo) Name() string { return fi.name }
+func (fi *r2FileInfo) Size() int64  { return fi.size }
 func (fi *r2FileInfo) Mode() fs.FileMode {
 	if fi.isDir {
 		return fs.ModeDir | 0755
