@@ -1,17 +1,17 @@
-package server
-
-// Sign-in with identity providers (SSO) for the people who run Flint: the
-// web UI and the CLI. Same config file and HTTP contract as the single
-// daemon (src/flint/daemon/sso.py; docs/sso.mdx): providers, and rules that
-// map people to admin or tenant-pinned service access. Authorization code
-// flow with PKCE, state and nonce (golang.org/x/oauth2); ID tokens are
-// verified with github.com/coreos/go-oidc.
+// Package sso is sign-in with identity providers for the people who run
+// Flint: the web UI and the CLI. Same config file and HTTP contract as the
+// single daemon (src/flint/daemon/sso.py; docs/sso.mdx): providers, and
+// rules that map people to admin or tenant-pinned service access.
+// Authorization code flow with PKCE, state and nonce (golang.org/x/oauth2);
+// ID tokens are verified with github.com/coreos/go-oidc.
 //
 // Replicas are stateless: the sign-in state rides in a cookie signed with a
 // key kept in the database, a session is a token row, and the CLI's
 // one-time codes are rows any replica can redeem.
+package sso
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -27,20 +27,24 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/jverre/flint/cluster/internal/auth"
+	"github.com/jverre/flint/cluster/internal/httpx"
+	"github.com/jverre/flint/cluster/internal/model"
 	"github.com/jverre/flint/cluster/internal/pki"
+	"github.com/jverre/flint/cluster/internal/store"
 	"golang.org/x/oauth2"
 )
 
 const (
-	sessionCookie = "flint_session"
-	loginCookie   = "flint_login"
-	loginTTL      = 10 * time.Minute
-	cliCodeTTL    = 2 * time.Minute
+	loginCookie = "flint_login"
+	loginTTL    = 10 * time.Minute
+	cliCodeTTL  = 2 * time.Minute
 )
 
 type ssoProviderConfig struct {
@@ -60,14 +64,14 @@ type ssoProviderConfig struct {
 }
 
 type ssoRule struct {
-	Kind        string   `json:"kind"`
-	Tenants     []string `json:"tenants"`
-	Provider    string   `json:"provider"`
-	Email       string   `json:"email"`
-	EmailDomain string   `json:"email_domain"`
-	Group       string   `json:"group"`
-	GithubOrg   string   `json:"github_org"`
-	GithubTeam  string   `json:"github_team"`
+	Kind        auth.Kind `json:"kind"`
+	Tenants     []string  `json:"tenants"`
+	Provider    string    `json:"provider"`
+	Email       string    `json:"email"`
+	EmailDomain string    `json:"email_domain"`
+	Group       string    `json:"group"`
+	GithubOrg   string    `json:"github_org"`
+	GithubTeam  string    `json:"github_team"`
 }
 
 type ssoConfig struct {
@@ -94,9 +98,8 @@ func (i identity) name() string {
 }
 
 var (
-	ssoIDRE     = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	ssoTenantRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
-	ssoLabels   = map[string]string{"google": "Google", "microsoft": "Microsoft", "auth0": "Auth0", "okta": "Okta",
+	ssoIDRE   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	ssoLabels = map[string]string{"google": "Google", "microsoft": "Microsoft", "auth0": "Auth0", "okta": "Okta",
 		"gitlab": "GitLab", "github": "GitHub", "oidc": "SSO"}
 )
 
@@ -197,10 +200,10 @@ func parseSSOConfig(data []byte) (*ssoConfig, error) {
 	}
 	for i, r := range c.Rules {
 		n := i + 1
-		if r.Kind != KindAdmin && r.Kind != KindService {
+		if r.Kind != auth.KindAdmin && r.Kind != auth.KindService {
 			return nil, fmt.Errorf("rule %d: 'kind' must be 'admin' or 'service'", n)
 		}
-		if r.Kind == KindAdmin && len(r.Tenants) > 0 {
+		if r.Kind == auth.KindAdmin && len(r.Tenants) > 0 {
 			return nil, fmt.Errorf("rule %d: admins act for every tenant; only service rules take 'tenants'", n)
 		}
 		if r.Email == "" && r.EmailDomain == "" && r.Group == "" && r.GithubOrg == "" && r.GithubTeam == "" {
@@ -210,7 +213,7 @@ func parseSSOConfig(data []byte) (*ssoConfig, error) {
 			return nil, fmt.Errorf("rule %d: no provider %q", n, r.Provider)
 		}
 		for _, t := range r.Tenants {
-			if !ssoTenantRE.MatchString(t) {
+			if !model.ValidTenant(t) {
 				return nil, fmt.Errorf("rule %d: invalid tenant %q", n, t)
 			}
 		}
@@ -249,7 +252,7 @@ func matchRule(rules []ssoRule, id identity) *ssoRule {
 		case r.Provider != "" && r.Provider != id.Provider,
 			r.Email != "" && strings.ToLower(r.Email) != email,
 			r.EmailDomain != "" && (email == "" || email[strings.LastIndex(email, "@")+1:] != strings.ToLower(strings.TrimPrefix(r.EmailDomain, "@"))),
-			r.Group != "" && !contains(id.Groups, r.Group),
+			r.Group != "" && !slices.Contains(id.Groups, r.Group),
 			r.GithubOrg != "" && !containsFold(id.GithubOrgs, r.GithubOrg),
 			r.GithubTeam != "" && !containsFold(id.GithubTeams, r.GithubTeam):
 			continue
@@ -275,25 +278,37 @@ type ssoRuntime struct {
 	http      *http.Client
 }
 
-// loadSSO reads the config at path ("" or missing file: no SSO).
-func (s *Server) loadSSO(ctx context.Context, path string) error {
+// Service serves sign-in. Without SSO configured it lists no providers and
+// refuses sign-ins.
+type Service struct {
+	store *store.Store
+	auth  *auth.Authenticator
+	rt    *ssoRuntime // nil without SSO
+}
+
+// New reads the config at path ("" or missing file: no SSO).
+func New(ctx context.Context, path string, st *store.Store, a *auth.Authenticator) (*Service, error) {
+	s := &Service{store: st, auth: a}
 	if path == "" {
-		return nil
+		return s, nil
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return s, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg, err := parseSSOConfig(data)
-	if err != nil || len(cfg.Providers) == 0 {
-		return err
-	}
-	key, err := s.db.SetMetaIfAbsent(ctx, "sso_cookie_key", pki.RandomSecret(32))
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if len(cfg.Providers) == 0 {
+		return s, nil
+	}
+	key, err := st.SetMetaIfAbsent(ctx, "sso_cookie_key", pki.RandomSecret(32))
+	if err != nil {
+		return nil, err
 	}
 	rt := &ssoRuntime{cfg: cfg, providers: map[string]*ssoProvider{}, key: []byte(key),
 		http: &http.Client{Timeout: 15 * time.Second}}
@@ -301,9 +316,21 @@ func (s *Server) loadSSO(ctx context.Context, path string) error {
 		rt.providers[p.ID] = &ssoProvider{cfg: p}
 		log.Printf("SSO: %s (%s); its redirect URI is %s", p.Label, p.ID, rt.redirectURI(p.ID))
 	}
-	s.sso = rt
-	return nil
+	s.rt = rt
+	return s, nil
 }
+
+// Routes registers the sign-in endpoints; they are public by nature.
+func (s *Service) Routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /auth/providers", s.handleProviders)
+	mux.HandleFunc("GET /auth/login/{id}", httpx.Handle(s.handleLogin))
+	mux.HandleFunc("GET /auth/callback/{id}", httpx.Handle(s.handleCallback))
+	mux.HandleFunc("POST /auth/cli/exchange", httpx.Handle(s.handleCLIExchange))
+	mux.HandleFunc("GET /auth/me", httpx.Handle(s.handleMe))
+	mux.HandleFunc("POST /auth/logout", httpx.Handle(s.handleLogout))
+}
+
+var errNotConfigured = httpx.NotFound("SSO isn't configured")
 
 func (rt *ssoRuntime) redirectURI(pid string) string {
 	return rt.cfg.PublicURL + "/auth/callback/" + pid
@@ -401,26 +428,24 @@ func ssoPage(w http.ResponseWriter, status int, title, text string) {
 		`<p><a style="color:#9cc1ff" href="/ui/">Back to Flint</a></p></div>`, html.EscapeString(title), html.EscapeString(title), html.EscapeString(text))
 }
 
-func (s *Server) handleSSOProviders(w http.ResponseWriter, r *http.Request) {
+func (s *Service) handleProviders(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]string{}
-	if s.sso != nil {
-		for _, p := range s.sso.cfg.Providers {
+	if s.rt != nil {
+		for _, p := range s.rt.cfg.Providers {
 			out = append(out, map[string]string{"id": p.ID, "label": p.Label, "type": p.Type})
 		}
 	}
-	writeJSON(w, 200, map[string]any{"providers": out})
+	httpx.WriteJSON(w, 200, map[string]any{"providers": out})
 }
 
-func (s *Server) handleSSOLogin(w http.ResponseWriter, r *http.Request) {
-	if s.sso == nil {
-		writeErr(w, 404, "SSO isn't configured")
-		return
+func (s *Service) handleLogin(w http.ResponseWriter, r *http.Request) error {
+	if s.rt == nil {
+		return errNotConfigured
 	}
 	pid := r.PathValue("id")
-	p, err := s.sso.client(r.Context(), pid)
+	p, err := s.rt.client(r.Context(), pid)
 	if err != nil {
-		writeErr(w, 404, err.Error())
-		return
+		return httpx.NotFound(err.Error())
 	}
 	q := r.URL.Query()
 	st := loginState{Provider: pid, State: randomString(), Nonce: randomString(), Verifier: oauth2.GenerateVerifier(),
@@ -429,102 +454,106 @@ func (s *Server) handleSSOLogin(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(port, "%d", &st.CLIPort)
 		st.CLIChallenge = q.Get("cli_challenge")
 		if st.CLIPort < 1024 || st.CLIPort > 65535 || len(st.CLIChallenge) < 20 || len(st.CLIChallenge) > 128 {
-			writeErr(w, 400, "Bad cli_port or cli_challenge")
-			return
+			return httpx.BadRequest("Bad cli_port or cli_challenge")
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: s.sso.sign(st), Path: "/auth/", MaxAge: int(loginTTL.Seconds()),
-		HttpOnly: true, Secure: s.sso.secure(), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: loginCookie, Value: s.rt.sign(st), Path: "/auth/", MaxAge: int(loginTTL.Seconds()),
+		HttpOnly: true, Secure: s.rt.secure(), SameSite: http.SameSiteLaxMode})
 	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(st.Verifier)}
 	if p.cfg.Type != "github" {
 		opts = append(opts, oidc.Nonce(st.Nonce))
 	}
 	http.Redirect(w, r, p.oauth.AuthCodeURL(st.State, opts...), http.StatusFound)
+	return nil
 }
 
-func (s *Server) handleSSOCallback(w http.ResponseWriter, r *http.Request) {
-	if s.sso == nil {
-		writeErr(w, 404, "SSO isn't configured")
-		return
+func (s *Service) handleCallback(w http.ResponseWriter, r *http.Request) error {
+	if s.rt == nil {
+		return errNotConfigured
 	}
 	pid := r.PathValue("id")
 	c, err := r.Cookie(loginCookie)
 	st, ok := loginState{}, false
 	if err == nil {
-		st, ok = s.sso.open(c.Value)
+		st, ok = s.rt.open(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{Name: loginCookie, Path: "/auth/", MaxAge: -1})
 	if !ok || st.Provider != pid || subtle.ConstantTimeCompare([]byte(st.State), []byte(r.URL.Query().Get("state"))) != 1 {
 		ssoPage(w, 400, "Sign-in expired", "Start again from Flint.")
-		return
+		return nil
 	}
-	p, err := s.sso.client(r.Context(), pid)
+	p, err := s.rt.client(r.Context(), pid)
 	if err != nil {
 		ssoPage(w, 502, "Sign-in failed", err.Error())
-		return
+		return nil
 	}
 	if e := r.URL.Query().Get("error"); e != "" {
-		ssoPage(w, 400, "Sign-in failed", p.cfg.Label+" said: "+firstNonEmpty(r.URL.Query().Get("error_description"), e))
-		return
+		ssoPage(w, 400, "Sign-in failed", p.cfg.Label+" said: "+cmp.Or(r.URL.Query().Get("error_description"), e))
+		return nil
 	}
-	ctx := oidc.ClientContext(r.Context(), s.sso.http)
+	ctx := oidc.ClientContext(r.Context(), s.rt.http)
 	tok, err := p.oauth.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(st.Verifier))
 	if err != nil {
 		log.Printf("SSO %s: code exchange: %v", pid, err)
 		ssoPage(w, 400, "Sign-in failed", p.cfg.Label+" refused the sign-in.")
-		return
+		return nil
 	}
 	var who identity
 	if p.cfg.Type == "github" {
-		who, err = githubIdentity(ctx, s.sso.http, p.cfg, tok)
+		who, err = githubIdentity(ctx, s.rt.http, p.cfg, tok)
 	} else {
 		who, err = oidcIdentity(ctx, p, tok, st.Nonce)
 	}
 	if err != nil {
 		log.Printf("SSO %s: %v", pid, err)
 		ssoPage(w, 502, "Sign-in failed", "Couldn't check who you are with "+p.cfg.Label+".")
-		return
+		return nil
 	}
-	rule := matchRule(s.sso.cfg.Rules, who)
+	rule := matchRule(s.rt.cfg.Rules, who)
 	if rule == nil {
 		log.Printf("SSO %s: %s has no access (no rule matches)", pid, who.name())
 		s.auditSignIn(r, "anonymous", who.name(), "/auth/callback/"+pid, 403)
-		shown := firstNonEmpty(who.Email, who.Login, who.Subject)
+		shown := cmp.Or(who.Email, who.Login, who.Subject)
 		ssoPage(w, 403, "No access", shown+" isn't allowed to use this Flint. Ask its admin to add a rule for you.")
-		return
+		return nil
 	}
-	ttl := time.Duration(s.sso.cfg.SessionHours * float64(time.Hour))
+	ttl := time.Duration(s.rt.cfg.SessionHours * float64(time.Hour))
 	log.Printf("SSO %s: %s signed in as %s %v", pid, who.name(), rule.Kind, rule.Tenants)
 	if st.CLIPort != 0 {
 		code := randomString()
-		grant, _ := json.Marshal(map[string]any{"kind": rule.Kind, "tenants": nonNil(rule.Tenants), "identity": who.name(),
-			"ttl_ms": ttl.Milliseconds()})
-		if _, err := s.db.Exec(r.Context(), `DELETE FROM sso_codes WHERE expires_at < ?`, nowMs()); err != nil {
-			log.Printf("SSO: pruning codes: %v", err)
-		}
-		if _, err := s.db.Exec(r.Context(), `INSERT INTO sso_codes (code_hash, grant_json, challenge, expires_at) VALUES (?, ?, ?, ?)`,
-			pki.HashSecret(code), string(grant), st.CLIChallenge, nowMs()+cliCodeTTL.Milliseconds()); err != nil {
+		grant, _ := json.Marshal(cliGrant{Kind: rule.Kind, Tenants: nonNil(rule.Tenants), Identity: who.name(), TTLms: ttl.Milliseconds()})
+		if err := s.store.InsertSSOCode(r.Context(), pki.HashSecret(code), string(grant), st.CLIChallenge,
+			model.NowMs()+cliCodeTTL.Milliseconds()); err != nil {
 			ssoPage(w, 500, "Sign-in failed", err.Error())
-			return
+			return nil
 		}
 		http.Redirect(w, r, fmt.Sprintf("http://127.0.0.1:%d/callback?%s", st.CLIPort, url.Values{"code": {code}}.Encode()), http.StatusFound)
-		return
+		return nil
 	}
-	sid, token, expires, err := s.createSession(r.Context(), rule.Kind, rule.Tenants, who.name(), ttl)
+	sid, token, expires, err := s.auth.CreateSession(r.Context(), rule.Kind, rule.Tenants, who.name(), ttl)
 	if err != nil {
 		ssoPage(w, 500, "Sign-in failed", err.Error())
-		return
+		return nil
 	}
 	s.auditSignIn(r, "token:"+sid, who.name(), "/auth/callback/"+pid, 302)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", Expires: time.UnixMilli(expires),
-		HttpOnly: true, Secure: s.sso.secure(), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: token, Path: "/", Expires: time.UnixMilli(expires),
+		HttpOnly: true, Secure: s.rt.secure(), SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, st.Next, http.StatusFound)
+	return nil
+}
+
+// cliGrant is what a CLI's one-time code redeems for.
+type cliGrant struct {
+	Kind     auth.Kind `json:"kind"`
+	Tenants  []string  `json:"tenants"`
+	Identity string    `json:"identity"`
+	TTLms    int64     `json:"ttl_ms"`
 }
 
 // auditSignIn records a sign-in (or a refused one) in the audit log.
-func (s *Server) auditSignIn(r *http.Request, actor, who, path string, status int) {
-	if err := s.appendAudit(r.Context(), auditEntry{Actor: actor, ActorName: who, Method: r.Method,
-		Path: path, Status: status}); err != nil {
+func (s *Service) auditSignIn(r *http.Request, actor, who, path string, status int) {
+	if err := s.store.AppendAudit(r.Context(), store.AuditEntry{Actor: actor, ActorName: who, Method: r.Method,
+		Path: path, Status: status}, model.NowMs()); err != nil {
 		log.Printf("audit: sign-in of %s: %v", who, err)
 	}
 }
@@ -627,99 +656,54 @@ func githubIdentity(ctx context.Context, hc *http.Client, p ssoProviderConfig, t
 	return who, nil
 }
 
-func (s *Server) handleSSOCLIExchange(w http.ResponseWriter, r *http.Request) {
+var errBadCode = httpx.BadRequest("Invalid or expired sign-in code")
+
+func (s *Service) handleCLIExchange(w http.ResponseWriter, r *http.Request) error {
 	var body struct{ Code, Verifier string }
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body) != nil || body.Code == "" {
-		writeErr(w, 400, "Invalid or expired sign-in code")
-		return
+		return errBadCode
 	}
-	var grantJSON, challenge string
-	var expires int64
-	h := pki.HashSecret(body.Code)
-	err := s.db.QueryRow(r.Context(), `SELECT grant_json, challenge, expires_at FROM sso_codes WHERE code_hash = ?`, h).
-		Scan(&grantJSON, &challenge, &expires)
+	code, err := s.store.TakeSSOCode(r.Context(), pki.HashSecret(body.Code))
+	if store.IsNotFound(err) {
+		return errBadCode
+	}
 	if err != nil {
-		writeErr(w, 400, "Invalid or expired sign-in code")
-		return
+		return err
 	}
-	// One try per code, whoever wins the race to delete it.
-	res, err := s.db.Exec(r.Context(), `DELETE FROM sso_codes WHERE code_hash = ?`, h)
-	if n, _ := res.RowsAffected(); err != nil || n != 1 || expires < nowMs() ||
-		subtle.ConstantTimeCompare([]byte(challenge), []byte(oauth2.S256ChallengeFromVerifier(body.Verifier))) != 1 {
-		writeErr(w, 400, "Invalid or expired sign-in code")
-		return
+	if code.ExpiresAt < model.NowMs() ||
+		subtle.ConstantTimeCompare([]byte(code.Challenge), []byte(oauth2.S256ChallengeFromVerifier(body.Verifier))) != 1 {
+		return errBadCode
 	}
-	var grant struct {
-		Kind     string   `json:"kind"`
-		Tenants  []string `json:"tenants"`
-		Identity string   `json:"identity"`
-		TTLms    int64    `json:"ttl_ms"`
+	var grant cliGrant
+	if err := json.Unmarshal([]byte(code.Grant), &grant); err != nil {
+		return err
 	}
-	json.Unmarshal([]byte(grantJSON), &grant)
-	sid, token, exp, err := s.createSession(r.Context(), grant.Kind, grant.Tenants, grant.Identity, time.Duration(grant.TTLms)*time.Millisecond)
+	sid, token, exp, err := s.auth.CreateSession(r.Context(), grant.Kind, grant.Tenants, grant.Identity, time.Duration(grant.TTLms)*time.Millisecond)
 	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
+		return err
 	}
 	s.auditSignIn(r, "token:"+sid, grant.Identity, "/auth/cli/exchange", 200)
-	writeJSON(w, 200, map[string]any{"token": token, "kind": grant.Kind, "tenants": nonNil(grant.Tenants),
+	return httpx.JSON(w, map[string]any{"token": token, "kind": grant.Kind, "tenants": nonNil(grant.Tenants),
 		"identity": grant.Identity, "expires_at": float64(exp) / 1000})
 }
 
-// callerToken is the request's bearer token, else its session cookie.
-func callerToken(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-	}
-	if c, err := r.Cookie(sessionCookie); err == nil {
-		return c.Value
-	}
-	return ""
-}
-
-func (s *Server) handleSSOMe(w http.ResponseWriter, r *http.Request) {
-	p, err := s.authenticateToken(r.Context(), callerToken(r))
+func (s *Service) handleMe(w http.ResponseWriter, r *http.Request) error {
+	p, err := s.auth.AuthenticateToken(r.Context(), auth.CallerToken(r))
 	if err != nil {
-		writeErr(w, 401, "Not signed in")
-		return
+		return httpx.NewError(http.StatusUnauthorized, "Not signed in")
 	}
-	writeJSON(w, 200, map[string]any{"kind": p.Kind, "tenants": nonNil(p.Tenants), "identity": p.Identity, "token_id": p.TokenID})
+	return httpx.JSON(w, map[string]any{"kind": p.Kind, "tenants": nonNil(p.Tenants), "identity": p.Identity, "token_id": p.TokenID})
 }
 
-func (s *Server) handleSSOLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") == "" && !sameOrigin(r) {
-		writeErr(w, 403, "Cross-origin request refused")
-		return
+func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) error {
+	if r.Header.Get("Authorization") == "" && !auth.SameOrigin(r) {
+		return httpx.Forbidden("Cross-origin request refused")
 	}
-	if p, err := s.authenticateToken(r.Context(), callerToken(r)); err == nil && p.Identity != "" {
-		s.db.Exec(r.Context(), `DELETE FROM tokens WHERE id = ?`, p.TokenID)
-		tokenCache.Delete(p.TokenID)
+	if p, err := s.auth.AuthenticateToken(r.Context(), auth.CallerToken(r)); err == nil && p.Identity != "" {
+		if err := s.auth.Revoke(r.Context(), p.TokenID); err != nil {
+			return err
+		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1})
-	writeJSON(w, 200, map[string]any{"ok": true})
-}
-
-// sameOrigin: the browser says the request comes from a page of this server.
-// Browsers always send Origin on WebSockets and on requests that change
-// something; comparing hosts (not schemes) works behind a TLS-terminating LB.
-func sameOrigin(r *http.Request) bool {
-	o := r.Header.Get("Origin")
-	if o == "" {
-		return false
-	}
-	u, err := url.Parse(o)
-	return err == nil && strings.EqualFold(u.Host, r.Host)
-}
-
-// createSession stores an expiring token for someone who signed in.
-func (s *Server) createSession(ctx context.Context, kind string, tenants []string, who string, ttl time.Duration) (string, string, int64, error) {
-	id := strings.NewReplacer("_", "x", "-", "y").Replace(pki.RandomSecret(6))
-	secret := pki.RandomSecret(24)
-	exp := nowMs() + ttl.Milliseconds()
-	if _, err := s.db.Exec(ctx, `DELETE FROM tokens WHERE expires_at IS NOT NULL AND expires_at < ?`, nowMs()); err != nil {
-		return "", "", 0, err
-	}
-	_, err := s.db.Exec(ctx, `INSERT INTO tokens (id, kind, secret_hash, tenants, name, created_at, expires_at, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, kind, pki.HashSecret(secret), mustJSON(nonNil(tenants)), "sign-in "+who, nowMs(), exp, who)
-	return id, formatToken(id, secret), exp, err
+	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Path: "/", MaxAge: -1})
+	return httpx.OK(w)
 }

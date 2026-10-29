@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -11,41 +12,50 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jverre/flint/cluster/internal/hostagent"
+	"github.com/jverre/flint/cluster/internal/httpx"
+	"github.com/jverre/flint/cluster/internal/model"
 	"github.com/jverre/flint/cluster/internal/pki"
+	"github.com/jverre/flint/cluster/internal/store"
 )
 
 // hostCertTTL: hosts renew at half-life (flint-cluster snapd does it).
 const hostCertTTL = 7 * 24 * time.Hour
 
+// hostHandler is the API host agents and snapd call, over mTLS.
 func (s *Server) hostHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/join", s.handleJoin)
+	mux.HandleFunc("POST /v1/join", httpx.Handle(s.handleJoin))
 	mux.HandleFunc("POST /v1/hosts/self/heartbeat", s.hostOnly(s.handleHeartbeat))
 	mux.HandleFunc("POST /v1/hosts/self/network-release", s.hostOnly(s.handleNetworkRelease))
 	mux.HandleFunc("POST /v1/hosts/self/handover", s.hostOnly(s.handleHandover))
 	mux.HandleFunc("POST /v1/hosts/self/events", s.hostOnly(s.handleHostEvents))
 	mux.HandleFunc("POST /v1/hosts/self/renew", s.hostOnly(s.handleRenew))
 	mux.HandleFunc("POST /v1/hosts/self/snapshots", s.hostOnly(s.handleHostSnapshot))
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		httpx.WriteJSON(w, 200, map[string]string{"status": "ok"})
+	})
 	return mux
 }
 
-type hostCtxKey struct{}
+// hostHandlerFunc handles a request from an authenticated host.
+type hostHandlerFunc func(w http.ResponseWriter, r *http.Request, h *model.Host) error
 
-func (s *Server) hostOnly(h func(http.ResponseWriter, *http.Request, *Host)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) hostOnly(h hostHandlerFunc) http.HandlerFunc {
+	return httpx.Handle(func(w http.ResponseWriter, r *http.Request) error {
 		id, ok := hostFromRequest(r)
 		if !ok {
-			writeErr(w, http.StatusUnauthorized, "host certificate required")
-			return
+			return httpx.NewError(http.StatusUnauthorized, "host certificate required")
 		}
-		host, err := s.getHost(r.Context(), id)
+		host, err := s.store.GetHost(r.Context(), id)
+		if store.IsNotFound(err) {
+			return httpx.Forbidden("unknown or removed host")
+		}
 		if err != nil {
-			writeErr(w, http.StatusForbidden, "unknown or removed host")
-			return
+			return err
 		}
-		h(w, r, host)
-	}
+		return h(w, r, host)
+	})
 }
 
 type joinReq struct {
@@ -68,74 +78,56 @@ func hostnameOf(raw string) string {
 	return u.Hostname()
 }
 
-func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
+var errBadJoinToken = httpx.Forbidden(store.ErrJoinTokenInvalid.Error())
+
+func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	var req joinReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid join request")
-		return
+		return httpx.BadRequest("invalid join request")
 	}
 	tok, err := pki.DecodeJoinToken(req.Token)
 	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
+		return httpx.BadRequest(err.Error())
 	}
 	if req.AgentURL == "" || req.SnapdURL == "" || req.CSR == "" {
-		writeErr(w, 400, "agent_url, snapd_url and csr_pem are required")
-		return
+		return httpx.BadRequest("agent_url, snapd_url and csr_pem are required")
 	}
 	ctx := r.Context()
-	var zone, labels string
+	zone, labels := "", map[string]string{}
 	hostID := "h-" + uuid.NewString()[:13]
 	if tok.ID == "static" {
 		if s.cfg.JoinSecret == "" || subtle.ConstantTimeCompare([]byte(tok.Secret), []byte(s.cfg.JoinSecret)) != 1 {
-			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
-			return
+			return errBadJoinToken
 		}
-		labels = "{}"
-	} else {
-		var hash string
-		var expires int64
-		err = s.db.QueryRow(ctx, `SELECT secret_hash, zone, labels, expires_at FROM join_tokens WHERE id = ? AND used_at IS NULL`, tok.ID).
-			Scan(&hash, &zone, &labels, &expires)
-		if err != nil || hash != pki.HashSecret(tok.Secret) || nowMs() > expires {
-			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
-			return
+	} else if zone, labels, err = s.store.UseJoinToken(ctx, tok.ID, pki.HashSecret(tok.Secret), hostID); err != nil {
+		if errors.Is(err, store.ErrJoinTokenInvalid) {
+			return errBadJoinToken
 		}
-		// Single use: only one joiner can flip used_at.
-		res, err := s.db.Exec(ctx, `UPDATE join_tokens SET used_at = ?, host_id = ? WHERE id = ? AND used_at IS NULL`, nowMs(), hostID, tok.ID)
-		if n, _ := res.RowsAffected(); err != nil || n != 1 {
-			writeErr(w, http.StatusForbidden, "join token is invalid, expired or already used")
-			return
-		}
+		return err
 	}
-	names := []string{hostnameOf(req.AgentURL), hostnameOf(req.SnapdURL)}
-	cert, err := s.hostsCA.IssueFromCSR([]byte(req.CSR), hostID, names, hostCertTTL)
+	cert, err := s.hostsCA.IssueFromCSR([]byte(req.CSR), hostID, []string{hostnameOf(req.AgentURL), hostnameOf(req.SnapdURL)}, hostCertTTL)
 	if err != nil {
-		writeErr(w, 400, "csr: "+err.Error())
-		return
+		return httpx.BadRequest("csr: " + err.Error())
 	}
 	if req.Zone != "" {
 		zone = req.Zone
 	}
-	lbl := map[string]string{}
-	json.Unmarshal([]byte(labels), &lbl)
 	for k, v := range req.Labels {
-		lbl[k] = v
+		labels[k] = v
 	}
 	name := req.Name
 	if name == "" {
 		name = hostID
 	}
-	now := nowMs()
-	if _, err := s.db.Exec(ctx, `INSERT INTO hosts (id, name, agent_url, snapd_url, zone, labels, backend, host_class, state, state_since, last_heartbeat, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, hostID, name, req.AgentURL, req.SnapdURL, zone, mustJSON(lbl), req.Backend, req.HostClass,
-		HostJoining, now, now, now); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	now := model.NowMs()
+	if err := s.store.InsertHost(ctx, &model.Host{ID: hostID, Name: name, AgentURL: req.AgentURL, SnapdURL: req.SnapdURL, Zone: zone,
+		Labels: labels, Backend: req.Backend, HostClass: req.HostClass, State: model.HostJoining, StateSince: now, LastHeartbeat: now,
+		CreatedAt: now}); err != nil {
+		return err
 	}
-	s.emit(ctx, "host.joined", "", "", hostID, map[string]any{"name": name, "zone": zone})
+	s.eng.Emit(ctx, "host.joined", "", "", hostID, map[string]any{"name": name, "zone": zone})
 	log.Printf("host %s (%s) joined from %s", name, hostID, req.AgentURL)
-	writeJSON(w, 200, map[string]any{
+	return httpx.JSON(w, map[string]any{
 		"host_id":      hostID,
 		"cert_pem":     string(cert),
 		"hosts_ca_pem": string(s.hostsCA.CertPEM),
@@ -144,207 +136,125 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request, h *Host) {
+func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request, h *model.Host) error {
 	var req struct {
 		CSR string `json:"csr_pem"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid request")
-		return
+		return httpx.BadRequest("invalid request")
 	}
 	cert, err := s.hostsCA.IssueFromCSR([]byte(req.CSR), h.ID, []string{hostnameOf(h.AgentURL), hostnameOf(h.SnapdURL)}, hostCertTTL)
 	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
+		return httpx.BadRequest(err.Error())
 	}
-	writeJSON(w, 200, map[string]any{"cert_pem": string(cert)})
-}
-
-// hostVM is a VM as a host reports it.
-type hostVM struct {
-	Resources       map[string]any `json:"resources"`
-	Maintenance     map[string]any `json:"maintenance"`
-	ID              string         `json:"vm_id"`
-	State           string         `json:"state"`
-	PauseSnapshotID string         `json:"pause_snapshot_id,omitempty"`
-}
-
-type heartbeatReq struct {
-	HandoverToken string         `json:"handover_token"`
-	PatchState    map[string]any `json:"patch_state"`
-	Version       string         `json:"version"`
-	Backend       string         `json:"backend"`
-	HostClass     string         `json:"host_class"`
-	Capacity      Capacity       `json:"capacity"`
-	VMs           []hostVM       `json:"vms"`
-	Cached        []string       `json:"cached_snapshots"`
-	Templates     []HostTemplate `json:"templates"`
-	Fenced        []string       `json:"fenced"`
+	return httpx.JSON(w, map[string]any{"cert_pem": string(cert)})
 }
 
 // handleHeartbeat renews the host's lease and reconciles its VMs against the
 // catalog. The answer lists VMs the host must delete: ones the catalog has
 // moved elsewhere or deleted while the host was away.
-func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *Host) {
-	var req heartbeatReq
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid heartbeat")
-		return
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, h *model.Host) error {
+	var hb hostagent.Heartbeat
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&hb); err != nil {
+		return httpx.BadRequest("invalid heartbeat")
 	}
-	if h.HandoverToken != "" && req.HandoverToken != h.HandoverToken {
-		writeErr(w, 409, "snapd owns lease renewal during agent handover")
-		return
+	if h.HandoverToken != "" && hb.HandoverToken != h.HandoverToken {
+		return httpx.Conflict("snapd owns lease renewal during agent handover")
 	}
 	ctx := r.Context()
-	now := nowMs()
-	if req.Cached == nil {
-		req.Cached = []string{}
+	err := s.store.RecordHeartbeat(ctx, h.ID, h.HandoverToken, store.Heartbeat{PatchState: hb.PatchState, Capacity: hb.Capacity,
+		Cached: hb.Cached, Templates: hb.Templates, Version: hb.Version, Backend: hb.Backend, HostClass: hb.HostClass, At: model.NowMs()})
+	if errors.Is(err, store.ErrHandoverRaced) {
+		return httpx.Conflict(err.Error())
 	}
-	if req.Templates == nil {
-		req.Templates = []HostTemplate{}
-	}
-	result, err := s.db.Exec(ctx, `UPDATE hosts SET handover_token = '', handover_until = 0, patch_state = ?, capacity = ?, cached = ?, templates = ?, version = ?, backend = ?, host_class = ?, last_heartbeat = ? WHERE id = ? AND handover_token = ?`,
-		mustJSON(req.PatchState), mustJSON(req.Capacity), mustJSON(req.Cached), mustJSON(req.Templates), req.Version, req.Backend, req.HostClass, now, h.ID, h.HandoverToken)
 	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
+		return err
 	}
-	if n, _ := result.RowsAffected(); n != 1 {
-		writeErr(w, 409, "handover started during heartbeat")
-		return
-	}
-
-	switch h.State {
-	case HostJoining, HostUnreachable, HostIsolated, HostDown:
-		s.setHostState(ctx, h.ID, HostReady)
-		s.emit(ctx, "host.ready", "", "", h.ID, map[string]any{"previous": h.State})
-		log.Printf("host %s is back (was %s)", h.Name, h.State)
-	}
-	s.syncTemplates(ctx, h, req.Templates)
-
-	// VMs an operation holds are its business; if we can't tell which, skip
-	// this round of reconciliation (the lease above is renewed regardless).
-	busy, err := s.busyVMs(ctx)
-	if err != nil {
-		log.Printf("heartbeat %s: %v", h.Name, err)
-		req.VMs = nil
-	}
-	evict := []string{}
-	reported := map[string]hostVM{}
-	for _, hv := range req.VMs {
-		reported[hv.ID] = hv
-		v, err := s.getVM(ctx, hv.ID)
-		if err == nil && (v.State == VMMigrating || busy[v.ID]) {
-			continue // an operation owns it (both hosts may hold it until a move commits or rolls back)
-		}
-		if err != nil || v.HostID != h.ID {
-			// Deleted, or now owned by another host (it was recovered or moved
-			// while this host was away): the stale copy must go.
-			if err == nil || isNotFound(err) {
-				evict = append(evict, hv.ID)
-			}
-			continue
-		}
-		s.reconcileReportedVM(ctx, h, v, hv)
-	}
-	// VMs the catalog places here that the host no longer has were deleted
-	// locally (timeout policy, error cleanup).
-	var mine []*VM
-	if busy != nil {
-		mine, _ = s.listVMs(ctx, `host_id = ? AND state = ?`, h.ID, VMRunning)
-	}
-	for _, v := range mine {
-		if _, ok := reported[v.ID]; ok || now-v.UpdatedAt < 20000 || busy[v.ID] {
-			continue
-		}
-		if v.VMSetID != "" {
-			s.updateVM(ctx, v.ID, vmUpdate{State: str(VMLost), Error: str("disappeared from its host")})
-			continue
-		}
-		s.deleteVMRow(ctx, v.ID)
-		log.Printf("vm %s no longer on host %s; removed from catalog", short(v.ID), h.Name)
-	}
-	writeJSON(w, 200, map[string]any{
+	evict := s.eng.ReconcileHeartbeat(ctx, h, &hb)
+	return httpx.JSON(w, map[string]any{
 		"host_id":      h.ID,
 		"lease_ttl_ms": s.cfg.LeaseTTL.Milliseconds(),
 		"evict":        evict,
 	})
 }
 
-// reconcileReportedVM folds a host's view of one of its VMs into the catalog.
-func (s *Server) reconcileReportedVM(ctx context.Context, h *Host, v *VM, hv hostVM) {
-	if len(hv.Resources) > 0 {
-		if v.Info == nil {
-			v.Info = map[string]any{}
-		}
-		v.Info["resources"] = hv.Resources
-		v.Info["maintenance"] = hv.Maintenance
-		s.updateVM(ctx, v.ID, vmUpdate{Info: v.Info})
-	}
-	switch {
-	case v.State == VMRunning && (hv.State == "Error" || hv.State == "Dead"):
-		// The VMM died on a healthy host: recover in place if the class allows.
-		if v.Availability == AvailEphemeral || v.VMSetID != "" {
-			s.updateVM(ctx, v.ID, vmUpdate{State: str(VMLost), Error: str("VM process died")})
-			s.emit(ctx, "vm.lost", v.Tenant, v.ID, h.ID, map[string]any{"vm_id": v.ID, "reason": "crashed"})
-			if hh, ok := s.hostIfUsable(ctx, h.ID); ok {
-				go s.deleteOnHost(context.Background(), hh, v.ID)
-			}
-			return
-		}
-		s.updateVM(ctx, v.ID, vmUpdate{State: str(VMRecovering), Error: str("crashed on " + h.Name)})
-		s.emit(ctx, "vm.crashed", v.Tenant, v.ID, h.ID, map[string]any{"vm_id": v.ID})
-		go func(v *VM) {
-			v.State = VMRecovering
-			s.recoverVM(context.Background(), v, h.ID, true)
-		}(v)
-	case v.State == VMLost && v.VMSetID == "" && (hv.State == "Running" || hv.State == "Started"):
-		// Its host was only partitioned and the VM kept running: it's not lost after all.
-		s.updateVM(ctx, v.ID, vmUpdate{State: str(VMRunning), Error: str("")})
-		s.emit(ctx, "vm.found", v.Tenant, v.ID, h.ID, map[string]any{"vm_id": v.ID})
-	case v.State == VMRunning && hv.State == "Paused":
-		// Paused on the host by its own timeout policy.
-		upd := vmUpdate{State: str(VMPaused)}
-		if hv.PauseSnapshotID != "" {
-			upd.PauseID = str(hv.PauseSnapshotID)
-			s.insertSnapshot(ctx, &Snapshot{ID: hv.PauseSnapshotID, Kind: "pause", VMID: v.ID, Tenant: v.Tenant, Backend: h.Backend,
-				HostClass: h.HostClass, SourceHost: h.ID, Uploaded: true})
-		}
-		s.updateVM(ctx, v.ID, upd)
-	}
-}
+const maxHandover = 120 * time.Second
 
-// syncTemplates records template snapshots hosts publish and finishes builds.
-func (s *Server) syncTemplates(ctx context.Context, h *Host, ts []HostTemplate) {
-	for _, t := range ts {
-		if t.ID == "default" {
-			continue
-		}
-		tmpl, err := s.getTemplate(ctx, t.ID)
+// handleHandover: during an explicit, bounded agent upgrade snapd renews
+// only the frozen VM set. It cannot reconcile VM state, adopt ownership or
+// revive an expired lease.
+func (s *Server) handleHandover(w http.ResponseWriter, r *http.Request, h *model.Host) error {
+	var req struct {
+		Token string   `json:"token"`
+		VMs   []string `json:"vms"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req) != nil || len(req.Token) < 32 || len(req.Token) > 128 {
+		return httpx.BadRequest("invalid handover")
+	}
+	ctx := r.Context()
+	if h.HandoverToken == "" {
+		// Starting one: hold placement so no operation starts on the host meanwhile.
+		guard, err := s.eng.LockPlacement(ctx)
 		if err != nil {
-			continue // a template only this host knows (built before it joined)
+			return err
 		}
-		if t.SnapshotID != "" {
-			if _, err := s.getSnapshot(ctx, t.SnapshotID); isNotFound(err) {
-				s.insertSnapshot(ctx, &Snapshot{ID: t.SnapshotID, Kind: "template", TemplateID: t.ID, Tenant: tmpl.Tenant,
-					Backend: h.Backend, HostClass: h.HostClass, SourceHost: h.ID, Uploaded: true})
-			}
-		}
-		if tmpl.BuildHost == h.ID && tmpl.Status == "building" && (t.Status == "ready" && t.SnapshotID != "" || t.Status == "error") {
-			s.db.Exec(ctx, `UPDATE templates SET status = ?, error = ?, updated_at = ? WHERE id = ?`, t.Status, t.Error, nowMs(), t.ID)
-			s.emit(ctx, "template."+t.Status, tmpl.Tenant, "", h.ID, map[string]any{"template_id": t.ID})
+		defer guard.Release()
+		if h, err = s.store.GetHost(ctx, h.ID); err != nil {
+			return err
 		}
 	}
+	now := model.NowMs()
+	leaseFloor := now - s.cfg.LeaseTTL.Milliseconds()
+	if h.LastHeartbeat <= leaseFloor || (h.HandoverToken != "" && (h.HandoverToken != req.Token || h.HandoverUntil <= now)) {
+		return httpx.Conflict("handover or host lease expired")
+	}
+	vms, err := s.store.ListVMs(ctx, store.VMFilter{HostID: h.ID, States: model.ActiveVMStates})
+	if err != nil {
+		return err
+	}
+	busy, err := s.eng.BusyVMs(ctx)
+	if err != nil {
+		return err
+	}
+	frozen := map[string]bool{}
+	for _, id := range req.VMs {
+		frozen[id] = true
+	}
+	for _, v := range vms {
+		if busy[v.ID] || v.State != model.VMRunning {
+			return httpx.Conflict("VM operation in progress")
+		}
+		if v.Availability.Recoverable() {
+			if !frozen[v.ID] {
+				return httpx.Conflict("frozen VM set incomplete")
+			}
+			delete(frozen, v.ID)
+		}
+	}
+	if len(frozen) != 0 {
+		return httpx.Conflict("VM ownership changed")
+	}
+	until := h.HandoverUntil
+	if h.HandoverToken == "" {
+		until = now + maxHandover.Milliseconds()
+	}
+	err = s.store.ClaimHandover(ctx, h.ID, h.HandoverToken, req.Token, until, now, leaseFloor)
+	if errors.Is(err, store.ErrHandoverLost) {
+		return httpx.Conflict(err.Error())
+	}
+	if err != nil {
+		return err
+	}
+	return httpx.JSON(w, map[string]any{"lease_ttl_ms": min(s.cfg.LeaseTTL.Milliseconds(), until-now), "handover_until_ms": until})
 }
 
 // handleHostEvents ingests a batch of the host's own events.
-func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Host) {
+func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *model.Host) error {
 	var req struct {
 		Events []map[string]any `json:"events"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
-		writeErr(w, 400, "invalid events")
-		return
+		return httpx.BadRequest("invalid events")
 	}
 	ctx := r.Context()
 	for _, e := range req.Events {
@@ -360,7 +270,7 @@ func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Hos
 		}
 		tenant := ""
 		if vmID != "" {
-			if v, err := s.getVM(ctx, vmID); err == nil {
+			if v, err := s.store.GetVM(ctx, vmID); err == nil {
 				tenant = v.Tenant
 				if v.HostID != h.ID {
 					continue // a stale copy on a host that lost the VM
@@ -371,7 +281,7 @@ func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Hos
 		if tenant != "" {
 			e["tenant"] = tenant
 		}
-		ts := nowMs()
+		ts := model.NowMs()
 		if f, ok := e["ts"].(float64); ok {
 			ts = int64(f * 1000)
 		}
@@ -383,35 +293,50 @@ func (s *Server) handleHostEvents(w http.ResponseWriter, r *http.Request, h *Hos
 			e["actor"] = actor
 			delete(e, "actor_name")
 		}
-		s.insertEvent(ctx, ts, typ, tenant, vmID, h.ID, actor, name, e)
+		// A failed insert is logged, not retried: the host would resend the whole batch.
+		if err := s.store.InsertEvent(ctx, store.Event{TS: ts, Type: typ, Tenant: tenant, VMID: vmID, HostID: h.ID, Actor: actor,
+			ActorName: name, Payload: e}); err != nil {
+			log.Printf("host %s event %s: %v", h.Name, typ, err)
+		}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	return httpx.OK(w)
 }
 
 // handleHostSnapshot registers a snapshot a host made on its own (a template build).
-func (s *Server) handleHostSnapshot(w http.ResponseWriter, r *http.Request, h *Host) {
-	var sn Snapshot
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&sn); err != nil || sn.ID == "" || sn.Kind != "template" {
-		writeErr(w, 400, "invalid snapshot")
-		return
+func (s *Server) handleHostSnapshot(w http.ResponseWriter, r *http.Request, h *model.Host) error {
+	var sn model.Snapshot
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&sn); err != nil || sn.ID == "" || sn.Kind != model.SnapshotTemplate {
+		return httpx.BadRequest("invalid snapshot")
 	}
 	sn.Backend, sn.HostClass, sn.SourceHost = h.Backend, h.HostClass, h.ID
-	if err := s.insertSnapshot(r.Context(), &sn); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	if err := s.store.InsertSnapshot(r.Context(), &sn); err != nil {
+		return err
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	return httpx.OK(w)
+}
+
+// handleNetworkRelease gates gateway garbage collection on authoritative
+// catalog absence. Temporary agent outages and migration source cleanup
+// must not discard live NAT state.
+func (s *Server) handleNetworkRelease(w http.ResponseWriter, r *http.Request, h *model.Host) error {
+	var req struct {
+		VMID string `json:"vm_id"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req) != nil || req.VMID == "" {
+		return httpx.BadRequest("VM ID required")
+	}
+	_, err := s.store.GetVM(r.Context(), req.VMID)
+	if err != nil && !store.IsNotFound(err) {
+		return err
+	}
+	return httpx.JSON(w, map[string]bool{"allowed": store.IsNotFound(err)})
 }
 
 // createJoinToken makes a single-use host join token.
 func (s *Server) createJoinToken(ctx context.Context, zone string, labels map[string]string, ttl time.Duration) (string, error) {
 	id := uuid.NewString()
 	secret := pki.RandomSecret(24)
-	if labels == nil {
-		labels = map[string]string{}
-	}
-	if _, err := s.db.Exec(ctx, `INSERT INTO join_tokens (id, secret_hash, zone, labels, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		id, pki.HashSecret(secret), zone, mustJSON(labels), nowMs()+ttl.Milliseconds(), nowMs()); err != nil {
+	if err := s.store.InsertJoinToken(ctx, id, pki.HashSecret(secret), zone, labels, model.NowMs()+ttl.Milliseconds()); err != nil {
 		return "", err
 	}
 	server := s.cfg.HostEndpoint
@@ -425,22 +350,4 @@ func (s *Server) createJoinToken(ctx context.Context, zone string, labels map[st
 // CreateJoinToken is createJoinToken for the CLI (--print-join-token).
 func (s *Server) CreateJoinToken(ctx context.Context, zone string, ttl time.Duration) (string, error) {
 	return s.createJoinToken(ctx, zone, nil, ttl)
-}
-
-// Gate gateway garbage collection on authoritative catalog absence. Temporary
-// agent outages and migration source cleanup must not discard live NAT state.
-func (s *Server) handleNetworkRelease(w http.ResponseWriter, r *http.Request, h *Host) {
-	var req struct {
-		VMID string `json:"vm_id"`
-	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req) != nil || req.VMID == "" {
-		writeErr(w, 400, "VM ID required")
-		return
-	}
-	_, err := s.getVM(r.Context(), req.VMID)
-	if err != nil && !isNotFound(err) {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]bool{"allowed": isNotFound(err)})
 }

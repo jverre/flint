@@ -1,6 +1,9 @@
-// Package server is flint-server, the cluster control plane: catalog,
-// scheduler, gateway to host agents, host registry, CA and reconcilers.
-// Replicas are stateless; all state is in the database and the object store.
+// Package server is flint-server's HTTP side: the public API (SDK, CLI,
+// Terraform, web UI) and the host API (host agents and snapd). Handlers
+// parse and check requests, call the engine (VM operations), the store
+// (catalog reads and simple writes) and the auth and sso packages, and turn
+// what they return into answers. Replicas are stateless: all state is in the
+// database and the object store.
 package server
 
 import (
@@ -18,9 +21,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jverre/flint/cluster/internal/auth"
 	"github.com/jverre/flint/cluster/internal/db"
+	"github.com/jverre/flint/cluster/internal/engine"
+	"github.com/jverre/flint/cluster/internal/hostagent"
+	"github.com/jverre/flint/cluster/internal/model"
 	"github.com/jverre/flint/cluster/internal/pki"
 	"github.com/jverre/flint/cluster/internal/snapstore"
+	"github.com/jverre/flint/cluster/internal/sso"
+	"github.com/jverre/flint/cluster/internal/store"
 )
 
 // Config for one flint-server replica.
@@ -77,19 +86,30 @@ func (c *Config) defaults() {
 // Server is one control-plane replica.
 type Server struct {
 	cfg    Config
-	db     *db.DB
-	remote snapstore.Remote
+	store  *store.Store
+	eng    *engine.Engine
+	auth   *auth.Authenticator
+	sso    *sso.Service
+	agents *hostagent.Client
 
 	hostsCA *pki.CA
 	cpCA    *pki.CA
-	// cpClient is this replica's identity towards host agents.
-	cpClient tls.Certificate
-	agents   *http.Client
 
 	leader   bool
 	leaderMu sync.Mutex
+}
 
-	sso *ssoRuntime // nil without SSO
+// newServer wires a replica's parts around its store. agentHTTP talks to
+// host agents (mTLS in production).
+func newServer(cfg Config, st *store.Store, remote snapstore.Remote, agentHTTP *http.Client) *Server {
+	agents := &hostagent.Client{HTTP: agentHTTP}
+	a := auth.New(st)
+	noSSO, _ := sso.New(context.Background(), "", st, a) // New replaces it when SSO is configured
+	return &Server{
+		cfg: cfg, store: st, auth: a, agents: agents, sso: noSSO,
+		eng: engine.New(engine.Config{LeaseTTL: cfg.LeaseTTL, FenceMargin: cfg.FenceMargin, CheckpointInterval: cfg.CheckpointInterval,
+			ReplicaID: cfg.ReplicaID}, st, agents, remote),
+	}
 }
 
 // New connects to the database and object store and loads (or creates) the CAs.
@@ -99,7 +119,8 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := waitDB(ctx, d); err != nil {
+	st := store.New(d)
+	if err := waitDB(ctx, st); err != nil {
 		return nil, err
 	}
 	if err := d.Migrate(ctx); err != nil {
@@ -109,44 +130,48 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, db: d, remote: remote}
-	if s.hostsCA, err = s.loadCA(ctx, "hosts_ca", "flint hosts CA", cfg.HostsCACert, cfg.HostsCAKey); err != nil {
+	hostsCA, err := loadCA(ctx, st, "hosts_ca", "flint hosts CA", cfg.HostsCACert, cfg.HostsCAKey)
+	if err != nil {
 		return nil, err
 	}
-	if s.cpCA, err = s.loadCA(ctx, "cp_ca", "flint control-plane CA", cfg.CPCACert, cfg.CPCAKey); err != nil {
+	cpCA, err := loadCA(ctx, st, "cp_ca", "flint control-plane CA", cfg.CPCACert, cfg.CPCAKey)
+	if err != nil {
 		return nil, err
 	}
-	if s.cpClient, err = s.cpCA.Keypair("flint-server", nil, 30*24*time.Hour); err != nil {
+	// This replica's identity towards host agents.
+	cpClient, err := cpCA.Keypair("flint-server", nil, 30*24*time.Hour)
+	if err != nil {
 		return nil, err
 	}
-	s.agents = &http.Client{
+	agentHTTP := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				MinVersion:   tls.VersionTLS12,
-				RootCAs:      s.hostsCA.Pool(),
-				Certificates: []tls.Certificate{s.cpClient},
+				RootCAs:      hostsCA.Pool(),
+				Certificates: []tls.Certificate{cpClient},
 			},
 			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     60 * time.Second,
 			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 		},
 	}
+	s := newServer(cfg, st, remote, agentHTTP)
+	s.hostsCA, s.cpCA = hostsCA, cpCA
 	if cfg.AdminToken != "" {
-		if err := s.ensureAdminToken(ctx, cfg.AdminToken); err != nil {
+		if err := s.auth.EnsureAdminToken(ctx, cfg.AdminToken); err != nil {
 			return nil, err
 		}
 	}
-	if err := s.loadSSO(ctx, cfg.SSOConfig); err != nil {
+	if s.sso, err = sso.New(ctx, cfg.SSOConfig, st, s.auth); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-func waitDB(ctx context.Context, d *db.DB) error {
+func waitDB(ctx context.Context, st *store.Store) error {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		var one int
-		err := d.QueryRow(ctx, `SELECT 1`).Scan(&one)
+		err := st.Ping(ctx)
 		if err == nil {
 			return nil
 		}
@@ -160,7 +185,7 @@ func waitDB(ctx context.Context, d *db.DB) error {
 
 // loadCA returns the cluster-wide CA stored in the database, creating it the
 // first time. Replicas racing here all end up with the same one.
-func (s *Server) loadCA(ctx context.Context, key, cn, certFile, keyFile string) (*pki.CA, error) {
+func loadCA(ctx context.Context, st *store.Store, key, cn, certFile, keyFile string) (*pki.CA, error) {
 	var fresh *pki.CA
 	var err error
 	if certFile != "" {
@@ -175,20 +200,19 @@ func (s *Server) loadCA(ctx context.Context, key, cn, certFile, keyFile string) 
 	} else if fresh, err = pki.NewCA(cn); err != nil {
 		return nil, err
 	}
-	certPEM, err := s.db.SetMetaIfAbsent(ctx, key+"_cert", string(fresh.CertPEM))
+	certPEM, err := st.SetMetaIfAbsent(ctx, key+"_cert", string(fresh.CertPEM))
 	if err != nil {
 		return nil, err
 	}
-	keyPEM := string(fresh.KeyPEM)
 	if certPEM == string(fresh.CertPEM) {
-		if _, err := s.db.Exec(ctx, `INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING`, key+"_key", keyPEM); err != nil {
+		if err := st.InsertMetaIfAbsent(ctx, key+"_key", string(fresh.KeyPEM)); err != nil {
 			return nil, err
 		}
 	}
 	// Another replica may have inserted the cert but not yet the key.
+	var keyPEM string
 	for i := 0; i < 50; i++ {
-		err = s.db.QueryRow(ctx, `SELECT value FROM meta WHERE key = ?`, key+"_key").Scan(&keyPEM)
-		if err == nil {
+		if keyPEM, err = st.GetMeta(ctx, key+"_key"); err == nil {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -236,7 +260,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	go s.leaderLoop(ctx)
-	log.Printf("flint-server %s: api on %s, hosts on %s (%s), db %s", s.cfg.ReplicaID, s.cfg.Listen, s.cfg.HostListen, s.cfg.HostEndpoint, s.db.Dialect)
+	log.Printf("flint-server %s: api on %s, hosts on %s (%s), db %s", s.cfg.ReplicaID, s.cfg.Listen, s.cfg.HostListen, s.cfg.HostEndpoint, s.store.Dialect())
 
 	select {
 	case <-ctx.Done():
@@ -299,8 +323,8 @@ func (s *Server) leaderLoop(ctx context.Context) {
 	defer tick.Stop()
 	var cancel context.CancelFunc
 	for {
-		now := nowMs()
-		ok, err := s.db.TryLease(ctx, "reconciler", s.cfg.ReplicaID, now, now+5000)
+		now := model.NowMs()
+		ok, err := s.store.TryLease(ctx, "reconciler", s.cfg.ReplicaID, now, now+5000)
 		if err != nil {
 			log.Printf("leader lease: %v", err)
 			ok = false
@@ -313,7 +337,7 @@ func (s *Server) leaderLoop(ctx context.Context) {
 			log.Printf("replica %s is now the reconciler leader", s.cfg.ReplicaID)
 			var rctx context.Context
 			rctx, cancel = context.WithCancel(ctx)
-			go s.reconcileLoop(rctx)
+			go s.eng.RunReconcilers(rctx)
 		} else if !ok && was {
 			log.Printf("replica %s lost the reconciler lease", s.cfg.ReplicaID)
 			if cancel != nil {
