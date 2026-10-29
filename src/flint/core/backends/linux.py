@@ -41,6 +41,8 @@ def _running(pid: int) -> bool:
 class LinuxVmmBackend(BackendPlugin):
     supported_platforms = ("linux",)
     supports_tenant_networks = True
+    supports_volume_mounts = True
+    supports_confined_api = True
 
     # Prefix of this backend's network namespaces (the netns pool's and recovery's key).
     ns_prefix: ClassVar[str]
@@ -232,11 +234,36 @@ class LinuxVmmBackend(BackendPlugin):
         return True
 
     def prepare_recovery(self, rows: list[Mapping]) -> None:
-        """Move legacy processes out of delegated parents before enabling controllers."""
+        """Refuse VMs of an older identity scheme, clear what a crashed daemon
+        left (credential proxies, template builds), and move legacy processes
+        out of delegated parents before enabling controllers."""
+        from .._build_job import recover_builds
+        from .._builder import cleanup_abandoned_builders
+        from .._identities import vm_identity
         from .._limits import attach_process, owns_process
-        for row in map(SandboxRow.of, rows):
+        from ..net.proxy import cleanup_abandoned_proxies
+        rows = [SandboxRow.of(row) for row in rows]
+        for row in rows:
+            if row.state not in (SandboxState.RUNNING, SandboxState.PAUSED) or not os.path.isdir(row.vm_dir):
+                continue
+            owner = os.stat(row.vm_dir, follow_symlinks=False)
+            if (owner.st_uid, owner.st_gid) != vm_identity(row.vm_id):
+                raise RuntimeError(
+                    f"VM {row.vm_id} uses a legacy host identity. Finish, export or delete "
+                    "existing VMs with the previous Flint release before upgrading this worker."
+                )
+        cleanup_abandoned_proxies()
+        recover_builds()
+        cleanup_abandoned_builders()
+        for row in rows:
             if owns_process(row.pid, row.vm_dir):
                 attach_process(self.vm_cgroup(row.vm_id), row.pid)
+
+    def reconcile_recovered(self, row: Mapping) -> None:
+        """Repair a surviving VM's namespace (firewall, proxy redirect), which a restart may have lost."""
+        from ..net.netns import reconcile_namespace
+        row = SandboxRow.of(row)
+        reconcile_namespace(row.ns_name, proxy=bool(row.get("network_policy_json")))
 
     def confine_recovered(self, row: Mapping) -> None:
         from .._limits import attach_process, cgroup_limits, owns_process

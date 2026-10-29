@@ -7,14 +7,29 @@ Flint keeps every lifecycle change and action as an **event**, and every API cal
 
 ## Events
 
-Each event has a `type`, a `ts` (Unix seconds), a `seq` (its position, for paging), its `tenant` and `vm_id` when it has them, and:
+Each event has a `type`, a `ts` (Unix seconds), a `seq` (its position, for paging), its `tenant`, the `vm_id` of the VM (every VM event has one) or the `volume_id` of the volume it's about, and:
 
 | Field | Meaning |
 |-------|---------|
 | `actor` | Who caused it: `token:<id>` (an API token or sign-in session), `socket` (the daemon's Unix socket), `host:<id>` (a cluster host on its own), or `system` (Flint itself) |
 | `actor_name` | The token's name, or who signed in |
 
-Types include `vm.created`, `vm.state_changed`, `vm.paused`, `vm.resumed`, `vm.deleted`, `vm.wiped`, `vm.exec` (with `cmd`, `exit_code`, `duration_ms`, and the last 256 characters of `stdout_tail` and `stderr_tail`), `vm.process_started` and the `volume.*` events.
+A single daemon's event types, and what else they carry:
+
+| Type | Fields |
+|------|--------|
+| `vm.created`, `vm.resumed` | `vm`: the VM as `GET /vms/{vm_id}` shows it |
+| `vm.state_changed` | `from`, `to` |
+| `vm.paused`, `vm.deleted` | |
+| `vm.checkpoint` | `snapshot_id`, `timings` (a cluster snapshotted the running VM) |
+| `vm.wiped` | `files`, `bytes`: what was wiped before the VM was removed |
+| `vm.exec` | `cmd`, `exit_code`, `duration_ms`, the last 256 characters of `stdout_tail` and `stderr_tail`, and `error` if the guest refused it |
+| `vm.process_started` | `cmd`, `pid` |
+| `volume.created` | `volume`: the volume |
+| `volume.deleted` | |
+| `volume.attached`, `volume.detached` | `vm_id`, `mount_path` |
+
+A cluster's control plane adds its own, such as `vm.moved`.
 
 `GET /v1/events` returns stored events, oldest first. Filters: `since` (a `seq`), `vm_id`, `tenant`, `type`, `actor`, `limit` (up to 5000). Pass the answer's `next` as `since` to get the next page. A token pinned to tenants only gets theirs.
 

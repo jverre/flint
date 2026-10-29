@@ -53,11 +53,9 @@ class BenchmarkScreen(Screen):
         self._launch_worker: Worker | None = None
         self._phase: str = "input"
         self._last_error: str = ""
-        self._use_pyroute2: bool = False
         self._use_rootfs_pool: bool = False
         self._toggle_states: dict[str, bool] = {
             "toggle-rootfs": False,
-            "toggle-pyroute2": False,
         }
 
     def compose(self) -> ComposeResult:
@@ -66,7 +64,6 @@ class BenchmarkScreen(Screen):
                 yield Static("Benchmark: How many VMs?", classes="title")
                 yield Input(value="16", id="benchmark-count-input")
                 yield Static("\u25cb Rootfs pool", id="toggle-rootfs", classes="toggle-option")
-                yield Static("\u25cb Pyroute2", id="toggle-pyroute2", classes="toggle-option")
                 yield Button("Start", id="benchmark-start-button", variant="default")
         with Center(id="benchmark-grid-container"):
             yield BenchmarkGrid(id="benchmark-grid")
@@ -107,7 +104,6 @@ class BenchmarkScreen(Screen):
 
         self._vm_count = count
         self._use_rootfs_pool = self._toggle_states.get("toggle-rootfs", False)
-        self._use_pyroute2 = self._toggle_states.get("toggle-pyroute2", False)
         self._phase = "running"
 
         self.query_one("#benchmark-input-wrapper").display = False
@@ -132,10 +128,7 @@ class BenchmarkScreen(Screen):
             grid.set_cell_state(pos, CellState.STARTING)
 
             try:
-                sb = Sandbox(
-                    use_pool=self._use_rootfs_pool,
-                    use_pyroute2=self._use_pyroute2,
-                )
+                sb = Sandbox(use_pool=self._use_rootfs_pool)
                 ready_ms = sb.ready_time_ms or 0.0
 
                 self._ready_times.append(ready_ms)

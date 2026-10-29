@@ -50,6 +50,14 @@ class BackendPlugin(ABC):
     supports_tenant_networks: ClassVar[bool] = False
     # VMs can boot from a cluster's shared root disks and move between hosts live.
     supports_live_migration: ClassVar[bool] = False
+    # Volumes can be mounted into VMs (served over the host bridge network).
+    supports_volume_mounts: ClassVar[bool] = False
+    # VMMs are confined host processes, so the daemon runs as root and serves
+    # its public API from a separate unprivileged process (daemon/supervisor.py).
+    supports_confined_api: ClassVar[bool] = False
+    # The hypervisor needs the process's main thread (e.g. a macOS RunLoop):
+    # the daemon serves its API on another thread and calls run_main_loop().
+    needs_main_thread: ClassVar[bool] = False
 
     def preflight(self) -> list[str]:
         """Check whether this backend is usable on the current host.
@@ -155,10 +163,19 @@ class BackendPlugin(ABC):
         return False
 
     def prepare_recovery(self, rows: list[Mapping]) -> None:
-        """Before recovery probes the rows: get surviving VMMs into a state recovery can handle."""
+        """Before recovery probes the rows (every active one, maybe none): clear
+        what a crashed daemon left behind and get surviving VMMs into a state
+        recovery can handle. Raise to refuse to start."""
+
+    def reconcile_recovered(self, row: Mapping) -> None:
+        """After recovery, for each running or paused VM: repair host state outside the VMM a restart may have lost."""
 
     def confine_recovered(self, row: Mapping) -> None:
         """Re-apply resource limits to an adopted VM; raise if it can't be confined."""
+
+    def run_main_loop(self) -> None:
+        """Run the hypervisor's main-thread loop, forever (see ``needs_main_thread``)."""
+        raise NotImplementedError(f"backend {self.name!r} has no main loop")
 
     # ── The guest agent ───────────────────────────────────────────────────
 

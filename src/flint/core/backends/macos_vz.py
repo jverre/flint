@@ -116,6 +116,7 @@ class MacOSVirtualizationBackend(BackendPlugin):
     display_name = "Virtualization.framework (macOS arm64)"
     supported_platforms = ("darwin-arm64",)
     supports_network_policy = False
+    needs_main_thread = True
 
     def preflight(self) -> list[str]:
         problems = super().preflight()
@@ -154,6 +155,9 @@ class MacOSVirtualizationBackend(BackendPlugin):
     def __init__(self) -> None:
         self._runtime = _BackendThread()
         self._handles: dict[str, _MacVMHandle] = {}
+
+    def run_main_loop(self) -> None:
+        self._runtime.run_loop()
 
     def ensure_runtime_ready(self) -> None:
         try:

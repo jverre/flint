@@ -7,7 +7,7 @@ from textual.message import Message
 from textual.widgets import Input, RichLog, Rule, Static
 from ..prompt_row import PromptRow
 from flint.sandbox import Sandbox
-from flint.core.config import TERM_COLS, TERM_ROWS
+from flint._settings import TERM_COLS, TERM_ROWS
 from flint.tui.palette import ERROR_HEX, SUCCESS_HEX, WARNING_HEX
 from flint.tui.terminal_emulator import TerminalEmulator
 

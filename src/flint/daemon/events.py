@@ -3,22 +3,28 @@
 `publish(...)` is safe to call from any thread. Each WebSocket subscriber gets
 a bounded asyncio.Queue; on overflow the oldest event is dropped.
 
-Every event carries the `tenant` it belongs to, the `actor` that caused it
-(see eventlog.py) and, once stored, its `seq`; `/events` subscribers only
-get their tenants' events.
+Every event has its `type`, `ts`, the `tenant` it belongs to, the `actor`
+that caused it (and `actor_name`; see eventlog.py) and, once stored, its
+`seq`; `/events` subscribers only get their tenants' events. Every event
+about a VM has its `vm_id`, and every event about a volume its `volume_id`.
 
-Event types (payload keys other than `type`, `ts` and `tenant`):
-  vm.created           vm: dict
-  vm.deleted           vm_id: str
-  vm.state_changed     vm_id: str, from: str, to: str
-  vm.paused            vm_id: str
+Event types and the rest of their payload:
+  vm.created           vm: dict (the VM as GET /vms/{id} shows it)
+  vm.deleted           -
+  vm.state_changed     from: str, to: str
+  vm.paused            -
   vm.resumed           vm: dict
-  vm.wiped             vm_id: str, files: int, bytes: int  (its files were wiped before removal)
-  vm.exec              vm_id: str, cmd: str, exit_code: int, duration_ms: float, stdout_tail, stderr_tail
+  vm.checkpoint        snapshot_id: str, timings: dict  (a cluster snapshotted the running VM)
+  vm.wiped             files: int, bytes: int  (its files were wiped before removal)
+  vm.exec              cmd: str, exit_code: int | None, duration_ms: float, stdout_tail: str,
+                       stderr_tail: str, error: str (if the guest refused it)
+  vm.process_started   cmd: str, pid: int | None
   volume.created       volume: dict
-  volume.deleted       volume_id: str
-  volume.attached      vm_id: str, volume_id: str, mount_path: str
-  volume.detached      vm_id: str, volume_id: str, mount_path: str
+  volume.deleted       -
+  volume.attached      vm_id: str, mount_path: str
+  volume.detached      vm_id: str, mount_path: str
+
+A cluster's control plane adds its own (vm.moved, vm.checkpointed, host.*).
 """
 
 from __future__ import annotations
@@ -96,7 +102,7 @@ def _tenant_of(payload: dict) -> str:
     volume = payload.get("volume")
     if isinstance(volume, dict) and volume.get("tenant"):
         return volume["tenant"]
-    vm_id = payload.get("vm_id") or (vm or {}).get("vm_id")
+    vm_id = payload.get("vm_id")
     if vm_id:
         try:
             return vm_tenant(vm_id) or ""
@@ -106,7 +112,11 @@ def _tenant_of(payload: dict) -> str:
 
 
 def publish(event_type: str, **payload) -> None:
-    """Publish to the global bus. No-op if the bus is not yet initialized."""
+    """Store an event and publish it to the global bus (if it is initialized yet)."""
+    for key, field in (("vm", "vm_id"), ("volume", "volume_id")):
+        resource = payload.get(key)
+        if isinstance(resource, dict) and not payload.get(field):
+            payload[field] = resource.get(field) or resource.get("id", "")
     if not payload.get("tenant"):
         payload["tenant"] = _tenant_of(payload)
     if not payload.get("actor"):

@@ -13,6 +13,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
+from .errors import Busy, InvalidRequest
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenant_quotas (
     tenant         TEXT PRIMARY KEY,
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS tenant_quotas (
 LIMITS = ("max_vms", "max_vcpus", "max_memory_mib", "max_volume_gib")
 
 
-class QuotaExceeded(Exception):
+class QuotaExceeded(Busy):
     """The tenant is at a limit. The API answers 429, like the cluster."""
 
 
@@ -73,9 +75,9 @@ class Quotas:
         """Change some limits (the others stay). Values are integers >= 0."""
         for k, v in changes.items():
             if k not in LIMITS:
-                raise ValueError(f"unknown limit {k!r}; limits are {', '.join(LIMITS)}")
+                raise InvalidRequest(f"unknown limit {k!r}; limits are {', '.join(LIMITS)}")
             if not isinstance(v, int) or isinstance(v, bool) or v < 0:
-                raise ValueError(f"{k} must be an integer >= 0 (0 = no limit)")
+                raise InvalidRequest(f"{k} must be an integer >= 0 (0 = no limit)")
         limits = {**self.get(tenant), **changes}
         with self._lock:
             self._conn.execute(

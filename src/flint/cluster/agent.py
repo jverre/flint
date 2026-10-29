@@ -213,13 +213,11 @@ class ClusterAgent:
         renewed, ttl = lease.get("renewed_at", 0.0), lease.get("ttl_ms", self.lease_ttl_ms) / 1000
         if time.time() - renewed <= ttl:
             return
-        mgr = self.daemon.manager
-        with mgr._lock:
-            stale = [e.vm_id for e in mgr._sandboxes.values() if e.availability in LEASED]
+        stale = [e.vm_id for e in self.daemon.manager.entries() if e.availability in LEASED]
         for vm_id in stale:
             log.warning("cluster: lease of %s lapsed %.0fs ago while the agent was down; killing it", vm_id[:8], time.time() - renewed - ttl)
             try:
-                self.daemon.kill_vm(vm_id)
+                self.daemon.services.kill_vm(vm_id, missing_ok=True)
             except Exception:
                 log.exception("fencing %s failed", vm_id[:8])
 
@@ -269,7 +267,7 @@ class ClusterAgent:
         for vm_id in resp.get("evict") or []:
             log.info("cluster: evicting %s (owned elsewhere or deleted)", vm_id[:8])
             try:
-                self.daemon.kill_vm(vm_id)
+                self.daemon.services.kill_vm(vm_id, missing_ok=True)
             except Exception:
                 log.exception("evict %s failed", vm_id[:8])
             with self._lock:
@@ -279,11 +277,9 @@ class ClusterAgent:
         """Point snapd's fence at the leased VMs running here now, expiring
         with the current lease. False if the lease has run out: snapd keeps
         its last deadline, which has passed or is about to."""
-        mgr = self.daemon.manager
         with self._fence_lock:
-            with mgr._lock:
-                leased = [{"vm_id": e.vm_id, "pid": e.pid} for e in mgr._sandboxes.values()
-                          if e.state in (SandboxState.RUNNING, SandboxState.STARTING) and e.availability in LEASED and e.pid > 0]
+            leased = [{"vm_id": e.vm_id, "pid": e.pid} for e in self.daemon.manager.entries()
+                      if e.state in (SandboxState.RUNNING, SandboxState.STARTING) and e.availability in LEASED and e.pid > 0]
             remaining = int((self._lease_deadline - time.monotonic()) * 1000)
             if not leased:
                 self.snapd.disarm()
@@ -311,14 +307,12 @@ class ClusterAgent:
         return self._inventory.report(self.daemon.backend.vmm_binary(), processes)
 
     def _vm_reports(self) -> list[dict]:
-        mgr = self.daemon.manager
         out = {}
-        with mgr._lock:
-            for e in mgr._sandboxes.values():
-                out[e.vm_id] = {"vm_id": e.vm_id, "state": str(e.state),
-                                "resources": e.backend_metadata.get("resources", {}),
-                                "maintenance": e.backend_metadata.get("maintenance", {})}
-        for row in self.daemon._state_store.list_active():
+        for e in self.daemon.manager.entries():
+            out[e.vm_id] = {"vm_id": e.vm_id, "state": str(e.state),
+                            "resources": e.backend_metadata.get("resources", {}),
+                            "maintenance": e.backend_metadata.get("maintenance", {})}
+        for row in self.daemon.state_store.list_active():
             if row["vm_id"] in out:
                 continue
             rep = {"vm_id": row["vm_id"], "state": row["state"]}
@@ -355,7 +349,7 @@ class ClusterAgent:
 
     def export_pause(self, vm_id: str, snapshot_id: str, upload: str = "sync") -> dict:
         """Snapshot a paused VM's files into the store."""
-        row = self.daemon._state_store.get_sandbox(vm_id)
+        row = self.daemon.state_store.get_sandbox(vm_id)
         if not row or row.state != SandboxState.PAUSED:
             raise RuntimeError(f"{vm_id} is not paused")
         root, files = self.daemon.backend.pause_files(row)
@@ -368,7 +362,7 @@ class ClusterAgent:
 
     def _export_unexported_pauses(self) -> None:
         """A VM paused by its own timeout policy still gets a snapshot, so it can resume elsewhere."""
-        for row in self.daemon._state_store.list_in_state(SandboxState.PAUSED):
+        for row in self.daemon.state_store.list_in_state(SandboxState.PAUSED):
             vm_id = row["vm_id"]
             if vm_id in self._pauses or vm_id in self._exporting or vm_id in self._api_pausing:
                 continue

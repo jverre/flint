@@ -152,6 +152,13 @@ class TokenStore:
             self._conn.commit()
         return record, _format(token_id, secret)
 
+    def export_rows(self) -> list[tuple]:
+        """Every token's row as stored (hashes, never secrets), to move the tokens to another database."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, kind, secret_hash, tenants, name, created_at, expires_at, identity FROM api_tokens"
+            ).fetchall()
+
     def list(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(

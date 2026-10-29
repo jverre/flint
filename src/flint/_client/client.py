@@ -7,8 +7,9 @@ from typing import Callable
 
 import httpx
 
-from flint.core.config import API_KEY, DAEMON_URL, TENANT
+from flint._settings import API_KEY, DAEMON_URL, DEFAULT_TEMPLATE_ID, TENANT
 from flint._client.transport import http_client, ws_connect
+from flint.errors import detail_of, raise_for_status as _raise_for_status
 
 DEFAULT_URL = DAEMON_URL
 
@@ -52,17 +53,6 @@ class _TerminalConnection:
                     self._on_output(message.encode())
         except Exception:
             pass
-
-
-def _raise_for_status(resp: httpx.Response) -> None:
-    """Like raise_for_status, with the daemon's error detail in the message."""
-    if resp.is_success:
-        return
-    try:
-        detail = resp.json().get("detail", resp.text)
-    except ValueError:
-        detail = resp.text
-    raise httpx.HTTPStatusError(f"{resp.status_code}: {detail}", request=resp.request, response=resp)
 
 
 # Answers worth retrying with the same Idempotency-Key: the control plane
@@ -117,10 +107,7 @@ class DaemonClient:
     def _worth_retrying(self, resp: httpx.Response) -> bool:
         if resp.status_code not in _RETRY_STATUS and resp.status_code != 409:
             return False
-        try:
-            detail = str(resp.json().get("detail", ""))
-        except ValueError:
-            detail = resp.text
+        detail = detail_of(resp)
         if resp.status_code == 409 and not any(d in detail for d in _RETRY_DETAIL):
             return False
         if "capacity_exhausted" in detail:
@@ -133,13 +120,14 @@ class DaemonClient:
         self._terminals.clear()
         self._http.close()
 
-    def create(self, *, template_id: str = "default", allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None, tenant: str | None = None, availability: str | None = None) -> dict:
+    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True,
+               network_policy: dict | None = None, tenant: str | None = None, availability: str | None = None) -> dict:
         body = {}
         if network_policy is not None:
             body["network_policy"] = network_policy
         if availability is not None:
             body["availability"] = availability
-        params = {"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool, "use_pyroute2": use_pyroute2}
+        params = {"template_id": template_id, "allow_internet_access": allow_internet_access, "use_pool": use_pool}
         if tenant or self._tenant:
             params["tenant"] = tenant or self._tenant
         resp = self._mutate("POST", "/vms", params=params, json=body or None)
@@ -248,19 +236,12 @@ class DaemonClient:
     def fork(self, vm_id: str, count: int = 1) -> list[dict]:
         """Fork a running VM into ``count`` new VMs (cluster control plane only)."""
         resp = self._mutate("POST", f"/vms/{vm_id}/fork", json={"count": count}, timeout=300.0)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Fork failed ({resp.status_code}): {resp.text}")
+        _raise_for_status(resp)
         return resp.json()["vms"]
 
     def resume(self, vm_id: str) -> dict:
         resp = self._mutate("POST", f"/vms/{vm_id}/resume")
-        if resp.status_code >= 400:
-            detail = resp.text
-            try:
-                detail = resp.json().get("detail", resp.text)
-            except Exception:
-                pass
-            raise RuntimeError(f"Resume failed ({resp.status_code}): {detail}")
+        _raise_for_status(resp)
         return resp.json()["vm"]
 
     def set_timeout(self, vm_id: str, timeout_seconds: float, policy: str = "kill") -> None:

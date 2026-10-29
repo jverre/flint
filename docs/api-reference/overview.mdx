@@ -113,9 +113,13 @@ Common status codes:
 |------|---------|
 | `200` | Success |
 | `201` | Created |
-| `400` | Bad request (e.g. trying to delete the default template) |
+| `400` | Bad request: a body or parameter that doesn't validate (the detail says which field and why), or e.g. trying to delete the default template |
 | `401` | No API token, or not a valid one |
 | `403` | The token can't do this (an admin-only endpoint, or another tenant) |
-| `404` | Sandbox or template not found (or another tenant's) |
-| `429` | The tenant is at its quota |
-| `503` | Guest agent unreachable |
+| `404` | Sandbox, template or volume not found (or another tenant's) |
+| `409` | The resource's state doesn't allow it (e.g. pausing a paused sandbox) |
+| `429` | The tenant is at its quota, or template builds are at capacity (see `Retry-After`) |
+| `501` | The host's backend can't do it (e.g. network policies on macOS) |
+| `503` | Not ready or unreachable (golden snapshot, guest agent), or a cleanup must be retried |
+
+The Python SDK raises these as `flint.FlintError` subclasses: `InvalidRequest` (400), `Unauthorized` (401), `Forbidden` (403), `NotFound` (404), `Conflict` (409), `LimitExceeded` (429) and `Unavailable` (502-507). Each is also an `httpx.HTTPStatusError`, with the answer in `.response`, and has the `status_code` and `detail`.

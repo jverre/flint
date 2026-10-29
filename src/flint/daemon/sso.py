@@ -325,7 +325,7 @@ def _sso(request: Request) -> SSO:
 
 
 def _tokens(request: Request):
-    return request.app.state.daemon.tokens
+    return request.app.state.services.tokens
 
 
 @router.get("/providers")
@@ -394,7 +394,7 @@ async def callback(pid: str, request: Request):
 
 def _audit_sign_in(request: Request, actor: str, who: str, pid: str, status: int) -> None:
     """Sign-ins go in the audit log: who got (or was refused) a session."""
-    eventlog = getattr(getattr(request.app.state, "daemon", None), "eventlog", None)
+    eventlog = getattr(getattr(request.app.state, "services", None), "eventlog", None)
     if eventlog is not None:
         eventlog.audit(actor=actor, actor_name=who, method="GET", path=f"/auth/callback/{pid}", status=status,
                        request_id=request.scope.get("state", {}).get("request_id", ""))

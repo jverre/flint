@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Callable
 from . import _wipe, config
 from .backends.base import BackendPlugin
 from .config import DEFAULT_TEMPLATE_ID, log
-from .errors import Conflict, InvalidState, SandboxNotFound
+from .errors import Conflict, InvalidRequest, InvalidState, SandboxNotFound
 from .events import EventSink, discard
 from .guest import GuestAgent, bridge_terminal
 from .policy import NetworkPolicy, redacted
@@ -28,6 +28,19 @@ from .types import BootResult, SandboxRow, SandboxState, _SandboxEntry
 
 if TYPE_CHECKING:
     from ._state_store import StateStore
+
+
+# What happens to a sandbox when its timeout passes.
+TIMEOUT_POLICIES = ("kill", "pause")
+
+
+def check_timeout(timeout_seconds: object, policy: object) -> None:
+    """Raise InvalidRequest unless these are a valid sandbox timeout and policy."""
+    if policy not in TIMEOUT_POLICIES:
+        raise InvalidRequest(f"timeout policy must be one of {', '.join(TIMEOUT_POLICIES)}")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) \
+            or not 0 <= timeout_seconds < float("inf"):
+        raise InvalidRequest("timeout must be a number of seconds >= 0")
 
 
 def _vm_operation(method):
@@ -85,6 +98,11 @@ class SandboxManager:
     def untrack(self, sandbox_id: str) -> None:
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
+
+    def detach_all(self) -> None:
+        """Stop tracking every VM without stopping it (the daemon is exiting; recovery adopts them again)."""
+        with self._lock:
+            self._sandboxes.clear()
 
     def adopt(self, entry: _SandboxEntry) -> None:
         """Record and track a sandbox whose VM was started outside :meth:`create` (a migration receiver)."""
@@ -157,7 +175,7 @@ class SandboxManager:
 
     def set_tenant_network(self, tenant: str, enabled: bool) -> None:
         if not self._backend.supports_tenant_networks or config.CLUSTER_MODE:
-            raise ValueError("Tenant networking requires a single Linux host")
+            raise Conflict("Tenant networking requires a single Linux host")
         with self._network_lock:
             self._state_store.set_tenant_network(tenant, enabled)
             self.refresh_tenant_networks()
@@ -382,9 +400,13 @@ class SandboxManager:
         return sandbox_id
 
     def set_timeout(self, sandbox_id: str, timeout_seconds: float, policy: str = "kill") -> None:
-        """Set or update the timeout for a sandbox."""
+        """Set or update the timeout for a sandbox: in ``timeout_seconds`` it is killed, or paused if ``policy`` is "pause"."""
         if not self._state_store:
             raise RuntimeError("StateStore required for set_timeout")
+        check_timeout(timeout_seconds, policy)
+        row = self._state_store.get_sandbox(sandbox_id)
+        if not row or row.state == SandboxState.DEAD:
+            raise SandboxNotFound.of(sandbox_id)
         timeout_at = time.time() + timeout_seconds
         self._state_store.set_timeout(sandbox_id, timeout_at, policy)
         with self._lock:

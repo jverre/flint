@@ -41,10 +41,9 @@ def test_events_and_audit_obey_the_http_principal(tmp_path, monkeypatch):
         threading.Thread(target=serve, daemon=True).start()
         return host
 
-    manager = SimpleNamespace(get_dict=lambda vm_id: vm if vm_id == "vm-1" else None,
-                              get_entry=lambda vm_id: SimpleNamespace(**vm), connect_agent=agent)
-    daemon = SimpleNamespace(tokens=tokens, eventlog=log, cluster=None, manager=manager, metrics=None)
-    monkeypatch.setattr(app.state, "daemon", daemon, raising=False)
+    services = SimpleNamespace(tokens=tokens, eventlog=log, cluster_mode=False, start=lambda loop: None,
+                               get_vm=lambda vm_id: vm if vm_id == "vm-1" else None, connect_agent=agent)
+    monkeypatch.setattr(app.state, "services", services, raising=False)
     monkeypatch.setattr(events, "sink", log.record)
     monkeypatch.setattr(events, "vm_tenant", lambda vm_id: "acme")
     for tenant in ("", "other", "acme"):

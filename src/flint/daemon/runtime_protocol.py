@@ -79,22 +79,8 @@ class RuntimeClient:
             if fd is not None:
                 import os
                 os.close(fd)
-            from .auth import AuthError
-            from flint.core._quotas import QuotaExceeded
-            from flint.core._volumes import VolumeError
-            from flint.core._wipe import WipeError
-            from flint.core.errors import BY_NAME as SANDBOX_ERRORS
+            # The API's exception handler answers with the error's status.
+            from flint.core.errors import from_status
             error = result["error"]
-            if error["kind"] in SANDBOX_ERRORS:
-                # The API's exception handler maps these to their status.
-                raise SANDBOX_ERRORS[error["kind"]](error["detail"])
-            errors = {"ValueError": ValueError, "RuntimeError": RuntimeError, "WipeError": WipeError,
-                      "QuotaExceeded": QuotaExceeded, "AuthError": AuthError, "VolumeError": VolumeError}
-            kind = errors.get(error["kind"], RuntimeError)
-            if kind in (AuthError, VolumeError):
-                raise kind(error["status"], error["detail"])
-            if error.get("status"):
-                from fastapi import HTTPException
-                raise HTTPException(error["status"], error["detail"], headers=error.get("headers"))
-            raise kind(error["detail"])
+            raise from_status(error.get("status"), str(error.get("detail", "")), error.get("headers"))
         return socket.socket(fileno=fd) if fd is not None else result["value"]

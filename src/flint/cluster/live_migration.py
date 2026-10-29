@@ -205,7 +205,7 @@ class LiveMigration:
     def status(self, vm_id: str) -> dict:
         entry = self.daemon.manager.get_entry(vm_id)
         if not entry:
-            row = self.daemon._state_store.get_sandbox(vm_id)
+            row = self.daemon.state_store.get_sandbox(vm_id)
             if row and self._alive(row["pid"]):
                 return {"phase": "unknown", "vmm_state": "Unknown"}
             return {"phase": "absent", "vmm_state": "Absent"}
@@ -250,7 +250,7 @@ class LiveMigration:
             if relay:
                 relay.close()
             entry = self.daemon.manager.get_entry(vm_id)
-            row = self.daemon._state_store.get_sandbox(vm_id)
+            row = self.daemon.state_store.get_sandbox(vm_id)
             pid = entry.pid if entry else (row or {}).get("pid", 0)
             maintenance = Maintenance.of(
                 entry.backend_metadata if entry else SandboxRow.of(row or {}).backend_metadata
@@ -259,7 +259,7 @@ class LiveMigration:
                 LivePhase.RECEIVED,
                 LivePhase.CUTOVER_FAILED,
             )
-            self.daemon.kill_vm(vm_id)
+            self.daemon.services.kill_vm(vm_id, missing_ok=True)
             worker = self.workers.get(vm_id)
             if worker:
                 worker.join(timeout=5)

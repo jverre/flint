@@ -19,7 +19,7 @@ def start(port, data_dir, state_dir, backend):
     """Start the Flint manager daemon."""
     _set_daemon_env(port, data_dir, state_dir, backend)
     _check_backend(backend)
-    from flint.daemon.server import FlintDaemon
+    from flint.daemon.lifecycle import FlintDaemon
     FlintDaemon().run()
 
 
@@ -138,7 +138,7 @@ def agent(token, advertise, listen, port, snapd_port, name, zone, labels, data_d
         if result.returncode != 0:
             raise click.ClickException(f"join failed: {result.stderr.strip() or result.stdout.strip()}")
         click.echo(f"Joined the cluster as {result.stdout.strip()}", err=True)
-    from flint.daemon.server import FlintDaemon
+    from flint.daemon.lifecycle import FlintDaemon
     FlintDaemon().run()
 
 
@@ -148,16 +148,15 @@ def _cp(method: str, path: str, **kwargs):
     """Call the daemon or control plane at FLINT_URL; exit with its error."""
     from flint._client.client import auth_headers
     from flint._client.transport import http_client
-    from flint.core.config import DAEMON_URL
+    from flint._settings import DAEMON_URL
+    from flint.errors import FlintError, raise_for_status
     _require_daemon()
     with http_client(DAEMON_URL, headers=auth_headers(), timeout=60.0) as c:
         resp = c.request(method, path, **kwargs)
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("detail", resp.text)
-        except ValueError:
-            detail = resp.text
-        raise click.ClickException(f"{resp.status_code}: {detail}")
+    try:
+        raise_for_status(resp)
+    except FlintError as e:
+        raise click.ClickException(str(e)) from None
     return resp.json()
 
 
@@ -165,7 +164,7 @@ def _require_daemon() -> None:
     """Exit with a useful message when the daemon can't be reached."""
     from flint._client.client import DaemonClient
     from flint._client.transport import socket_path
-    from flint.core.config import DAEMON_URL
+    from flint._settings import DAEMON_URL
     if DaemonClient.is_daemon_running():
         return
     path = socket_path(DAEMON_URL)
@@ -209,7 +208,7 @@ def token_revoke(token_id):
 
 def _event_line(e: dict) -> str:
     when = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
-    vm = (e.get("vm_id") or (e.get("vm") or {}).get("vm_id") or "")[:8]
+    vm = (e.get("vm_id") or "")[:8]
     who = e.get("actor_name") or e.get("actor", "")
     detail = ""
     if e.get("type") == "vm.exec":
@@ -307,7 +306,7 @@ def login(provider, open_browser):
     import webbrowser
     import httpx
     from urllib.parse import parse_qs, urlencode, urlsplit
-    from flint.core.config import CREDENTIALS_PATH, DAEMON_URL
+    from flint._settings import CREDENTIALS_PATH, DAEMON_URL
     from flint.daemon.sso import pkce_challenge
     if DAEMON_URL.startswith("unix://"):
         raise click.ClickException("the daemon's socket needs no sign-in; set FLINT_URL to sign in to a server over HTTP")
@@ -375,7 +374,7 @@ def logout():
     """End the sign-in session `flint login` started for FLINT_URL."""
     import json as _json
     import httpx
-    from flint.core.config import CREDENTIALS_PATH, DAEMON_URL, stored_token
+    from flint._settings import CREDENTIALS_PATH, DAEMON_URL, stored_token
     tok = stored_token(DAEMON_URL)
     if tok:
         try:
@@ -644,10 +643,10 @@ def _daemon_client():
 
 
 def _volume_call(fn, *args, **kwargs):
-    import httpx
+    from flint.errors import FlintError
     try:
         return fn(*args, **kwargs)
-    except httpx.HTTPStatusError as e:
+    except FlintError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
 

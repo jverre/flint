@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from flint._client.client import DaemonClient, _TerminalConnection, auth_headers
-from flint.core.config import API_KEY, DAEMON_URL, TENANT, TERM_COLS, TERM_ROWS
+from flint._settings import API_KEY, DAEMON_URL, DEFAULT_TEMPLATE_ID, TENANT, TERM_COLS, TERM_ROWS
 
 if TYPE_CHECKING:
     from flint.volume import Volume
@@ -128,10 +128,9 @@ class Sandbox:
         self,
         vm_id: str | None = None,
         *,
-        template_id: str = "default",
+        template_id: str = DEFAULT_TEMPLATE_ID,
         allow_internet_access: bool = True,
         use_pool: bool = True,
-        use_pyroute2: bool = True,
         network_policy: dict | None = None,
         tenant: str | None = None,
         availability: str | None = None,
@@ -140,7 +139,8 @@ class Sandbox:
         ``durable``) apply when talking to a cluster control plane."""
         client = _get_client()
         if vm_id is None:
-            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool, use_pyroute2=use_pyroute2, network_policy=network_policy, tenant=tenant, availability=availability)
+            vm = client.create(template_id=template_id, allow_internet_access=allow_internet_access, use_pool=use_pool,
+                               network_policy=network_policy, tenant=tenant, availability=availability)
             self._id = vm["vm_id"]
             self._timings: dict[str, float] = vm.get("timings", {})
             self._ready_time_ms: float | None = vm.get("ready_time_ms")
@@ -320,7 +320,7 @@ class Sandbox:
         sb._ready_time_ms = None
         sb._storage_backend = "local"
         sb._workspace_dir = "/workspace"
-        sb._template_id = "default"
+        sb._template_id = DEFAULT_TEMPLATE_ID
         sb._commands = Commands(vm_id)
         sb._pty = Pty(vm_id)
         return sb

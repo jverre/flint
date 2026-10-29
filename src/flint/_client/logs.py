@@ -7,14 +7,17 @@ VM and stop it when switching away.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Callable
 
 from websockets.exceptions import WebSocketException
 
-from flint.core.config import DAEMON_URL, log
+from flint._settings import DAEMON_URL
 from flint._client.client import auth_headers
 from flint._client.transport import ws_connect
+
+log = logging.getLogger("flint.client")
 
 
 class LogStream:

@@ -47,6 +47,7 @@ from dataclasses import asdict, dataclass
 
 from . import _nfs_server
 from .config import BRIDGE_IP, NBD_PORT, NBD_RO_PORT, R2NFS_PORT, log
+from .errors import FlintError
 from ._nfs_server import VOLUMES_DIR
 from .types import SandboxState
 
@@ -99,7 +100,9 @@ _WRITER_OPTIONS = "rw,actimeo=30"
 _GUEST_DISKS_DIR = "/run/flint/disks"
 
 
-class VolumeError(Exception):
+class VolumeError(FlintError):
+    """A volume request that can't be served; ``status`` is the API's answer."""
+
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
         self.status = status
@@ -179,10 +182,13 @@ def _overlaps(a: str, b: str) -> bool:
 
 
 class Volumes:
-    """Volume CRUD plus mounting into sandboxes. ``manager`` is the SandboxManager."""
+    """Volume CRUD plus mounting into sandboxes. ``manager`` is the SandboxManager.
 
-    def __init__(self, conn: sqlite3.Connection, manager, state_store=None) -> None:
-        self._conn = conn
+    Keeps its tables in the daemon's database at ``db_path``, over its own connection.
+    """
+
+    def __init__(self, db_path: str, manager, state_store=None) -> None:
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._manager = manager
         self._state_store = state_store
         self._lock = threading.Lock()
@@ -252,7 +258,7 @@ class Volumes:
             rows = byid
         return _volume(rows[0]) if rows else None
 
-    def _require(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume:
+    def require(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume:
         vol = self.get(ref, tenants)
         if vol is None:
             raise VolumeError(404, f"Volume '{ref}' not found")
@@ -278,7 +284,7 @@ class Volumes:
         return self._copy(ref, name, readonly=False, tenants=tenants)
 
     def _copy(self, ref: str, name: object, readonly: bool, tenants: tuple[str, ...] | None) -> Volume:
-        src = self._require(ref, tenants)
+        src = self.require(ref, tenants)
         if src.kind != "image":
             raise VolumeError(400, f"Volume '{src.name}' is a plain directory; only image volumes can be copied")
         owner = next((m for m in self._mounts_where("volume_id = ?", src.id) if m.exclusive), None)
@@ -326,7 +332,7 @@ class Volumes:
 
     def delete(self, ref: str, tenants: tuple[str, ...] | None = None) -> Volume:
         with self._lock:
-            vol = self._require(ref, tenants)
+            vol = self.require(ref, tenants)
             if self._mounts_where("volume_id = ?", vol.id):
                 raise VolumeError(409, f"Volume '{vol.name}' is mounted; unmount it first")
             self._discard(vol)
@@ -373,14 +379,14 @@ class Volumes:
             raise VolumeError(409, f"Sandbox {vm_id} is not running")
         # Only the sandbox's own tenant's volumes: another tenant's don't exist for it.
         tenant = (entry.tenant or "default",)
-        self._require(volume, tenant)
+        self.require(volume, tenant)
         client_ip = (entry.backend_metadata or {}).get("veth_ip", "")
         if not client_ip:
             raise VolumeError(409, "Sandbox has no network path to the host's volume server "
                                    "(sandboxes created with allow_internet_access=False can't mount volumes)")
 
         with self._lock:
-            vol = self._require(volume, tenant)
+            vol = self.require(volume, tenant)
             if vol.readonly and not readonly:
                 raise VolumeError(400, f"Volume '{vol.name}' is a read-only snapshot; mount it with readonly=True")
             if self._mounts_where("vm_id = ? AND path = ?", vm_id, path):
