@@ -1,8 +1,9 @@
-// In-browser mock of the daemon + control-plane API (same routes, same shapes, see
-// API-CONTRACT.md). Used with `?mock` (cluster) or `?mock=daemon` for demos, screenshots and
-// developing without VMs. Not used against a real server.
+// In-browser mock of the daemon + control-plane API (same routes, same shapes as the real servers:
+// see the note at the top of types.ts; type mock replies with those types so they can't drift).
+// Used with `?mock` (cluster) or `?mock=daemon` for demos, screenshots and developing without
+// VMs. Not used against a real server.
 import type { Sock } from "./client";
-import type { FlintEvent, Host, RawVM, Template, Token } from "./types";
+import type { FileEntry, FlintEvent, Host, ProcessInfo, RawVM, Template, Token } from "./types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now() / 1000;
@@ -218,9 +219,14 @@ on("GET", /^\/vms\/([^/]+)\/network-policy$/, (m) => { const v = find(m[1]); ret
 on("PUT", /^\/vms\/([^/]+)\/network-policy$/, (m, _q, b) => { const v = find(m[1]); if (!v) return err(404, "VM not found"); v.network_policy = b as RawVM["network_policy"]; return json({ ok: true }); });
 on("GET", /^\/vms\/([^/]+)\/processes$/, (m) => {
   const v = find(m[1]); if (!v) return err(404, "VM not found");
-  return json({ processes: [{ pid: 1, cmd: ["/sbin/init"], running: true }, { pid: 412, cmd: ["flintd"], tag: "agent", running: true }, { pid: 4127, cmd: ["python", "main.py", "--resume"], tag: "exec", running: true }] });
+  // What flintd lists: the processes it started (not init or itself), forgotten once they exit.
+  const processes: ProcessInfo[] = [
+    { pid: 211, tag: "", pty: true, cmd: ["/bin/sh"], exited: false },
+    { pid: 4127, tag: "agent", pty: false, cmd: ["python", "main.py", "--resume"], exited: false },
+  ];
+  return json({ processes });
 });
-const FS: Record<string, { name: string; size: number; is_dir: boolean; mode: string }[]> = {
+const FS: Record<string, FileEntry[]> = {
   "/workspace": [{ name: "main.py", size: 4812, is_dir: false, mode: "0644" }, { name: "agent.toml", size: 611, is_dir: false, mode: "0644" }, { name: "requirements.txt", size: 142, is_dir: false, mode: "0644" }, { name: "out", size: 0, is_dir: true, mode: "0755" }],
   "/workspace/out": [{ name: "report-0411.md", size: 20480, is_dir: false, mode: "0644" }],
   "/": [{ name: "workspace", size: 0, is_dir: true, mode: "0755" }, { name: "etc", size: 0, is_dir: true, mode: "0755" }, { name: "tmp", size: 0, is_dir: true, mode: "1777" }],

@@ -1,7 +1,6 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
-import { api } from "../../api/client";
-import { useFiles } from "../../api/hooks";
+import { fileActions, useFilePreview, useFiles } from "../../api/hooks";
 import type { FileEntry } from "../../api/types";
 import { Dialog, Empty, useToast } from "../../components/ui";
 import { errMsg, NeedsRunning, type TabProps } from "./common";
@@ -21,13 +20,7 @@ export default function Files({ vm, running, onResume, resuming }: TabProps) {
   const files = useFiles(vm.id, path, running);
   const selPath = sel ? join(path, sel.name) : "";
 
-  const prev = useQuery<{ text: string; truncated: boolean; binary: boolean }>({
-    queryKey: ["file-preview", vm.id, selPath], enabled: !!sel && !sel.is_dir && running, retry: false,
-    queryFn: async () => {
-      const t = await api.get<string>(`/vms/${vm.id}/files`, { query: { path: selPath }, as: "text", headers: { Range: `bytes=0-${CAP - 1}` } });
-      return { text: t.slice(0, CAP), truncated: t.length > CAP || (sel?.size ?? 0) > CAP, binary: t.slice(0, 4096).includes("\u0000") };
-    },
-  });
+  const prev = useFilePreview(vm.id, selPath, sel?.size ?? 0, CAP, !!sel && !sel.is_dir && running);
 
   if (!running) return <NeedsRunning vm={vm} what="The file browser" onResume={onResume} resuming={resuming} />;
 
@@ -39,7 +32,7 @@ export default function Files({ vm, running, onResume, resuming }: TabProps) {
     finally { setBusy(false); }
   };
   const download = () => sel && run(`Downloaded ${sel.name}.`, async () => {
-    const b = await api.get<Blob>(`/vms/${vm.id}/files`, { query: { path: selPath }, as: "blob" });
+    const b = await fileActions.download(vm.id, selPath);
     const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = sel.name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   });
   const crumbs = path.split("/").filter(Boolean);
@@ -56,7 +49,7 @@ export default function Files({ vm, running, onResume, resuming }: TabProps) {
         <span className="grow" />
         <input ref={up} type="file" hidden onChange={async (e) => {
           const f = e.target.files?.[0]; e.target.value = "";
-          if (f) await run(`Uploaded ${f.name}.`, () => api.post(`/vms/${vm.id}/files`, { query: { path: join(path, f.name) }, raw: f }));
+          if (f) await run(`Uploaded ${f.name}.`, () => fileActions.upload(vm.id, join(path, f.name), f));
         }} />
         <button className="btn sm" disabled={busy} onClick={() => up.current?.click()}>Upload</button>
         <button className="btn sm" disabled={busy} onClick={() => { setFolder(""); setMk(true); }}>New folder</button>
@@ -96,13 +89,13 @@ export default function Files({ vm, running, onResume, resuming }: TabProps) {
         </div>
       </div>
       <Dialog open={mk} onClose={() => setMk(false)} title="New folder" sub={`In ${path}`} width={440}
-        actions={[{ label: "Cancel", kind: "ghost" }, { label: "Create", kind: "pri", disabled: !folder.trim() || folder.includes("/"), onClick: () => run(`Created ${folder}.`, () => api.post(`/vms/${vm.id}/files/mkdir`, { query: { path: join(path, folder.trim()), parents: true } })) }]}>
+        actions={[{ label: "Cancel", kind: "ghost" }, { label: "Create", kind: "pri", disabled: !folder.trim() || folder.includes("/"), onClick: () => run(`Created ${folder}.`, () => fileActions.mkdir(vm.id, join(path, folder.trim()))) }]}>
         <input className="vm-input" autoFocus placeholder="folder name" aria-label="Folder name" value={folder} onChange={(e) => setFolder(e.target.value)} />
       </Dialog>
       <Dialog open={!!del} onClose={() => setDel(null)} title={`Delete ${del?.name ?? ""}?`} sub="This removes it from the VM's disk. It can't be undone." width={460}
         actions={[{ label: "Cancel", kind: "ghost" }, { label: "Delete", kind: "danger", onClick: async () => {
           if (!del) return;
-          const ok = await run(`Deleted ${del.name}.`, () => api.del(`/vms/${vm.id}/files`, { query: { path: join(path, del.name), recursive: del.is_dir } }));
+          const ok = await run(`Deleted ${del.name}.`, () => fileActions.remove(vm.id, join(path, del.name), del.is_dir));
           if (ok) setSel(null);
           return ok;
         } }]} />

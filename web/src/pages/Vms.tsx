@@ -128,6 +128,7 @@ export default function VmsPage() {
   if (counts.migrating) facts.push(<span key="m">{counts.migrating} migrating</span>);
   if (counts.recovering) facts.push(<span key="rc">{counts.recovering} recovering</span>);
   if (counts.stopped) facts.push(<span key="st">{counts.stopped} stopped</span>);
+  if (counts.unknown) facts.push(<span key="u" title="A state this UI does not recognise (see the browser console)">{counts.unknown} in an unknown state</span>);
   if (failed) facts.push(<span key="f" className="errc">{failed} failed</span>);
 
   const cols = 5 + (cluster ? 2 : 0) + (selMode ? 1 : 0);

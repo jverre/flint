@@ -1,9 +1,11 @@
-// Data hooks (TanStack Query) + the live event stream. Pages import from here only.
+// Data hooks (TanStack Query), actions, and the live event stream. Pages read and change server
+// state through here only, never with `api.*` directly; from ./client they use just ApiError (to
+// tell errors apart) and openSocket (interactive streams: shell, logs).
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
 import { api, ApiError, mockMode, openSocket } from "./client";
 import { normState, normVM } from "./normalize";
-import type { FileEntry, FlintEvent, Health, Host, MetricSample, Platform, ProcessInfo, Quota, RawVM, Template, Token, VM } from "./types";
+import type { FileEntry, FlintEvent, Health, Host, MetricSample, NetworkPolicy, Platform, ProcessInfo, Quota, RawVM, Template, Token, VM } from "./types";
 
 // ---------------- platform ----------------
 export function usePlatform() {
@@ -69,6 +71,47 @@ export function useFiles(id: string | undefined, path: string, enabled = true) {
     queryFn: async () => (await api.get<{ entries: FileEntry[] }>(`/vms/${id}/files/list`, { query: { path } })).entries ?? [],
   });
 }
+export interface FilePreview { text: string; truncated: boolean; binary: boolean }
+/** The first `cap` bytes of a file, as text. `size` (from the listing) tells whether it was cut. */
+export function useFilePreview(id: string, path: string, size: number, cap: number, enabled = true) {
+  return useQuery<FilePreview>({
+    queryKey: ["file-preview", id, path], enabled: !!path && enabled, retry: false,
+    queryFn: async () => {
+      const t = await api.get<string>(`/vms/${id}/files`, { query: { path }, as: "text", headers: { Range: `bytes=0-${cap - 1}` } });
+      return { text: t.slice(0, cap), truncated: t.length > cap || size > cap, binary: t.slice(0, 4096).includes("\u0000") };
+    },
+  });
+}
+export const fileActions = {
+  download: (id: string, path: string) => api.get<Blob>(`/vms/${id}/files`, { query: { path }, as: "blob" }),
+  upload: (id: string, path: string, data: Blob) => api.post(`/vms/${id}/files`, { query: { path }, raw: data }),
+  mkdir: (id: string, path: string) => api.post(`/vms/${id}/files/mkdir`, { query: { path, parents: true } }),
+  remove: (id: string, path: string, recursive: boolean) => api.del(`/vms/${id}/files`, { query: { path, recursive } }),
+};
+/** The VM's network policy, header values redacted. Not cached: an editor always starts from the server's. */
+export function useNetworkPolicy(id: string) {
+  return useQuery<NetworkPolicy | null>({
+    queryKey: ["network-policy", id], gcTime: 0, retry: false, refetchOnWindowFocus: false,
+    queryFn: async () => (await api.get<{ network_policy: NetworkPolicy | null }>(`/vms/${id}/network-policy`)).network_policy,
+  });
+}
+export const setNetworkPolicy = (id: string, policy: NetworkPolicy) => api.put(`/vms/${id}/network-policy`, { body: policy });
+/** A VM's past events. The timeline is oldest-first, a page at a time: page forward (bounded) so the newest are included. */
+export function useVmTimeline(id: string) {
+  return useQuery<FlintEvent[]>({
+    queryKey: ["vm-events", id], retry: false, staleTime: Infinity,
+    queryFn: async () => {
+      let since = 0, all: FlintEvent[] = [];
+      for (let i = 0; i < 6; i++) {
+        const r = await api.get<{ events: FlintEvent[]; next: number }>(`/vms/${id}/timeline`, { query: { since, limit: 1000 } });
+        all = all.concat(r.events);
+        if (r.events.length < 1000) break;
+        since = r.next;
+      }
+      return all;
+    },
+  });
+}
 
 // ---------------- templates / cluster ----------------
 export function useTemplates() {
@@ -83,7 +126,7 @@ export function useQuota(tenant: string | undefined, enabled = true) {
 export function useTokens(enabled = true) {
   return useQuery<Token[]>({ queryKey: ["tokens"], enabled, queryFn: async () => (await api.get<{ tokens: Token[] }>("/v1/tokens")).tokens });
 }
-/** Tenants are derived: there is no tenants endpoint (API-CONTRACT gap 8). */
+/** Tenants are derived: neither server has a tenants endpoint. */
 export function tenantsOf(vms: VM[] | undefined, tokens?: Token[]): string[] {
   const s = new Set<string>();
   vms?.forEach((v) => v.tenant && s.add(v.tenant));
@@ -92,6 +135,10 @@ export function tenantsOf(vms: VM[] | undefined, tokens?: Token[]): string[] {
 }
 
 // ---------------- actions ----------------
+export const signOut = () => api.post("/auth/logout");
+// TODO: the daemon and the control plane take create parameters differently (query string vs
+// body, timeout set by a follow-up PATCH in the cluster), hence the branching below. It goes
+// once the servers accept the same request; until then keep both shapes.
 export interface CreateOpts { template: string; tenant?: string; name?: string; allowInternet?: boolean; timeoutSeconds?: number; timeoutPolicy?: "kill" | "pause"; labels?: Record<string, string> }
 export async function createVM(o: CreateOpts, cluster: boolean): Promise<VM> {
   const labels = { ...(o.labels ?? {}), ...(o.name ? { name: o.name } : {}) };

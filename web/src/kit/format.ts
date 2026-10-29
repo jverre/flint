@@ -29,6 +29,6 @@ export const fmtMs = (ms: number | null | undefined): string => (ms == null ? "â
 export const pct = (a: number, b: number): string => (b ? Math.round((a / b) * 100) + " %" : "â€”");
 
 export const STATE_LABEL: Record<string, string> = {
-  running: "Running", paused: "Paused", starting: "Starting", error: "Failed", stopped: "Stopped", creating: "Starting", deleting: "Removing",
+  running: "Running", paused: "Paused", starting: "Starting", error: "Failed", stopped: "Stopped", creating: "Starting", deleting: "Removing", unknown: "Unknown",
 };
 export const stateLabel = (s: string) => STATE_LABEL[s] ?? s;

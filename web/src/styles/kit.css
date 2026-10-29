@@ -55,6 +55,8 @@ h1{font:600 22px/1.15 var(--sans);letter-spacing:-.01em}
 .st-paused{color:var(--muted)}
 .st-starting .dot{background:var(--blue);animation:blink 0.6s infinite alternate}
 .st-error .dot{background:var(--err)} .st-error{color:var(--err)}
+.st-unknown .dot{background:transparent;border:1.5px dashed var(--muted)} .st-unknown{color:var(--muted)}
+.st-deleting .dot{background:var(--muted)} .st-deleting{color:var(--muted)}
 .st-draining .dot{background:var(--warn)} .st-draining{color:var(--warn)}
 .st-cordoned .dot{background:transparent;border:1.5px dashed var(--warn)} .st-cordoned{color:var(--warn)}
 @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent-live) 55%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}

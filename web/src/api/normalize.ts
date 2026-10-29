@@ -1,13 +1,23 @@
 import type { RawVM, VM, VMState } from "./types";
 
+// Daemon states: src/flint/core/types.py (SandboxState, _STATE_API_NAMES).
+// Cluster states: cluster/internal/server/models.go (VMPending…).
 const STATE: Record<string, VMState> = {
   starting: "starting", pending: "starting", started: "running", running: "running", paused: "paused",
-  error: "error", dead: "stopped", migrating: "migrating", recovering: "recovering", lost: "lost",
+  error: "error", deleting: "deleting", dead: "stopped", migrating: "migrating", recovering: "recovering", lost: "lost",
 };
 
-/** One mapping for REST `state` (Started…), events (`Running`…) and cluster `cluster_state`. */
+const warned = new Set<string>();
+
+/** One mapping for REST `state` (Started…), events (`Running`…) and cluster `cluster_state`.
+ *  A state missing from the map is "unknown" (and logged once), not a failure: a server newer
+ *  than this UI must not paint healthy VMs red. */
 export function normState(s: string | undefined | null): VMState {
-  return STATE[(s ?? "").toLowerCase()] ?? "error";
+  const k = (s ?? "").toLowerCase();
+  const st = STATE[k];
+  if (st) return st;
+  if (!warned.has(k)) { warned.add(k); console.warn(`flint: unknown VM state ${JSON.stringify(s)}; shown as "unknown"`); }
+  return "unknown";
 }
 
 export function normVM(r: RawVM): VM {
@@ -39,9 +49,4 @@ export function normVM(r: RawVM): VM {
     logLines: r.log_lines ?? [],
     raw: r,
   };
-}
-
-/** Phase names from `timings` in a stable, human order (backend-specific keys pass through). */
-export function orderedTimings(t: Record<string, number>): [string, number][] {
-  return Object.entries(t).filter(([, v]) => typeof v === "number").sort((a, b) => b[1] - a[1] && 0);
 }
