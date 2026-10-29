@@ -115,10 +115,8 @@ def test_register_rejects_duplicate_name():
         def stop_pool(self): pass
         def create(self, **kw): raise NotImplementedError
         def kill(self, entry): pass
-        def pause(self, entry, state_store): pass
+        def pause(self, entry): return ""
         def resume(self, row): raise NotImplementedError
-        def proxy_guest_request(self, entry, method, path, body=None, timeout=65): raise NotImplementedError
-        async def bridge_terminal(self, entry, websocket): raise NotImplementedError
         def check_entry_alive(self, entry): return False, None
         def recover_row(self, row): return "dead", None
         def build_template(self, name, dockerfile, rootfs_size_mb=500): raise NotImplementedError
@@ -209,12 +207,9 @@ def test_ch_create_requires_golden_rootfs(monkeypatch, tmp_path):
     """Calling create() when the CH golden rootfs is missing must raise a
     clear RuntimeError instead of crashing deeper in the boot pipeline."""
     import flint.core.backends.linux_cloud_hypervisor as _mod
+    import flint.core.config as _cfg
 
-    # The plugin captures CH_GOLDEN_DIR from config at import time; patch the
-    # already-imported binding rather than reloading the module (a reload
-    # re-runs the `_register(...)` side effect, which collides with the class
-    # already in the registry).
-    monkeypatch.setattr(_mod, "CH_GOLDEN_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(_cfg, "CH_GOLDEN_DIR", str(tmp_path / "absent"))
 
     backend = _mod.LinuxCloudHypervisorBackend()
     with pytest.raises(RuntimeError, match="golden"):
@@ -253,10 +248,10 @@ def test_ch_recover_row_returns_paused_for_paused_row():
 def test_ch_backend_metadata_ns_and_tap_names():
     """ns/tap helpers must use the ``ch-`` prefix so FC and CH can coexist
     without colliding on the same host."""
-    from flint.core._ch_boot import _ch_ns_name, _ch_tap_name
+    from flint.core.vmm.cloud_hypervisor.boot import ns_name_for, tap_for_ns
 
-    ns = _ch_ns_name("abcdef12-0000-0000-0000-000000000000")
-    tap = _ch_tap_name("abcdef12-0000-0000-0000-000000000000")
+    ns = ns_name_for("abcdef12-0000-0000-0000-000000000000")
+    tap = tap_for_ns(ns)
     assert ns.startswith("ch-")
     assert tap.startswith("chtap-")
 
@@ -264,7 +259,7 @@ def test_ch_backend_metadata_ns_and_tap_names():
 def test_ch_strip_ns_prefix_handles_fc_and_ch():
     """The shared netns helpers key veth pair names by the vm-id suffix; the
     split must work for both backends' prefixes."""
-    from flint.core._netns import _strip_ns_prefix
+    from flint.core.net.netns import _strip_ns_prefix
 
     assert _strip_ns_prefix("fc-abcd1234") == "abcd1234"
     assert _strip_ns_prefix("ch-abcd1234") == "abcd1234"
@@ -337,7 +332,7 @@ def test_ch_api_client_returns_as_soon_as_response_is_complete(fake_ch_api):
     """CH keeps the connection open; the client must not wait for it to close."""
     import time
 
-    import flint.core._cloud_hypervisor as ch
+    import flint.core.vmm.cloud_hypervisor.api as ch
 
     sock = fake_ch_api(b"HTTP/1.1 204 No Content\r\n\r\n")
     t0 = time.monotonic()
@@ -355,7 +350,7 @@ def test_ch_api_client_returns_as_soon_as_response_is_complete(fake_ch_api):
 
 def test_ch_api_client_rejects_error_status(fake_ch_api):
     """Helper wrappers (vm_create etc.) must raise on a non-2xx response."""
-    import flint.core._cloud_hypervisor as ch
+    import flint.core.vmm.cloud_hypervisor.api as ch
 
     sock = fake_ch_api(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nnope!")
     with pytest.raises(RuntimeError, match="vm.boot"):
@@ -368,7 +363,7 @@ def test_ch_api_client_passes_tap_fd(fake_ch_api, tmp_path):
     """The TAP is handed to the jailed VMM as an fd alongside the request."""
     import os
 
-    import flint.core._cloud_hypervisor as ch
+    import flint.core.vmm.cloud_hypervisor.api as ch
 
     sock = fake_ch_api(b"HTTP/1.1 204 No Content\r\n\r\n")
     (tmp_path / "tap").write_text("")
@@ -385,7 +380,7 @@ def test_ch_api_client_passes_tap_fd(fake_ch_api, tmp_path):
 
 def test_ch_api_client_exposes_full_verb_surface():
     """The protocol surface the plugin relies on must be importable."""
-    import flint.core._cloud_hypervisor as ch
+    import flint.core.vmm.cloud_hypervisor.api as ch
 
     for name in (
         "ch_put", "ch_post", "ch_get", "ch_status_ok",

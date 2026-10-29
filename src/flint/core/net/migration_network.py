@@ -14,9 +14,9 @@ import os
 import subprocess
 import uuid
 
-from .config import GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC
-from ._identities import vm_identity
-from ._netns import BLOCKED_EGRESS, _setup_veth_pair, _delete_netns
+from ..config import GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC
+from .._identities import vm_identity
+from .netns import BLOCKED_EGRESS, _setup_veth_pair, _delete_netns
 
 
 def run(*argv: str, input: str | None = None) -> str:
@@ -176,7 +176,7 @@ class MigrationNetwork:
               }}
             }}\n'''
             self._ns(ns, "nft", "-f", "-", input=rules)
-            from ._limits import network_limits
+            from .._limits import network_limits
             network_limits(ns, "tap0")
             return ns, "tap0"
         except Exception:

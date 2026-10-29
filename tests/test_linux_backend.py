@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from flint.core._ch_jail import ChJail
-from flint.core._jailer import JailSpec
+from flint.core.vmm.cloud_hypervisor.jail import CloudHypervisorJail
+from flint.core.vmm.firecracker.jail import FirecrackerJail
 
 
 
@@ -20,11 +20,9 @@ pytestmark = [
 
 def _jail(sandbox, backend_kind) -> tuple[str, str]:
     """(chroot base, chroot root) of the sandbox's VMM jail."""
-    if backend_kind == "linux-cloud-hypervisor":
-        jail = ChJail(sandbox.id)
-        return jail.base, jail.root
-    spec = JailSpec(vm_id=sandbox.id, ns_name="")
-    return spec.chroot_base, spec.chroot_root
+    jail_type = CloudHypervisorJail if backend_kind == "linux-cloud-hypervisor" else FirecrackerJail
+    jail = jail_type(sandbox.id)
+    return jail.base, jail.root
 
 
 def test_jailer_chroot_cleanup(sandbox, backend_kind):
@@ -104,7 +102,7 @@ print("runtime rejects host commands, arbitrary connections and path traversal")
     from flint.core import config
     from flint.core._limits import DISK_BPS
     if backend_kind == "linux-cloud-hypervisor":
-        group = Path(ChJail(sandbox.id).cgroup)
+        group = Path(CloudHypervisorJail(sandbox.id).cgroup)
     else:
         group = Path("/sys/fs/cgroup") / config.JAILER_PARENT_CGROUP / sandbox.id
     from flint.core._limits import verify_process

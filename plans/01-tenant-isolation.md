@@ -27,7 +27,7 @@ table is `docs/architecture/security.mdx`.
 
 | Boundary | Requirement | Current state |
 |----------|-------------|---------------|
-| **VM ↔ host** | VMM runs jailed: chroot, unprivileged uid, seccomp, cgroups, minimal devices | Done for both: Firecracker uses the jailer; Cloud Hypervisor runs in Flint's equivalent jail (`_ch_jail.py`, TAP passed as an fd). Golden-snapshot boots of tenant templates are jailed on both. Covered by `test_vmm_runs_unprivileged_in_its_jail` |
+| **VM ↔ host** | VMM runs jailed: chroot, unprivileged uid, seccomp, cgroups, minimal devices | Done for both: Firecracker uses the jailer; Cloud Hypervisor runs in Flint's equivalent jail (`vmm/cloud_hypervisor/jail.py`, TAP passed as an fd). Golden-snapshot boots of tenant templates are jailed on both. Covered by `test_vmm_runs_unprivileged_in_its_jail` |
 | **VM ↔ VM (cross-tenant)** | No packets between tenants' VMs | Done: bridge port isolation + per-netns ingress firewall; host drops bridge hairpin. Covered by `test_sandbox_cannot_reach_other_sandboxes_on_bridge` |
 | **VM ↔ VM (same tenant)** | Allowed only when the tenant opts in | Blocked by default; `PUT /v1/tenants/{tenant}/network` opts in. Traffic is routed through host and namespace nftables ACLs. Control ports stay private; revocation also blocks established flows. Covered by the two-tenant and Linux kernel flows |
 | **VM ↔ host services** | VMs can reach only explicitly exposed host services | Done: host `FLINT-INPUT` drops everything from `br-flint` except the r2nfs port; netns egress policy blocks private ranges. Covered by `test_sandbox_cannot_reach_host_services`. r2nfs authorizes exports by veth IP, which is now unique and unspoofable (per-netns NAT + port isolation) |

@@ -22,9 +22,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
-from . import config
-from .config import log
-from ._netns import _delete_netns, _setup_netns_pyroute2, _setup_netns_subprocess
+from .. import config
+from ..config import log
+from .netns import _delete_netns, _setup_netns_pyroute2, _setup_netns_subprocess
 
 # Namespaces kept ready for sandboxes without internet access (rarer).
 OFFLINE_POOL_SIZE = 2

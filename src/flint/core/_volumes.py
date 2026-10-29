@@ -541,16 +541,13 @@ class Volumes:
 
     def _guest_sh(self, vm_id: str, script: str, *args: str) -> None:
         """Run a shell script in the guest with positional args; raise on failure."""
-        body = json.dumps({"cmd": ["/bin/sh", "-c", script, "sh", *args], "timeout": 30}).encode()
-        status, resp = self._manager.agent_request(vm_id, "POST", "/exec", body, 40)
-        result = json.loads(resp) if status == 200 else {}
-        if result.get("exit_code") != 0:
-            detail = (result.get("stderr") or result.get("stdout") or resp.decode(errors="replace")).strip()
-            raise VolumeError(500, f"In sandbox: {detail}")
+        result = self._manager.guest(vm_id).sh(script, *args, timeout=30, request_timeout=40)
+        if not result.ok:
+            raise VolumeError(500, f"In sandbox: {result.error}")
 
     def _agent_json(self, vm_id: str, path: str, body: dict) -> dict:
         """POST to the guest agent; raise with its error on failure."""
-        status, resp = self._manager.agent_request(vm_id, "POST", path, json.dumps(body).encode(), 90)
+        status, resp = self._manager.guest(vm_id).post_json(path, body, 90)
         if status == 404 and b"error" not in resp:
             raise VolumeError(501, "This sandbox's guest agent predates exclusive volumes; rebuild its template")
         try:

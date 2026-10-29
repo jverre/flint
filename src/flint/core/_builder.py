@@ -26,9 +26,10 @@ import uuid
 from . import config
 from ._limits import ch_disk_limiter
 from ._artifacts import sparse_copy, shared_readonly
-from ._firecracker import _fc_put, _fc_status_ok, _wait_for_api_socket, _wait_for_agent
-from ._jailer import JailSpec, build_jailer_command, cleanup_jailer, make_private
-from ._netns import (_setup_netns_pyroute2, _apply_netns_firewall, _strip_ns_prefix,
+from .vmm.common import wait_for_agent
+from .vmm.firecracker import api as fc_api
+from .vmm.firecracker.jail import FirecrackerJail
+from .net.netns import (_setup_netns_pyroute2, _apply_netns_firewall, _strip_ns_prefix,
                      _enter_netns, _restore_netns, _delete_netns, open_tap_fd)
 
 _MEMORY_MIB = 2048
@@ -50,15 +51,15 @@ def _marker(vm_id: str) -> Path:
 
 def cleanup_abandoned_builders() -> None:
     """Called once before accepting builds after a daemon restart."""
-    from ._ch_jail import ChJail
+    from .vmm.cloud_hypervisor.jail import CloudHypervisorJail
     for marker in _marker("unused").parent.glob("build-*.json"):
         vm_id = marker.stem
         data = json.loads(marker.read_text())
         if not re.fullmatch(r"build-[0-9a-f]{16}", vm_id) or not re.fullmatch(r"fb-[0-9a-f]{8}", data["ns"]):
             raise RuntimeError(f"Invalid builder recovery record: {marker}")
-        spec = JailSpec(vm_id, data["ns"]) if data["kind"] == "linux-firecracker" else None
-        jail = None if spec else ChJail(vm_id)
-        group = Path(f"/sys/fs/cgroup/{config.JAILER_PARENT_CGROUP}/{vm_id}" if spec else jail.cgroup)
+        spec = FirecrackerJail(vm_id) if data["kind"] == "linux-firecracker" else None
+        jail = None if spec else CloudHypervisorJail(vm_id)
+        group = Path((spec or jail).cgroup)
         if group.exists():
             # The cgroup is unique to this appliance; never kill a reused PID.
             (group / "cgroup.kill").write_text("1")
@@ -68,7 +69,7 @@ def cleanup_abandoned_builders() -> None:
                     raise RuntimeError(f"Builder {vm_id} has not stopped; retaining its disk")
                 time.sleep(.02)
         _delete_netns(data["ns"])
-        cleanup_jailer(spec.chroot_base, vm_id) if spec else jail.cleanup()
+        (spec or jail).cleanup()
         from ._wipe import take
         take(vm_id)
         marker.unlink()
@@ -125,17 +126,17 @@ def _vm(kind: str, disk_mb: int):
     config.log.info("Builder %s: starting %s VM", vm_id, kind)
     try:
         if kind == "linux-firecracker":
-            spec = JailSpec(vm_id, ns)
-            os.makedirs(spec.chroot_root)
-            os.chown(spec.chroot_root, *spec.identity)
-            rootfs = f"{spec.chroot_root}/rootfs.ext4"
+            spec = FirecrackerJail(vm_id)
+            os.makedirs(spec.root)
+            os.chown(spec.root, *spec.identity)
+            rootfs = f"{spec.root}/rootfs.ext4"
         else:
-            from ._ch_jail import ChJail
-            jail = ChJail(vm_id)
+            from .vmm.cloud_hypervisor.jail import CloudHypervisorJail
+            jail = CloudHypervisorJail(vm_id)
             jail.prepare()
             rootfs = jail.host_path("/rootfs.ext4")
         sparse_copy(source, rootfs)
-        make_private(rootfs, vm_id) if spec else jail.give("/rootfs.ext4")
+        (spec or jail).give("/rootfs.ext4")
         # Bound space for image layers, export and the output filesystem.
         with open(rootfs, "r+b") as f:
             f.truncate(max(12288, disk_mb * 4 + 4096) * (1 << 20))
@@ -144,22 +145,22 @@ def _vm(kind: str, disk_mb: int):
         _setup_netns_pyroute2(ns, tap, veth_ip=os.environ["FLINT_BUILD_VETH_IP"])
         _apply_netns_firewall(ns, "vn-" + _strip_ns_prefix(ns)[:8], allow_storage=False)
         if spec:
-            os.link(shared_readonly(config.KERNEL_PATH, config.JAILER_SHARED_DIR), f"{spec.chroot_root}/vmlinux")
-            with open(f"{spec.chroot_base}/builder.log", "w") as log:
-                process = subprocess.Popen(build_jailer_command(spec, vcpus=_CPUS, memory_mib=_MEMORY_MIB),
+            os.link(shared_readonly(config.KERNEL_PATH, config.JAILER_SHARED_DIR), f"{spec.root}/vmlinux")
+            with open(f"{spec.base}/builder.log", "w") as log:
+                process = subprocess.Popen(spec.command(ns, vcpus=_CPUS, memory_mib=_MEMORY_MIB),
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-            _wait_for_api_socket(spec.socket_path_on_host, process=process, log_path=f"{spec.chroot_base}/builder.log", vm_id=spec.vm_id)
+            fc_api.wait_for_api_socket(spec.socket_path, process=process, log_path=f"{spec.base}/builder.log", cgroup=spec.cgroup)
             requests = [("/machine-config", {"vcpu_count": _CPUS, "mem_size_mib": _MEMORY_MIB}),
                         ("/boot-source", {"kernel_image_path": "vmlinux", "boot_args": config.BOOT_ARGS}),
                         ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": True, "is_read_only": False}),
                         ("/network-interfaces/eth0", {"iface_id": "eth0", "guest_mac": config.GUEST_MAC, "host_dev_name": tap}),
                         ("/actions", {"action_type": "InstanceStart"})]
             for route, body in requests:
-                if not _fc_status_ok(_fc_put(spec.socket_path_on_host, route, body)):
+                if not fc_api.status_ok(fc_api.put(spec.socket_path, route, body)):
                     raise RuntimeError(f"Builder VM failed at {route}")
         else:
-            from . import _cloud_hypervisor as ch
-            from ._ch_boot import CH_BOOT_ARGS
+            from .vmm.cloud_hypervisor import api as ch
+            from .vmm.cloud_hypervisor.boot import CH_BOOT_ARGS
             process = jail.spawn(ns, vcpus=_CPUS, memory_mib=_MEMORY_MIB)
             ch.vm_create(jail.socket_path, {
                 "cpus": {"boot_vcpus": _CPUS, "max_vcpus": _CPUS},
@@ -172,7 +173,7 @@ def _vm(kind: str, disk_mb: int):
             finally:
                 os.close(fd)
             ch.vm_boot(jail.socket_path)
-        _wait_for_agent(ns, retries=3000)
+        wait_for_agent(ns, retries=3000)
         config.log.info("Builder %s: guest ready in %.1fs", vm_id, time.monotonic() - started)
         yield ns
     finally:
@@ -181,7 +182,7 @@ def _vm(kind: str, disk_mb: int):
             process.wait(timeout=10)
         _delete_netns(ns)
         if spec:
-            cleanup_jailer(spec.chroot_base, vm_id)
+            spec.cleanup()
         elif jail:
             jail.cleanup()
         from ._wipe import take

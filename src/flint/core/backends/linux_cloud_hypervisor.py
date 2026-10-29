@@ -1,94 +1,63 @@
-"""Cloud-Hypervisor backend plugin.
+"""Cloud-Hypervisor backend: jailed cloud-hypervisor VMs (see :mod:`flint.core.vmm.cloud_hypervisor`).
 
-Boots micro-VMs via the ``cloud-hypervisor`` binary using the REST API exposed
-on a Unix domain socket. Reuses the same ``br-flint`` bridge + netns + TAP
-infrastructure as the Firecracker backend; there is no jailer — isolation uses
-CH's built-in ``--seccomp true`` and runs the binary inside a per-VM network
-namespace.
+Uses the same bridge, per-VM network namespaces and guest image as the
+Firecracker backend. CH has no jailer of its own: Flint's
+:class:`~flint.core.vmm.cloud_hypervisor.jail.CloudHypervisorJail` gives it an
+equivalent chroot, identity and cgroup. It can also boot VMs on a cluster's
+shared root disks and migration network, which lets them move live.
 """
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import json
 import os
-import platform
 import shutil
-import socket
-import threading
-import urllib.request
+from collections.abc import Mapping
 
-import websockets.sync.client as ws_sync
-
-from flint.core import config as _cfg
-from flint.core._ch_boot import (
-    _RecoveredChProcess,
-    _ch_ns_name,
-    _ch_tap_name,
-    ch_boot,
-    ch_create_golden,
-    ch_create_golden_snapshot,
-    ch_golden_ready,
-    ch_snapshot_ready,
-    ch_tap_for_ns,
-    ch_pause_vm,
-    ch_resume_from_pause,
-    ch_teardown,
-)
-from flint.core._ch_jail import CH_JAIL_DIR, ChJail
-from flint.core._firecracker import _wait_for_agent
-from flint.core._netns import _delete_netns, _enter_netns, _ensure_bridge, _restore_netns, ensure_host_firewall, reserve_existing_veth_ips
-from flint.core._netns_pool import start_netns_pool, stop_netns_pool
-from flint.core._pool import start_pool, stop_pool
-from flint.core.config import (
-    AGENT_PORT,
-    CH_GOLDEN_DIR,
-    DEFAULT_TEMPLATE_ID,
-    GUEST_IP,
-    log,
-)
-from flint.core.types import _SandboxEntry, SandboxState
-
-from .base import BackendBootResult, HostBackend, row_backend_metadata
+from .. import config
+from ..config import DEFAULT_TEMPLATE_ID, log
+from ..net.netns import _delete_netns
+from ..types import BootResult, LivePhase, Maintenance, SandboxRow, SandboxState
+from ..vmm.cloud_hypervisor import api as ch_api
+from ..vmm.cloud_hypervisor import boot as ch
+from ..vmm.cloud_hypervisor.jail import JAIL_ROOTFS, CloudHypervisorJail, jail_dir
+from .linux import LinuxVmmBackend
 
 
-class LinuxCloudHypervisorBackend(HostBackend):
+class LinuxCloudHypervisorBackend(LinuxVmmBackend):
     name = "cloud-hypervisor"
     kind = "linux-cloud-hypervisor"
     display_name = "Cloud-Hypervisor (Linux)"
-    supported_platforms = ("linux",)
+    supports_live_migration = True
+    ns_prefix = ch.NS_PREFIX
+    jail_type = CloudHypervisorJail
+    vmm_disk_limit = True
 
-    def preflight(self) -> list[str]:
-        problems = super().preflight()
-        if problems:
-            return problems
-        # Read CH_BINARY from the live config module so env-var overrides
-        # (e.g. in tests that reload config) are honored.
-        binary = _cfg.CH_BINARY
-        if not os.path.exists(binary) and not shutil.which("cloud-hypervisor"):
-            problems.append(
-                f"cloud-hypervisor binary not found at {binary} or on PATH"
-            )
-        if not os.path.exists(_cfg.KERNEL_PATH):
-            problems.append(f"kernel image not found at {_cfg.KERNEL_PATH}")
-        if not os.path.exists(_cfg.SOURCE_ROOTFS):
-            problems.append(f"source rootfs not found at {_cfg.SOURCE_ROOTFS}")
+    tap_for_ns = staticmethod(ch.tap_for_ns)
+
+    def _vmm_preflight(self) -> list[str]:
+        problems = []
+        if not os.path.exists(config.CH_BINARY) and not shutil.which("cloud-hypervisor"):
+            problems.append(f"cloud-hypervisor binary not found at {config.CH_BINARY} or on PATH")
+        if not os.path.exists(config.SOURCE_ROOTFS):
+            problems.append(f"source rootfs not found at {config.SOURCE_ROOTFS}")
         for tool in ("setpriv", "chroot"):
             if not shutil.which(tool):
                 problems.append(f"{tool} not found on PATH (needed to jail cloud-hypervisor)")
-        for tool in ("nft", "tc", "bwrap", "setpriv"):
-            if not shutil.which(tool):
-                problems.append(f"{tool} is required for workload isolation")
         return problems
+
+    def vmm_binary(self) -> str:
+        return config.CH_BINARY
+
+    def vm_resources(self) -> tuple[int, int]:
+        return config.CH_CPU_COUNT, config.CH_MEMORY_BYTES >> 20
 
     def template_artifact_valid(self, template_dir: str) -> bool:
         # A rootfs is enough: without a golden snapshot, create() cold-boots.
         # Per-sandbox pause snapshots live under each sandbox's vm_dir.
-        return os.path.exists(os.path.join(template_dir, "rootfs.ext4"))
+        return os.path.exists(os.path.join(template_dir, ch.ROOTFS))
 
     def install_dependencies(self, **kwargs) -> None:
-        from flint.core._install import KERNEL_RELEASE, _detect_arch, _install_kernel, install_cloud_hypervisor
+        from .._install import KERNEL_RELEASE, _detect_arch, _install_kernel, install_cloud_hypervisor
 
         install_cloud_hypervisor(
             version=kwargs.get("version", "latest"),
@@ -101,476 +70,173 @@ class LinuxCloudHypervisorBackend(HostBackend):
                 kwargs.get("kernel_dir", "/root/firecracker-vm"),
             )
 
-    def ensure_runtime_ready(self) -> None:
-        _ensure_bridge()
-        ensure_host_firewall()
-        reserve_existing_veth_ips()
-
     def ensure_default_template(self) -> None:
-        from flint.core._template_registry import register_template_artifact
+        from .._template_registry import register_template_artifact
 
-        os.makedirs(CH_GOLDEN_DIR, exist_ok=True)
+        golden_dir = config.CH_GOLDEN_DIR
+        os.makedirs(golden_dir, exist_ok=True)
         status = "ready"
         try:
-            ch_create_golden(dest_dir=CH_GOLDEN_DIR, source_rootfs=_cfg.SOURCE_ROOTFS)
+            ch.create_golden(dest_dir=golden_dir, source_rootfs=config.SOURCE_ROOTFS)
         except Exception as exc:
-            if ch_golden_ready(CH_GOLDEN_DIR):
+            if ch.golden_ready(golden_dir):
                 # Sandboxes still work, they just cold-boot instead of restoring.
                 log.warning("ch golden snapshot not created, falling back to fresh boot: %s", exc)
             else:
                 log.warning("ch golden template not installed: %s", exc)
                 status = "pending"
+        register_template_artifact(DEFAULT_TEMPLATE_ID, "Default (Alpine)", self.kind, golden_dir, status=status)
+        log.info("cloud-hypervisor default template registered (status=%s, dir=%s)", status, golden_dir)
 
-        register_template_artifact(
-            DEFAULT_TEMPLATE_ID,
-            "Default (Alpine)",
-            self.kind,
-            CH_GOLDEN_DIR,
-            status=status,
-        )
-        log.info(
-            "cloud-hypervisor default template registered (status=%s, dir=%s)",
-            status,
-            CH_GOLDEN_DIR,
-        )
+    def _pool_dir(self) -> str:
+        return config.CH_POOL_DIR
 
-    def start_pool(self) -> None:
-        start_pool(_cfg.CH_POOL_DIR, self._pool_sources)
-        start_netns_pool("ch-", ch_tap_for_ns)
-
-    def stop_pool(self) -> None:
-        stop_pool()
-        stop_netns_pool()
-
-    @staticmethod
-    def _pool_sources(template_id: str) -> dict[str, str] | None:
-        from flint.core._template_registry import get_template_dir
-
-        if template_id == DEFAULT_TEMPLATE_ID:
-            template_dir = CH_GOLDEN_DIR
-        else:
-            try:
-                template_dir = get_template_dir(template_id, backend_kind=LinuxCloudHypervisorBackend.kind)
-            except KeyError:
-                return None
-        if not ch_snapshot_ready(template_dir):
+    def _pool_sources(self, template_id: str) -> dict[str, str] | None:
+        try:
+            template_dir = ch.template_dir(template_id)
+        except KeyError:
             return None
-        return {"rootfs.ext4": os.path.join(template_dir, "snapshot", "rootfs.ext4")}
+        if not ch.snapshot_ready(template_dir):
+            return None
+        return {ch.ROOTFS: os.path.join(ch.snapshot_dir(template_dir), ch.ROOTFS)}
 
-    def create(
-        self,
-        *,
-        template_id: str,
-        allow_internet_access: bool,
-        use_pool: bool,
-        use_pyroute2: bool,
-        vm_id: str | None = None,
-    ) -> BackendBootResult:
-        if template_id == DEFAULT_TEMPLATE_ID and not ch_golden_ready(CH_GOLDEN_DIR):
-            raise RuntimeError(
-                f"cloud-hypervisor golden rootfs not found in {CH_GOLDEN_DIR}"
-            )
+    def _require_template(self, template_id: str) -> None:
+        if template_id == DEFAULT_TEMPLATE_ID and not ch.golden_ready():
+            raise RuntimeError(f"cloud-hypervisor golden rootfs not found in {config.CH_GOLDEN_DIR}")
 
-        boot = ch_boot(
-            template_id=template_id,
-            allow_internet_access=allow_internet_access,
-            use_pool=use_pool,
-            use_pyroute2=use_pyroute2,
-            vm_id=vm_id,
-        )
+    def _boot(self, **kwargs) -> BootResult:
+        return ch.boot(**kwargs)
 
-        return BackendBootResult(
-            process=boot.process,
-            pid=boot.process.pid,
-            vm_dir=boot.vm_dir,
-            socket_path=boot.socket_path,
-            ns_name=boot.ns_name,
-            guest_ip=GUEST_IP,
-            agent_url=boot.agent_url,
-            chroot_base=boot.chroot_base,
-            backend_vm_ref=boot.vm_id,
-            runtime_dir=boot.vm_dir,
-            guest_arch=platform.machine().lower(),
-            transport_ref=f"netns:{boot.ns_name}",
-            timings=dict(boot.timings),
-            t_total=boot.t_total,
-            backend_metadata={
-                "api_socket": boot.socket_path,
-                "ns_name": boot.ns_name,
-                "tap_name": boot.tap_name,
-                "veth_ip": boot.veth_ip,
-                "maintenance": boot.maintenance,
-            },
-        )
+    def _shutdown_vmm(self, entry) -> None:
+        ch.shutdown(entry.socket_path)
 
-    def vm_resources(self) -> tuple[int, int]:
-        from flint.core.config import CH_CPU_COUNT, CH_MEMORY_BYTES
-        return CH_CPU_COUNT, CH_MEMORY_BYTES >> 20
+    def _snapshot_and_hold(self, entry) -> str:
+        return ch.pause(entry.vm_id)
 
-    def kill(self, entry: _SandboxEntry) -> None:
-        ns_name = entry.ns_name or (entry.backend_metadata or {}).get("ns_name") or _ch_ns_name(entry.vm_id)
-        socket_path = entry.socket_path or (entry.backend_metadata or {}).get("api_socket") or ""
-        ch_teardown(entry.process, ns_name, entry.vm_id, socket_path=socket_path)
-
-    def pause(self, entry: _SandboxEntry, state_store) -> None:
-        pause_dir = ch_pause_vm(entry.vm_id)
-
-        # Stop the CH process — vm.restore on resume needs a fresh cloud-hypervisor
-        # instance pointed at the same api-socket path.
-        if entry.process:
-            try:
-                entry.process.kill()
-                entry.process.wait(timeout=2)
-            except Exception:
-                pass
-
-        entry.state = SandboxState.PAUSED
-        entry.agent_healthy = False
-        entry.process = None
-        entry.pause_state_ref = pause_dir
-        meta = dict(entry.backend_metadata or {})
-        meta["pause_dir"] = pause_dir
-        entry.backend_metadata = meta
-
-        if state_store:
-            state_store.transition_state(entry.vm_id, SandboxState.PAUSED)
-            state_store.set_pause_snapshot(entry.vm_id, pause_dir)
-            state_store.update_sandbox(entry.vm_id, pause_state_ref=pause_dir)
-
-    def resume(self, row: dict) -> BackendBootResult:
-        vm_id = row["vm_id"]
-        ns_name = row.get("ns_name") or _ch_ns_name(vm_id)
-        meta = row_backend_metadata(row)
-        tap_name = meta.get("tap_name") or _ch_tap_name(vm_id)
-
-        boot = ch_resume_from_pause(
-            vm_id,
+    def resume(self, row: Mapping) -> BootResult:
+        row = SandboxRow.of(row)
+        meta = row.backend_metadata
+        ns_name = self._row_ns_name(row)
+        return ch.resume(
+            row.vm_id,
             ns_name=ns_name,
-            tap_name=tap_name,
-            veth_ip=meta.get("veth_ip", ""), maintenance=meta.get("maintenance",{}),
+            tap_name=meta.get("tap_name") or ch.tap_for_ns(ns_name),
+            veth_ip=meta.get("veth_ip", ""),
+            maintenance=Maintenance.of(meta),
         )
-        vm_dir = boot.vm_dir
-        pause_dir = os.path.join(vm_dir, "pause")
 
-        return BackendBootResult(
-            process=boot.process,
-            pid=boot.process.pid,
-            vm_dir=vm_dir,
-            socket_path=boot.socket_path,
-            ns_name=boot.ns_name,
-            guest_ip=GUEST_IP,
-            agent_url=boot.agent_url,
-            chroot_base=boot.chroot_base,
-            backend_vm_ref=vm_id,
-            runtime_dir=vm_dir,
-            guest_arch=platform.machine().lower(),
-            transport_ref=f"netns:{ns_name}",
-            timings=dict(boot.timings),
-            t_total=boot.t_total,
-            backend_metadata={
-                "api_socket": boot.socket_path,
-                "ns_name": boot.ns_name,
-                "tap_name": boot.tap_name,
-                "pause_dir": pause_dir,
-                "veth_ip": boot.veth_ip,
-                "maintenance": boot.maintenance,
-                "resources": meta.get("resources",{}),
-            },
-        )
+    # ── Recovery ──────────────────────────────────────────────────────────
+
+    def _row_ns_name(self, row: SandboxRow) -> str:
+        return row.ns_name or ch.ns_name_for(row.vm_id)
+
+    def _vmm_held_paused(self, row: SandboxRow) -> bool:
+        # A live migration's source after the send: the control plane decides
+        # whether it is rolled back (resumed) or deleted, so keep its VMM.
+        return row.state == SandboxState.PAUSED and row.maintenance.live_phase == LivePhase.SENT
+
+    def _discard_jail(self, row: SandboxRow) -> None:
+        super()._discard_jail(row)
+        # Sandboxes created before CH was jailed kept their files in the data dir.
+        if row.vm_dir and not row.vm_dir.startswith(jail_dir()):
+            from .._wipe import wipe_tree
+            wipe_tree(row.vm_dir, row.vm_id)
+
+    def _check_recovered(self, row: SandboxRow) -> None:
+        import json
+        from .._limits import DISK_BPS
+        rootfs = os.path.join(row.vm_dir, ch.ROOTFS)
+        if os.major(os.stat(rootfs).st_dev):
+            return  # a local disk: the cgroup bounds its IO
+        # A shared disk isn't a block device cgroups can limit; CH's own limiter must be on.
+        status, body = ch_api.ch_get(row.socket_path, "/api/v1/vm.info")
+        disks = json.loads(body).get("config", {}).get("disks", []) if status == 200 else []
+        if not disks or any(
+            (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("size") != DISK_BPS
+            or (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("refill_time") != 1000
+            for disk in disks
+        ):
+            raise RuntimeError("Recovered shared-disk VM needs a bounded disk configuration; restore from its snapshot")
 
     # ── Cluster hooks ──────────────────────────────────────────────────────
 
-    _PAUSE_FILES = ("config.json", "state.json", "memory-ranges")
+    def pause_files(self, row: Mapping) -> tuple[str, dict[str, str]]:
+        files = {ch.ROOTFS: ch.ROOTFS}
+        files.update({f"pause/{n}": f"pause/{n}" for n in ch.SNAPSHOT_FILES})
+        return CloudHypervisorJail(row["vm_id"]).root, files
 
-    def pause_files(self, row: dict) -> tuple[str, dict[str, str]]:
-        files = {"rootfs.ext4": "rootfs.ext4"}
-        files.update({f"pause/{n}": f"pause/{n}" for n in self._PAUSE_FILES})
-        return ChJail(row["vm_id"]).root, files
+    def checkpoint(self, entry, snapshot):
+        from .._wipe import wipe_tree
 
-    def checkpoint(self, entry: _SandboxEntry, snapshot):
-        from flint.core import _cloud_hypervisor as _ch
-
-        jail = ChJail(entry.vm_id)
+        jail = CloudHypervisorJail(entry.vm_id)
         staging = jail.host_path("/ckpt")
         shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging)
         jail.give("/ckpt")
-        _ch.vm_pause(jail.socket_path)
+        ch_api.vm_pause(jail.socket_path)
         try:
-            _ch.vm_snapshot(jail.socket_path, "file:///ckpt")
-            files = {"rootfs.ext4": "rootfs.ext4"}
-            files.update({f"pause/{n}": f"ckpt/{n}" for n in self._PAUSE_FILES})
+            ch_api.vm_snapshot(jail.socket_path, "file:///ckpt")
+            files = {ch.ROOTFS: ch.ROOTFS}
+            files.update({f"pause/{n}": f"ckpt/{n}" for n in ch.SNAPSHOT_FILES})
             return snapshot(jail.root, files)
         finally:
             try:
-                _ch.vm_resume(jail.socket_path)
+                ch_api.vm_resume(jail.socket_path)
             finally:
-                from flint.core._wipe import wipe_tree
                 wipe_tree(staging, entry.vm_id)  # a copy of the VM's memory
 
-    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
-        from flint.core._ch_jail import JAIL_ROOTFS
-        from flint.core._netns_pool import acquire_netns, NetSlot
-        from flint.core._shared_rootfs import configured_pool
+    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BootResult:
+        from .._shared_rootfs import configured_pool
+        from ..net.netns_pool import acquire_netns
 
-        pool = configured_pool()
-        maintenance = {}
-        jail = ChJail(vm_id)
+        shared = configured_pool()
+        maintenance = Maintenance()
+        jail = CloudHypervisorJail(vm_id)
         jail.cleanup()  # a stale jail from an earlier life of this ID
         jail.prepare()
-        net = None
+        ns_name = ""
         try:
-            if pool:
-                disk = pool.create(vm_id,os.path.join(src_dir,"rootfs.ext4"),jail.identity[0])
-                with open(f"{jail.base}/shared-rootfs","x") as marker:
-                    marker.write(pool.pool_id)
-                pool.attach(vm_id,jail.host_path(JAIL_ROOTFS),expected=disk)
-                maintenance["root_disk"] = disk
+            if shared:
+                ch.attach_shared_disk(jail, shared, os.path.join(src_dir, ch.ROOTFS), maintenance, verify=True)
             else:
-                os.rename(os.path.join(src_dir, "rootfs.ext4"), jail.host_path(JAIL_ROOTFS))
+                os.rename(os.path.join(src_dir, ch.ROOTFS), jail.host_path(JAIL_ROOTFS))
             jail.give(JAIL_ROOTFS)
             os.mkdir(jail.host_path("/pause"))
-            for n in self._PAUSE_FILES:
+            for n in ch.SNAPSHOT_FILES:
                 os.rename(os.path.join(src_dir, "pause", n), jail.host_path(f"/pause/{n}"))
                 jail.give(f"/pause/{n}")
             jail.give("/pause")
-            if pool:
-                from flint.core._migration_network import configured_network
-                from flint.cluster.gateway import gateway_request
-                network = configured_network(vm_id,disk["vni"])
-                gateway_request("prepare",vm_id,internet=allow_internet_access)
-                ns,tap = network.setup_compute(allow_internet_access)
-                net = NetSlot(ns,tap,"",allow_internet_access)
-                maintenance["network"] = {"vni":network.vni,"gateway":network.gateway_ip,"underlay":network.underlay,"mtu":network.mtu}
+            veth_ip = ""
+            if shared:
+                network = ch.migration_network(vm_id, maintenance)
+                ns_name, tap_name = ch.setup_migration_network(network, vm_id, maintenance, allow_internet_access)
             else:
-                net = acquire_netns("ch-", ch_tap_for_ns, allow_internet_access, use_pool=use_pool)
-            boot = ch_resume_from_pause(
-                vm_id, ns_name=net.ns_name, tap_name=net.tap_name,
-                allow_internet_access=allow_internet_access, veth_ip=net.veth_ip, maintenance=maintenance,
+                net = acquire_netns(ch.NS_PREFIX, ch.tap_for_ns, allow_internet_access, use_pool=use_pool)
+                ns_name, tap_name, veth_ip = net.ns_name, net.tap_name, net.veth_ip
+            return ch.resume(
+                vm_id, ns_name=ns_name, tap_name=tap_name,
+                allow_internet_access=allow_internet_access, veth_ip=veth_ip, maintenance=maintenance,
             )
         except Exception:
-            if net is not None:
-                _delete_netns(net.ns_name)
+            if ns_name:
+                _delete_netns(ns_name)
             jail.cleanup()
             raise
-        return BackendBootResult(
-            process=boot.process,
-            pid=boot.process.pid,
-            vm_dir=boot.vm_dir,
-            socket_path=boot.socket_path,
-            ns_name=net.ns_name,
-            guest_ip=GUEST_IP,
-            agent_url=boot.agent_url,
-            chroot_base=boot.chroot_base,
-            backend_vm_ref=vm_id,
-            runtime_dir=boot.vm_dir,
-            guest_arch=platform.machine().lower(),
-            transport_ref=f"netns:{net.ns_name}",
-            timings=dict(boot.timings),
-            t_total=boot.t_total,
-            backend_metadata={
-                "api_socket": boot.socket_path,
-                "ns_name": net.ns_name,
-                "tap_name": net.tap_name,
-                "pause_dir": os.path.join(boot.vm_dir, "pause"),
-                "veth_ip": net.veth_ip,
-                "maintenance": boot.maintenance,
-            },
-        )
 
     def template_files(self, template_dir: str) -> list[str]:
-        return ["rootfs.ext4"] + [f"snapshot/{n}" for n in (*self._PAUSE_FILES, "rootfs.ext4")]
+        return [ch.ROOTFS] + [f"snapshot/{n}" for n in (*ch.SNAPSHOT_FILES, ch.ROOTFS)]
 
-    def connect_guest(self, entry: _SandboxEntry) -> socket.socket:
-        # A socket belongs to the netns it was created in.
-        orig_fd = _enter_netns(entry.ns_name or (entry.backend_metadata or {}).get("ns_name"))
-        try:
-            return super().connect_guest(entry)
-        finally:
-            _restore_netns(orig_fd)
-
-    async def bridge_terminal(self, entry: _SandboxEntry, websocket) -> None:
-        await websocket.accept()
-
-        create_body = json.dumps({
-            "cmd": ["/bin/sh", "-i"],
-            "pty": True,
-            "cols": 120,
-            "rows": 40,
-        }).encode()
-        status, resp_body = await asyncio.get_event_loop().run_in_executor(
-            None,
-            self.proxy_guest_request,
-            entry,
-            "POST",
-            "/processes",
-            create_body,
-            65,
-        )
-        if status != 201:
-            await websocket.close(code=1011, reason="Failed to create PTY process")
-            return
-
-        proc_info = json.loads(resp_body)
-        guest_pid = proc_info["pid"]
-        loop = asyncio.get_event_loop()
-        closed = False
-
-        ns_name = entry.ns_name or (entry.backend_metadata or {}).get("ns_name")
-
-        def _read_guest_ws():
-            nonlocal closed
-            try:
-                orig_fd = _enter_netns(ns_name)
-                try:
-                    guest_ws_url = f"ws://{entry.guest_ip}:{AGENT_PORT}/processes/{guest_pid}/output"
-                    guest_ws = ws_sync.connect(guest_ws_url)
-                finally:
-                    _restore_netns(orig_fd)
-
-                for message in guest_ws:
-                    if closed:
-                        break
-                    try:
-                        ev = json.loads(message)
-                        if ev.get("type") in ("stdout", "stderr") and ev.get("data"):
-                            raw = base64.b64decode(ev["data"])
-                            asyncio.run_coroutine_threadsafe(websocket.send_bytes(raw), loop)
-                        elif ev.get("type") == "exit":
-                            break
-                    except Exception:
-                        pass
-                guest_ws.close()
-            except Exception:
-                pass
-
-        reader_thread = threading.Thread(target=_read_guest_ws, daemon=True)
-        reader_thread.start()
-
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/input",
-                    data,
-                    5,
-                )
-        except Exception:
-            pass
-        finally:
-            closed = True
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/signal",
-                    json.dumps({"signal": 9}).encode(),
-                    2,
-                )
-            except Exception:
-                pass
-
-    def check_entry_alive(self, entry: _SandboxEntry) -> tuple[bool, str | None]:
-        pid = getattr(entry, "pid", 0)
-        if not pid:
-            return False, "no pid recorded"
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False, f"process {pid} not found"
-        except PermissionError:
-            pass
-        return True, None
-
-    @staticmethod
-    def _probe_sandbox(row: dict) -> str:
-        state = row.get("state", "")
-        if state == "Paused":
-            return "paused"
-        pid = row.get("pid")
-        if not pid:
-            return "dead"
-        try:
-            os.kill(pid, 0)
-            return "alive"
-        except (OSError, ProcessLookupError):
-            return "dead"
-
-    def recover_row(self, row: dict):
-        meta = row_backend_metadata(row)
-        live_paused = row.get("state") == "Paused" and meta.get("maintenance",{}).get("live_phase") == "sent"
-        probe = self._probe_sandbox(row)
-        if live_paused:
-            try:
-                os.kill(row["pid"],0)
-                probe = "alive"
-            except OSError:
-                probe = "dead"
-        if probe == "paused":
-            return "paused", None
-        if probe != "alive":
-            self._cleanup_dead_row(row)
-            return "dead", None
-
-        vm_id = row["vm_id"]
-        pid = row["pid"]
-        ns_name = row.get("ns_name") or _ch_ns_name(vm_id)
-        vm_dir = row["vm_dir"]
-
-        try:
-            agent_url = f"http://{GUEST_IP}:{AGENT_PORT}" if live_paused else _wait_for_agent(ns_name, retries=50)
-        except Exception:
-            self._cleanup_dead_row(row)
-            return "dead", None
-
-        meta = row_backend_metadata(row)
-
-        entry = _SandboxEntry(
-            vm_id=vm_id,
-            process=_RecoveredChProcess(pid),
-            pid=pid,
-            vm_dir=vm_dir,
-            socket_path=row.get("socket_path") or meta.get("api_socket") or os.path.join(vm_dir, "ch.sock"),
-            ns_name=ns_name,
-            guest_ip=GUEST_IP,
-            agent_url=agent_url,
-            agent_healthy=True,
-            state=SandboxState.PAUSED if live_paused else SandboxState.RUNNING,
-            template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
-            chroot_base=row.get("chroot_base") or "",
-            backend_kind=row.get("backend_kind") or self.kind,
-            backend_vm_ref=vm_id,
-            runtime_dir=vm_dir,
-            guest_arch=platform.machine().lower(),
-            transport_ref=f"netns:{ns_name}",
-            backend_metadata=dict(meta),
-        )
-        return "alive", entry
-
-    def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
-        if not os.environ.get("FLINT_BUILD_JOB"):
-            from flint.core._build_job import run_build
-            return run_build(self.kind, name, dockerfile, rootfs_size_mb)
+    def _build_template_in_job(self, name: str, dockerfile: str, rootfs_size_mb: int) -> dict:
         """Build a CH template: Docker build -> rootfs extraction -> golden snapshot -> register."""
-        from flint.core._template_build import (
-            _build_flintd,
-            _find_init_net_sh,
-            _slugify,
-        )
-        from flint.core._template_registry import (
-            register_template_artifact,
-            update_template_artifact_status,
-        )
-        from flint.core.config import TEMPLATES_DIR
+        import tempfile
+
+        from .._build_job import output_dir
+        from .._builder import build_rootfs
+        from .._template_build import _build_flintd, _find_init_net_sh, _slugify
+        from .._template_registry import register_template_artifact, update_template_artifact_status
+        from .._wipe import wipe_tree
 
         template_id = _slugify(name)
-        from flint.core._build_job import output_dir
         template_dir = output_dir(template_id)
         os.makedirs(template_dir, exist_ok=True)
 
@@ -579,77 +245,28 @@ class LinuxCloudHypervisorBackend(HostBackend):
         if os.environ.get("FLINT_BUILD_JOB"):
             update_template_artifact_status(template_id, self.kind, "building")
         else:
-            register_template_artifact(
-                template_id,
-                name,
-                self.kind,
-                template_dir,
-                status="building",
-                rootfs_size_mb=rootfs_size_mb,
-            )
+            register_template_artifact(template_id, name, self.kind, template_dir,
+                                       status="building", rootfs_size_mb=rootfs_size_mb)
 
-        import tempfile
         context_dir = tempfile.mkdtemp(prefix="context-", dir=template_dir)
-
         try:
             _build_flintd(os.path.join(context_dir, "flintd"))
-            init_net = _find_init_net_sh()
-            shutil.copy2(init_net, os.path.join(context_dir, "init-net.sh"))
-
+            shutil.copy2(_find_init_net_sh(), os.path.join(context_dir, "init-net.sh"))
             with open(f"{template_dir}/Dockerfile", "w") as f:
                 f.write(dockerfile)
-
-            from flint.core._builder import build_rootfs
-            rootfs_path = f"{template_dir}/rootfs.ext4"
-            build_rootfs(self.kind, dockerfile, context_dir, rootfs_path, rootfs_size_mb)
-            ch_create_golden_snapshot(template_dir)
+            build_rootfs(self.kind, dockerfile, context_dir, f"{template_dir}/{ch.ROOTFS}", rootfs_size_mb)
+            ch.create_golden_snapshot(template_dir)
 
             # The supervisor publishes only after worker cleanup and durable output.
             if not os.environ.get("FLINT_BUILD_JOB"):
                 update_template_artifact_status(template_id, self.kind, "ready")
-
-
             log.info("CH template %s built successfully", template_id)
             return {"template_id": template_id, "status": "ready"}
         except Exception:
             update_template_artifact_status(template_id, self.kind, "failed")
             raise
         finally:
-            from flint.core._wipe import wipe_tree
             wipe_tree(context_dir)
-
-    def delete_template_artifact(self, template_id: str, template: dict | None = None) -> None:
-        from flint.core._template_registry import delete_template_artifact as _delete_template_artifact
-
-        _delete_template_artifact(template_id, self.kind)
-
-    def discard_paused(self, row: dict) -> None:
-        # Its VMM exited at pause; the recorded pid may belong to something else now.
-        self._cleanup_dead_row({**row, "pid": 0})
-
-    @staticmethod
-    def _cleanup_dead_row(row: dict) -> None:
-        vm_id = row["vm_id"]
-        pid = row.get("pid", 0)
-        ns_name = row.get("ns_name") or _ch_ns_name(vm_id)
-        vm_dir = row.get("vm_dir") or ""
-
-        if pid:
-            try:
-                os.kill(pid, 9)
-            except (ProcessLookupError, PermissionError):
-                pass
-
-        try:
-            _delete_netns(ns_name)
-        except Exception:
-            pass
-
-        ChJail(vm_id).cleanup()
-        # Sandboxes created before CH was jailed kept their files in the data dir.
-        if vm_dir and not vm_dir.startswith(CH_JAIL_DIR):
-            from flint.core._wipe import wipe_tree
-            wipe_tree(vm_dir, vm_id)
 
 
 from .registry import register as _register

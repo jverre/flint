@@ -6,7 +6,7 @@ domain-matching rules.
 
 Usage (via mitmdump):
     mitmdump --mode transparent --set confdir=/path/to/ca \
-        -s _proxy_server.py -q
+        -s proxy_server.py -q
 
 The addon reads rules from the file path in the FLINT_PROXY_RULES environment
 variable. Rules are a JSON dict mapping domain patterns to header dicts:

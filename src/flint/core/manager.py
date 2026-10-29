@@ -1,48 +1,33 @@
+"""The sandbox manager: every sandbox's lifecycle on this host, and its record of it.
+
+The manager owns sandbox state. Backends drive the hypervisor (start, pause,
+resume, stop a VM); the manager decides when, tracks the running sandboxes in
+memory, and records every transition in the :class:`StateStore`. Requests it
+can't serve raise :mod:`flint.core.errors`.
+"""
+
 from __future__ import annotations
 
+import functools
 import json
 import os
+import stat
 import threading
-import functools
-import weakref
 import time
+import weakref
 from typing import TYPE_CHECKING, Callable
 
-from . import _secrets, _wipe
-from .backends.base import HostBackend
-from . import config
-from .config import log, DEFAULT_TEMPLATE_ID
-from .types import _SandboxEntry, SandboxState
+from . import _wipe, config
+from .backends.base import BackendPlugin
+from .config import DEFAULT_TEMPLATE_ID, log
+from .errors import Conflict, InvalidState, SandboxNotFound
+from .events import EventSink, discard
+from .guest import GuestAgent, bridge_terminal
+from .policy import NetworkPolicy, redacted
+from .types import BootResult, SandboxRow, SandboxState, _SandboxEntry
 
 if TYPE_CHECKING:
     from ._state_store import StateStore
-
-
-def _policy_has_transforms(policy: dict) -> bool:
-    """Check if a network policy contains any transform rules."""
-    allow = policy.get("allow", {})
-    for domain_rules in allow.values():
-        for rule in domain_rules:
-            if rule.get("transform"):
-                return True
-    return False
-
-
-def _extract_transform_rules(policy: dict) -> dict:
-    """Extract domain -> headers mapping from a network policy.
-
-    Returns a dict like: {"api.openai.com": {"Authorization": "Bearer sk-..."}, ...}
-    """
-    rules: dict[str, dict[str, str]] = {}
-    allow = policy.get("allow", {})
-    for domain, domain_rules in allow.items():
-        merged_headers: dict[str, str] = {}
-        for rule in domain_rules:
-            for transform in rule.get("transform", []):
-                merged_headers.update(transform.get("headers", {}))
-        if merged_headers:
-            rules[domain] = merged_headers
-    return rules
 
 
 def _vm_operation(method):
@@ -57,7 +42,7 @@ def _vm_operation(method):
 class SandboxManager:
     """Owns all sandbox state and lifecycle. No TUI dependencies."""
 
-    def __init__(self, backend: HostBackend, state_store: StateStore | None = None) -> None:
+    def __init__(self, backend: BackendPlugin, state_store: StateStore | None = None, *, publish: EventSink = discard) -> None:
         self._backend = backend
         self._sandboxes: dict[str, _SandboxEntry] = {}
         self._lock = threading.Lock()
@@ -65,8 +50,17 @@ class SandboxManager:
         self._network_lock = threading.RLock()
         self._operation_locks = weakref.WeakValueDictionary()
         self._state_store = state_store
+        self._publish = publish
         # Called with the sandbox ID just before a sandbox is killed.
         self.kill_hooks: list[Callable[[str], None]] = []
+
+    @property
+    def backend(self) -> BackendPlugin:
+        return self._backend
+
+    @property
+    def backend_kind(self) -> str:
+        return self._backend.kind
 
     def _operation_lock(self, vm_id: str):
         with self._lock:
@@ -76,39 +70,115 @@ class SandboxManager:
                 self._operation_locks[vm_id] = lock
             return lock
 
+    # ── Tracking ───────────────────────────────────────────────────────────
+
+    def entries(self) -> list[_SandboxEntry]:
+        """The sandboxes whose VMs this manager tracks (running, or held by a migration)."""
+        with self._lock:
+            return list(self._sandboxes.values())
+
+    def track(self, entry: _SandboxEntry) -> None:
+        """Track a sandbox whose VM is already recorded (e.g. adopted by recovery)."""
+        with self._lock:
+            self._sandboxes[entry.vm_id] = entry
+
+    def untrack(self, sandbox_id: str) -> None:
+        with self._lock:
+            self._sandboxes.pop(sandbox_id, None)
+
+    def adopt(self, entry: _SandboxEntry) -> None:
+        """Record and track a sandbox whose VM was started outside :meth:`create` (a migration receiver)."""
+        self._insert(entry)
+        self.track(entry)
+
+    def save(self, entry: _SandboxEntry, *, state: SandboxState | None = None) -> None:
+        """Record a tracked sandbox's metadata and availability, and its new ``state`` if given."""
+        if state is not None:
+            entry.state = state
+        if self._state_store:
+            self._state_store.update_sandbox(
+                entry.vm_id, backend_meta_json=json.dumps(entry.backend_metadata), availability=entry.availability,
+            )
+            if state is not None:
+                self._state_store.transition_state(entry.vm_id, state)
+
+    def _entry(self, sandbox_id: str) -> _SandboxEntry:
+        """A tracked sandbox. Raises InvalidState for one only on record (e.g. paused), else SandboxNotFound."""
+        with self._lock:
+            entry = self._sandboxes.get(sandbox_id)
+        if entry:
+            return entry
+        row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
+        if row and row.state != SandboxState.DEAD:
+            raise InvalidState(f"Sandbox {sandbox_id} is not running (state={row.state})")
+        raise SandboxNotFound.of(sandbox_id)
+
+    def _running_entry(self, sandbox_id: str) -> _SandboxEntry:
+        entry = self._entry(sandbox_id)
+        if entry.state != SandboxState.RUNNING:
+            raise InvalidState(f"Sandbox {sandbox_id} is not running (state={entry.state})")
+        return entry
+
+    def _insert(self, entry: _SandboxEntry) -> None:
+        if self._state_store:
+            self._state_store.insert_sandbox(
+                vm_id=entry.vm_id,
+                pid=entry.pid,
+                vm_dir=entry.vm_dir,
+                socket_path=entry.socket_path,
+                ns_name=entry.ns_name,
+                state=entry.state,
+                daemon_pid=os.getpid(),
+                template_id=entry.template_id,
+                boot_time_ms=entry.ready_time_ms,
+                timings_json=entry.timings,
+                chroot_base=entry.chroot_base,
+                backend_kind=entry.backend_kind,
+                backend_meta_json=entry.backend_metadata,
+                tenant=entry.tenant,
+                availability=entry.availability,
+            )
+
+    # ── Tenant networks ────────────────────────────────────────────────────
+
     def refresh_tenant_networks(self) -> None:
-        if not self._backend.kind.startswith("linux-") or not self._state_store:
+        if not self._backend.supports_tenant_networks or not self._state_store:
             return
-        from ._netns import configure_tenant_peers
+        from .net.netns import configure_tenant_peers
         with self._network_lock:
             groups: dict[tuple[str, str], list[str]] = {}
             for row in self._state_store.list_active():
-                if not row.get("ns_name") or row["state"] in (SandboxState.ERROR.value, SandboxState.DELETING.value):
+                if not row.ns_name or row.state in (SandboxState.ERROR, SandboxState.DELETING):
                     continue
                 tenant = row.get("tenant") or "default"
-                key = ("tenant", tenant) if self._state_store.tenant_network(tenant) else ("vm", row["ns_name"])
-                groups.setdefault(key, []).append(row["ns_name"])
+                key = ("tenant", tenant) if self._state_store.tenant_network(tenant) else ("vm", row.ns_name)
+                groups.setdefault(key, []).append(row.ns_name)
             configure_tenant_peers(list(groups.values()))
 
     def set_tenant_network(self, tenant: str, enabled: bool) -> None:
-        if not self._backend.kind.startswith("linux-") or config.CLUSTER_MODE:
+        if not self._backend.supports_tenant_networks or config.CLUSTER_MODE:
             raise ValueError("Tenant networking requires a single Linux host")
         with self._network_lock:
             self._state_store.set_tenant_network(tenant, enabled)
             self.refresh_tenant_networks()
 
-    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True, use_pyroute2: bool = True, network_policy: dict | None = None, vm_id: str | None = None, tenant: str = "", availability: str = "") -> str:
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def create(self, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, use_pool: bool = True,
+               use_pyroute2: bool = True, network_policy: NetworkPolicy | dict | None = None, vm_id: str | None = None,
+               tenant: str = "", availability: str = "") -> str:
         """Start an interactive VM from a template snapshot. Returns the vm_id.
 
         ``vm_id`` is chosen by the caller in a cluster (the control plane),
         so a VM keeps its ID when it moves between hosts.
         """
-        if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+        policy = NetworkPolicy.optional(network_policy)
+        if config.SHARED_ROOTFS_DIR:
             if not config.CLUSTER_MODE:
                 raise ValueError("shared root disks require cluster ownership and fencing")
-            if self._backend.kind != "linux-cloud-hypervisor":
+            if not self._backend.supports_live_migration:
                 raise ValueError("shared root disks require Cloud Hypervisor")
-            if network_policy or config.STORAGE_BACKEND != "local":
+            if policy or config.STORAGE_BACKEND != "local":
                 raise ValueError("migration networking requires rootfs-local workspaces and no host-local credential proxy")
         boot = self._backend.create(
             template_id=template_id,
@@ -117,117 +187,61 @@ class SandboxManager:
             use_pyroute2=use_pyroute2,
             vm_id=vm_id,
         )
-        return self._register_boot(boot, template_id, network_policy, tenant, availability)
+        return self._register_boot(boot, template_id, policy, tenant, availability)
 
     @_vm_operation
-    def restore(self, vm_id: str, src_dir: str, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True, network_policy: dict | None = None, tenant: str = "", availability: str = "") -> str:
+    def restore(self, vm_id: str, src_dir: str, *, template_id: str = DEFAULT_TEMPLATE_ID, allow_internet_access: bool = True,
+                network_policy: NetworkPolicy | dict | None = None, tenant: str = "", availability: str = "") -> str:
         """Start ``vm_id`` from a snapshot of another VM (paused, checkpointed or
         forked, possibly on another host) restored into ``src_dir``."""
+        policy = NetworkPolicy.optional(network_policy)
         with self._lock:
             if vm_id in self._sandboxes:
-                raise RuntimeError(f"Sandbox {vm_id} already runs here")
+                raise Conflict(f"Sandbox {vm_id} already runs here")
         if self._state_store:
             row = self._state_store.get_sandbox(vm_id)
-            if row and row["state"] != SandboxState.DEAD.value:
+            if row and row.state != SandboxState.DEAD:
                 self.kill(vm_id)  # a stale local copy (e.g. paused here before it moved)
         boot = self._backend.import_snapshot(vm_id, src_dir, allow_internet_access=allow_internet_access)
-        return self._register_boot(boot, template_id, network_policy, tenant, availability)
+        return self._register_boot(boot, template_id, policy, tenant, availability)
 
     @_vm_operation
     def checkpoint(self, sandbox_id: str, snapshot: Callable[[str, dict[str, str]], object]) -> object:
         """Snapshot a running sandbox without stopping it (see BackendPlugin.checkpoint)."""
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        if entry.state != SandboxState.RUNNING:
-            raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
-        return self._backend.checkpoint(entry, snapshot)
+        return self._backend.checkpoint(self._running_entry(sandbox_id), snapshot)
 
-    def _register_boot(self, boot, template_id: str, network_policy: dict | None, tenant: str, availability: str) -> str:
-        vm_id = boot.backend_vm_ref or os.path.basename(boot.runtime_dir) or str(time.time())
-        with self._operation_lock(vm_id):
-            return self._register_boot_locked(vm_id, boot, template_id, network_policy, tenant, availability)
+    def _register_boot(self, boot: BootResult, template_id: str, policy: NetworkPolicy | None, tenant: str, availability: str) -> str:
+        with self._operation_lock(boot.vm_id):
+            return self._register_boot_locked(boot, template_id, policy, tenant, availability)
 
-    def _register_boot_locked(self, vm_id, boot, template_id, network_policy, tenant, availability):
-        agent_url = boot.agent_url
-
-        entry = _SandboxEntry(
-            vm_id=vm_id,
-            process=boot.process,
-            pid=boot.pid,
-            vm_dir=boot.vm_dir,
-            socket_path=boot.socket_path,
-            ns_name=boot.ns_name,
-            guest_ip=boot.guest_ip,
-            agent_url=agent_url,
-            agent_healthy=True,
-            state=SandboxState.RUNNING,
-            template_id=template_id,
-            chroot_base=boot.chroot_base,
-            backend_kind=self._backend.kind,
-            backend_vm_ref=boot.backend_vm_ref or vm_id,
-            runtime_dir=boot.runtime_dir or boot.vm_dir,
-            guest_arch=boot.guest_arch,
-            transport_ref=boot.transport_ref,
-            backend_metadata=dict(boot.backend_metadata),
-            t_instance_start=boot.t_total,
-            ready_time_ms=(time.monotonic() - boot.t_total) * 1000,
-            timings=boot.timings,
-            network_policy=network_policy,
-            tenant=tenant or "default",
-            availability=availability,
+    def _register_boot_locked(self, boot: BootResult, template_id: str, policy: NetworkPolicy | None, tenant: str, availability: str) -> str:
+        vm_id = boot.vm_id
+        entry = _SandboxEntry.from_boot(
+            boot, kind=self._backend.kind, template_id=template_id,
+            tenant=tenant or "default", availability=availability, network_policy=policy,
         )
+        entry.ready_time_ms = (time.monotonic() - boot.t_total) * 1000
+        vcpus, memory_mb = self._backend.vm_resources()
+        entry.backend_metadata["resources"] = {"vcpus": vcpus, "memory_mb": memory_mb, "disk_mb": _disk_mb(boot.vm_dir)}
 
-        try:
-            disk_mb = (os.stat(os.path.join(boot.vm_dir, "rootfs.ext4")).st_size + (1 << 20) - 1) // (1 << 20)
-        except OSError:
-            disk_mb = 0
-        entry.backend_metadata["resources"] = {
-            "vcpus": config.CH_CPU_COUNT if entry.backend_kind == "linux-cloud-hypervisor" else 1,
-            "memory_mb": config.CH_MEMORY_BYTES // (1 << 20) if entry.backend_kind == "linux-cloud-hypervisor" else 128,
-            "disk_mb": disk_mb,
-        }
         # Warmup: send a quick exec to measure time-to-interactive.
         t0 = time.monotonic()
         try:
-            body = json.dumps({"cmd": ["echo", "benchmark"], "timeout": 5}).encode()
-            self._backend.proxy_guest_request(entry, "POST", "/exec", body, timeout=10)
-        except Exception:
-            pass
+            self._backend.guest(entry).exec(["echo", "benchmark"], timeout=5, request_timeout=10)
+        except Exception as exc:
+            log.warning("[%s] warm-up exec failed: %s", vm_id[:8], exc)
         entry.timings["exec_command_ms"] = (time.monotonic() - t0) * 1000
 
         with self._lock:
             self._sandboxes[vm_id] = entry
-
-        # Persist to state store if available
-        if self._state_store:
-            self._state_store.insert_sandbox(
-                vm_id=vm_id,
-                pid=boot.process.pid,
-                vm_dir=boot.vm_dir,
-                socket_path=boot.socket_path,
-                ns_name=boot.ns_name,
-                state=SandboxState.RUNNING,
-                daemon_pid=os.getpid(),
-                template_id=template_id,
-                boot_time_ms=entry.ready_time_ms,
-                timings_json=entry.timings,
-                chroot_base=boot.chroot_base,
-                backend_kind=entry.backend_kind,
-                backend_meta_json=entry.backend_metadata,
-                tenant=tenant or "default",
-                availability=availability,
-            )
-
-        # Persist network policy if provided
-        if network_policy and self._state_store:
-            self._state_store.set_network_policy(vm_id, json.dumps(network_policy))
+        self._insert(entry)
+        if policy and self._state_store:
+            self._state_store.set_network_policy(vm_id, policy.to_json_text())
 
         # Start credential proxy if network policy has transforms
-        if network_policy:
+        if policy:
             try:
-                self._apply_network_policy(entry, network_policy)
+                self._apply_network_policy(entry, policy)
             except Exception:
                 self.kill(vm_id)
                 raise
@@ -237,7 +251,6 @@ class SandboxManager:
         total_ms = (time.monotonic() - boot.t_total) * 1000
         parts = " | ".join(f"{k}={v:.1f}" for k, v in boot.timings.items())
         log.debug("[%s] DONE %.0f ms: %s", vm_id[:8], total_ms, parts)
-
         return vm_id
 
     @_vm_operation
@@ -253,20 +266,21 @@ class SandboxManager:
                 entry.state = SandboxState.DELETING
                 entry.agent_healthy = False
         row = self._state_store.get_sandbox(sandbox_id) if self._state_store else None
-        if not entry and (not row or row["state"] == SandboxState.DEAD.value):
+        if not entry and (not row or row.state == SandboxState.DEAD):
             return
         if self._state_store:
-            if row and row["state"] != SandboxState.DELETING.value:
+            if row and row.state != SandboxState.DELETING:
                 self._state_store.transition_state(sandbox_id, SandboxState.DELETING, detail="deletion pending")
             self._state_store.update_sandbox(sandbox_id, deletion_attempt_at=time.time())
         try:
-            # A firewall failure must not prevent the VMM from stopping.
-            if self._backend.kind.startswith("linux-"):
-                from ._limits import stop_processes, vm_cgroup
-                pid = entry.pid if entry else row.get("pid", 0)
-                root = entry.vm_dir if entry else row["vm_dir"]
-                stop_processes(vm_cgroup(sandbox_id, self._backend.kind), pid=pid, root=root,
-                               process=entry.process if entry else None)
+            # Stop the VMM first: a firewall failure must not prevent that.
+            stopped = self._backend.force_stop(
+                sandbox_id,
+                pid=entry.pid if entry else row.pid,
+                root=entry.vm_dir if entry else row.vm_dir,
+                process=entry.process if entry else None,
+            )
+            if stopped:
                 if entry:
                     entry.process = None
                     entry.pid = 0
@@ -277,57 +291,50 @@ class SandboxManager:
             if entry and entry.proxy:
                 entry.proxy.stop()
                 entry.proxy = None
-            elif self._backend.kind.startswith("linux-"):
-                from ._proxy import stop_namespace_proxy
-                stop_namespace_proxy(entry.ns_name if entry else row.get("ns_name", ""))
+            elif self._backend.supports_network_policy:
+                from .net.proxy import stop_namespace_proxy
+                stop_namespace_proxy(entry.ns_name if entry else row.ns_name)
             for hook in self.kill_hooks:
                 hook(sandbox_id)
             if entry:
                 self._backend.kill(entry)
             elif row:
-                self._backend.discard_paused({**row, "pid": 0})
+                self._backend.discard_paused(SandboxRow({**row, "pid": 0}))
         except Exception as exc:
             if self._state_store:
                 self._state_store.update_sandbox(sandbox_id, error_message=str(exc))
             raise _wipe.WipeError(f"Deletion pending for {sandbox_id}; retry cleanup: {exc}") from exc
-        with self._lock:
-            self._sandboxes.pop(sandbox_id, None)
+        self.untrack(sandbox_id)
         if self._state_store:
             self._state_store.transition_state(sandbox_id, SandboxState.DEAD)
         self._report_wiped(sandbox_id)
 
-    @staticmethod
-    def _report_wiped(sandbox_id: str) -> None:
+    def _report_wiped(self, sandbox_id: str) -> None:
         """Publish ``vm.wiped``: proof that the sandbox's files were wiped before removal."""
         wiped = _wipe.take(sandbox_id)
         log.info("[%s] wiped %d files (%d bytes)", sandbox_id[:8], wiped["files"], wiped["bytes"])
         try:
-            from flint.daemon.events import publish
-            publish("vm.wiped", vm_id=sandbox_id, files=wiped["files"], bytes=wiped["bytes"])
+            self._publish("vm.wiped", vm_id=sandbox_id, files=wiped["files"], bytes=wiped["bytes"])
         except Exception:
-            pass
+            log.exception("[%s] publishing vm.wiped failed", sandbox_id[:8])
 
     @_vm_operation
     def pause(self, sandbox_id: str) -> None:
-        """Pause a running sandbox: snapshot state to disk, kill process."""
-        from ._firecracker import _fc_patch, _fc_put, _fc_status_ok
+        """Pause a running sandbox: snapshot its state to disk and stop its VMM."""
+        entry = self._running_entry(sandbox_id)
+        pause_ref = self._backend.pause(entry)
 
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        if entry.state != SandboxState.RUNNING:
-            raise RuntimeError(f"Sandbox {sandbox_id} is not running (state={entry.state})")
-
-        self._backend.pause(entry, self._state_store)
+        entry.state = SandboxState.PAUSED
+        entry.agent_healthy = False
+        entry.process = None
+        if self._state_store:
+            self._state_store.transition_state(sandbox_id, SandboxState.PAUSED)
+            self._state_store.set_pause_snapshot(sandbox_id, pause_ref)
 
         if entry.proxy:
             entry.proxy.stop()
             entry.proxy = None
-
-        with self._lock:
-            self._sandboxes.pop(sandbox_id, None)
-
+        self.untrack(sandbox_id)
         log.debug("[%s] paused", sandbox_id[:8])
 
     @_vm_operation
@@ -338,62 +345,36 @@ class SandboxManager:
 
         row = self._state_store.get_sandbox(sandbox_id)
         if not row:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found in state store")
-        if row["state"] != SandboxState.PAUSED.value:
-            raise RuntimeError(f"Sandbox {sandbox_id} is not paused (state={row['state']})")
+            raise SandboxNotFound.of(sandbox_id, " in state store")
+        if row.state != SandboxState.PAUSED:
+            raise InvalidState(f"Sandbox {sandbox_id} is not paused (state={row['state']})")
 
         boot = self._backend.resume(row)
+        policy = NetworkPolicy.from_json_text(self._state_store.get_network_policy(sandbox_id))
+        entry = _SandboxEntry.from_boot(
+            boot, kind=row.get("backend_kind") or self._backend.kind,
+            template_id=row.get("template_id") or DEFAULT_TEMPLATE_ID,
+            tenant=row.get("tenant") or "", availability=row.get("availability") or "",
+            network_policy=policy,
+        )
+        # The API reports the timings of a VM's creation; a resumed one has none.
+        entry.timings = {}
+        resources = row.backend_metadata.get("resources")
+        if resources is not None:
+            entry.backend_metadata.setdefault("resources", resources)
+        self.track(entry)
 
-        # 6. Restore network policy from SQLite
-        network_policy = None
-        policy_json = self._state_store.get_network_policy(sandbox_id)
-        if policy_json:
-            try:
-                network_policy = json.loads(policy_json)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # 7. Create entry and insert into in-memory dict
-        entry = _SandboxEntry(
-            vm_id=sandbox_id,
-            process=boot.process,
+        self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
+        self._state_store.update_sandbox(
+            sandbox_id,
             pid=boot.pid,
-            vm_dir=boot.vm_dir,
-            socket_path=boot.socket_path,
-            ns_name=boot.ns_name,
-            guest_ip=boot.guest_ip,
-            agent_url=boot.agent_url,
-            agent_healthy=True,
-            state=SandboxState.RUNNING,
-            template_id=row.get("template_id", DEFAULT_TEMPLATE_ID),
-            chroot_base=boot.chroot_base,
-            network_policy=network_policy,
-            backend_kind=row.get("backend_kind") or self._backend.kind,
-            backend_vm_ref=boot.backend_vm_ref or sandbox_id,
-            runtime_dir=boot.runtime_dir or boot.vm_dir,
-            guest_arch=boot.guest_arch,
-            transport_ref=boot.transport_ref,
-            backend_metadata=dict(boot.backend_metadata),
-            tenant=row.get("tenant") or "",
-            availability=row.get("availability") or "",
+            daemon_pid=os.getpid(),
+            backend_meta_json=json.dumps(entry.backend_metadata),
         )
 
-        with self._lock:
-            self._sandboxes[sandbox_id] = entry
-
-        # 8. Persist state transition
-        if self._state_store:
-            self._state_store.transition_state(sandbox_id, SandboxState.RUNNING)
-            self._state_store.update_sandbox(
-                sandbox_id,
-                pid=boot.pid,
-                daemon_pid=os.getpid(),
-                backend_meta_json=json.dumps(entry.backend_metadata),
-            )
-
-        # 9. Re-apply credential injection proxy if policy has transforms
-        if network_policy:
-            self._apply_network_policy(entry, network_policy)
+        # Re-apply credential injection proxy if policy has transforms
+        if policy:
+            self._apply_network_policy(entry, policy)
 
         self.refresh_tenant_networks()
 
@@ -412,6 +393,8 @@ class SandboxManager:
             entry.timeout_seconds = timeout_seconds
             entry.timeout_policy = policy
 
+    # ── Views ──────────────────────────────────────────────────────────────
+
     def list_dicts(self) -> list[dict]:
         """Return JSON-serializable dicts for all VMs, paused ones included.
 
@@ -423,7 +406,7 @@ class SandboxManager:
             live = set(self._sandboxes)
         if self._state_store:
             for row in self._state_store.list_active():
-                if row["vm_id"] not in live:
+                if row.vm_id not in live:
                     dicts.append(self._row_dict(row))
         return dicts
 
@@ -440,21 +423,20 @@ class SandboxManager:
                 return self._row_dict(row)
         return None
 
-    @staticmethod
-    def _row_dict(row: dict) -> dict:
+    def _row_dict(self, row: SandboxRow) -> dict:
         """VM dict for a VM known only to the state store (e.g. paused)."""
         timings = {}
         if row.get("timings_json"):
             try:
                 timings = json.loads(row["timings_json"])
             except (json.JSONDecodeError, TypeError):
-                pass
+                log.warning("[%s] unreadable timings in the state store", row.vm_id[:8])
         return {
-            "vm_id": row["vm_id"],
+            "vm_id": row.vm_id,
             "pid": row["pid"],
             "state": row["state"],
-            "template_id": row.get("template_id", "default"),
-            "backend_kind": row.get("backend_kind", "linux-firecracker"),
+            "template_id": row.get("template_id", DEFAULT_TEMPLATE_ID),
+            "backend_kind": row.get("backend_kind") or self._backend.kind,
             "agent_healthy": False,
             "created_at": row["created_at"],
             "boot_time_ms": row.get("boot_time_ms"),
@@ -466,7 +448,7 @@ class SandboxManager:
             "timeout_seconds": None,
             "timeout_policy": row.get("timeout_policy"),
             "tenant": row.get("tenant") or "",
-            "network_address": json.loads(row.get("backend_meta_json") or "{}").get("veth_ip", ""),
+            "network_address": row.backend_metadata.get("veth_ip", ""),
             "availability": row.get("availability") or "",
         }
 
@@ -481,56 +463,55 @@ class SandboxManager:
         with self._lock:
             return list(self._sandboxes.keys())
 
+    # ── Network policy ─────────────────────────────────────────────────────
+
     @_vm_operation
-    def update_network_policy(self, sandbox_id: str, policy: dict) -> None:
+    def update_network_policy(self, sandbox_id: str, policy: NetworkPolicy | dict) -> None:
         """Replace the network policy (credential injection rules) of a sandbox.
 
         A header value sent back in the redacted form the API returns keeps
         the current credential, so a client can edit a policy it can't read.
         """
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry or entry.state != SandboxState.RUNNING:
-            raise RuntimeError(f"Sandbox {sandbox_id} is not running")
-        policy = _secrets.keep_unchanged(policy, entry.network_policy)
+        entry = self._running_entry(sandbox_id)
+        policy = NetworkPolicy.parse(policy).keeping_credentials_of(entry.network_policy)
 
         # Apply first: a policy that can't be applied isn't recorded.
         self._apply_network_policy(entry, policy)
         entry.network_policy = policy
 
         if self._state_store:
-            self._state_store.set_network_policy(sandbox_id, json.dumps(policy))
+            self._state_store.set_network_policy(sandbox_id, policy.to_json_text())
 
     def get_network_policy(self, sandbox_id: str) -> dict | None:
         """The sandbox's network policy, with credential values redacted."""
-        with self._lock:
-            entry = self._sandboxes.get(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        return _secrets.redact_policy(entry.network_policy)
+        return redacted(self._entry(sandbox_id).network_policy)
 
-    def _apply_network_policy(self, entry: _SandboxEntry, policy: dict) -> None:
+    def restore_network_policy(self, sandbox_id: str) -> None:
+        """Re-apply a recovered sandbox's stored policy: its credential proxy didn't survive the restart."""
+        entry = self.get_entry(sandbox_id)
+        policy = NetworkPolicy.from_json_text(self._state_store.get_network_policy(sandbox_id)) if self._state_store else None
+        if entry and policy:
+            entry.network_policy = policy
+            self._apply_network_policy(entry, policy)
+
+    def _apply_network_policy(self, entry: _SandboxEntry, policy: NetworkPolicy) -> None:
         """Start, update, or stop the credential proxy based on the policy."""
-        from ._proxy import CredentialProxy
-        from ._netns import _setup_proxy_redirect, _remove_proxy_redirect
+        from .net.netns import _remove_proxy_redirect, _setup_proxy_redirect
+        from .net.proxy import CredentialProxy
 
-        has_transforms = _policy_has_transforms(policy)
-
-        if has_transforms:
-            rules = _extract_transform_rules(policy)
+        if policy.has_transforms:
             if entry.proxy:
-                entry.proxy.update_rules(rules)
+                entry.proxy.update_rules(policy.headers)
             else:
                 proxy = CredentialProxy(entry.ns_name, entry.vm_id)
-                proxy.start(rules)
+                proxy.start(policy.headers)
                 entry.proxy = proxy
                 _setup_proxy_redirect(entry.ns_name)
                 self._trust_proxy_ca(entry, proxy)
-        else:
-            if entry.proxy:
-                entry.proxy.stop()
-                entry.proxy = None
-                _remove_proxy_redirect(entry.ns_name)
+        elif entry.proxy:
+            entry.proxy.stop()
+            entry.proxy = None
+            _remove_proxy_redirect(entry.ns_name)
 
     def _trust_proxy_ca(self, entry: _SandboxEntry, proxy) -> None:
         """Add the proxy's CA to the guest's system trust bundle.
@@ -543,7 +524,6 @@ class SandboxManager:
         # The proxy owns its CA directory. Never follow a certificate symlink
         # it could plant to make the root supervisor read a host secret.
         from ._jailfs import _open_nofollow
-        import stat
         fd = _open_nofollow(proxy.ca_cert_path, os.O_RDONLY, (stat.S_IFREG,))
         with os.fdopen(fd) as f:
             cert = f.read(65537).strip()
@@ -554,37 +534,31 @@ class SandboxManager:
             '[ "$(cat flint-proxy-ca.pem 2>/dev/null)" = "$1" ] && exit 0\n'
             'printf "%s\\n" "$1" > flint-proxy-ca.pem && printf "%s\\n" "$1" >> ca-certificates.crt\n'
         )
-        body = json.dumps({"cmd": ["/bin/sh", "-c", script, "sh", cert], "timeout": 10}).encode()
-        status, resp = self._backend.proxy_guest_request(entry, "POST", "/exec", body, timeout=15)
-        if status != 200 or json.loads(resp).get("exit_code") != 0:
-            raise RuntimeError(f"Installing the proxy CA in the guest failed: {resp[:300]!r}")
+        result = self._backend.guest(entry).sh(script, cert, timeout=10, request_timeout=15)
+        if not result.ok:
+            raise RuntimeError(f"Installing the proxy CA in the guest failed: {result.body[:300]!r}")
 
-    @property
-    def backend_kind(self) -> str:
-        return self._backend.kind
-
-    def agent_request(
-        self,
-        sandbox_id: str,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        timeout: float = 65,
-    ) -> tuple[int, bytes]:
-        entry = self.get_entry(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        return self._backend.proxy_guest_request(entry, method, path, body, timeout)
+    # ── The guest agent ────────────────────────────────────────────────────
 
     def connect_agent(self, sandbox_id: str):
         """A socket starting to connect to the sandbox's guest agent."""
         entry = self.get_entry(sandbox_id)
         if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
+            raise SandboxNotFound.of(sandbox_id)
         return self._backend.connect_guest(entry)
 
+    def guest(self, sandbox_id: str) -> GuestAgent:
+        """A client for the sandbox's guest agent."""
+        if not self.get_entry(sandbox_id):
+            raise SandboxNotFound.of(sandbox_id)
+        return GuestAgent(lambda: self.connect_agent(sandbox_id))
+
     async def bridge_terminal(self, sandbox_id: str, websocket) -> None:
-        entry = self.get_entry(sandbox_id)
-        if not entry:
-            raise RuntimeError(f"Sandbox {sandbox_id} not found")
-        await self._backend.bridge_terminal(entry, websocket)
+        await bridge_terminal(self.guest(sandbox_id), websocket)
+
+
+def _disk_mb(vm_dir: str) -> int:
+    try:
+        return (os.stat(os.path.join(vm_dir, "rootfs.ext4")).st_size + (1 << 20) - 1) // (1 << 20)
+    except OSError:
+        return 0

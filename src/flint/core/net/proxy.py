@@ -21,10 +21,10 @@ import time
 from pathlib import Path
 import select
 
-from .config import log, HOST_IP, PROXY_PORT, STATE_DIR, _DATA_KEY
-from ._netns import _popen_in_ns
-from ._confinement import parser_command, supervised_spawn
-from ._identities import identity, release
+from ..config import log, HOST_IP, PROXY_PORT, STATE_DIR, _DATA_KEY
+from .netns import _popen_in_ns
+from .._confinement import parser_command, supervised_spawn
+from .._identities import identity, release
 
 # The proxy's rules hold credentials in plaintext, so they stay in memory
 # (/run is a tmpfs) and readable by root only.
@@ -36,8 +36,8 @@ def stop_namespace_proxy(ns_name: str) -> None:
     """Release a namespace's proxy even when its Python handle was lost."""
     if not ns_name:
         return
-    from ._limits import stop_processes
-    from ._wipe import wipe_tree
+    from .._limits import stop_processes
+    from .._wipe import wipe_tree
     group = Path(_CGROUP_ROOT) / ns_name
     stop_processes(str(group))
     if group.exists():
@@ -84,11 +84,11 @@ def cleanup_abandoned_proxies() -> None:
         for group in root.iterdir():
             if group.is_dir():
                 stop_namespace_proxy(group.name)
-    from ._wipe import wipe_tree
+    from .._wipe import wipe_tree
     wipe_tree(_RULES_DIR)
     # No proxy is left running, so no proxy identity is in use. This also
     # drops records keyed by namespace name from before they were per VM.
-    from ._identities import release_kind
+    from .._identities import release_kind
     release_kind("proxy")
 
 
@@ -137,7 +137,7 @@ class CredentialProxy:
         self._rules_file = rules_path
 
         # Launch mitmdump in transparent mode inside the netns
-        addon_script = os.path.join(os.path.dirname(__file__), "_proxy_server.py")
+        addon_script = os.path.join(os.path.dirname(__file__), "proxy_server.py")
         shutil.copyfile(addon_script, os.path.join(directory, "addon.py"))
         os.chmod(os.path.join(directory, "addon.py"), 0o444)
         cmd = [
@@ -162,7 +162,7 @@ class CredentialProxy:
                 self.ns_name, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
             ))
-            from ._limits import attach_process
+            from .._limits import attach_process
             attach_process(str(Path(_CGROUP_ROOT) / self.ns_name), self._process.pid)
             self._wait_listening()
         except Exception:
@@ -200,7 +200,7 @@ class CredentialProxy:
             log.info("[%s] Credential proxy stopped", self.ns_name)
             self._process = None
         if self._directory:
-            from ._wipe import wipe_tree
+            from .._wipe import wipe_tree
             wipe_tree(self._directory)
             self._directory = None
             self._rules_file = None

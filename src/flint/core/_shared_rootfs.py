@@ -242,5 +242,5 @@ class SharedRootfs:
 
 
 def configured_pool() -> SharedRootfs | None:
-    directory = os.environ.get("FLINT_SHARED_ROOTFS_DIR", "")
-    return SharedRootfs(directory) if directory else None
+    from . import config
+    return SharedRootfs(config.SHARED_ROOTFS_DIR) if config.SHARED_ROOTFS_DIR else None

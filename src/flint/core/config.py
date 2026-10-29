@@ -131,6 +131,8 @@ CH_BINARY         = os.environ.get("FLINT_CH_BINARY", "/usr/local/bin/cloud-hype
 CH_CPU_COUNT      = int(os.environ.get("FLINT_CH_CPU_COUNT", "1"))
 CH_MEMORY_BYTES   = int(os.environ.get("FLINT_CH_MEMORY_BYTES", str(128 * 1024 * 1024)))
 CH_GOLDEN_DIR     = os.environ.get("FLINT_CH_GOLDEN_DIR", f"{DATA_DIR}/.golden-ch")
+# cgroup v2 base of every jailed cloud-hypervisor VMM (cf. JAILER_PARENT_CGROUP).
+CH_PARENT_CGROUP  = os.environ.get("FLINT_CH_PARENT_CGROUP", "cloud-hypervisor")
 
 # ── macOS Virtualization.framework backend ───────────────────────────────
 VZ_KERNEL_PATH = os.environ.get("FLINT_VZ_KERNEL_PATH", os.path.join(DATA_DIR, "vz", "vmlinux"))
@@ -153,6 +155,10 @@ CLUSTER_IDENTITY_DIR = os.environ.get("FLINT_IDENTITY_DIR", f"{STATE_DIR}/cluste
 SNAPD_SOCKET = os.environ.get("FLINT_SNAPD_SOCKET", "/run/flint/snapd.sock")
 # Most VMs (running, not paused) this host takes; 0 = derive from memory.
 MAX_VMS = int(os.environ.get("FLINT_MAX_VMS", "0"))
+# A cluster-wide directory of root disks (e.g. on NFS). When set, Cloud
+# Hypervisor VMs boot from a disk there on a migration network, so they can
+# move between hosts live. See _shared_rootfs.py and net/migration_network.py.
+SHARED_ROOTFS_DIR = os.environ.get("FLINT_SHARED_ROOTFS_DIR", "")
 
 # ── Runtime-editable overrides ──────────────────────────────────────────
 CONFIG_OVERRIDES_PATH = f"{STATE_DIR}/config.json"

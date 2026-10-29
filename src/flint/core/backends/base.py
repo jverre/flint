@@ -1,66 +1,25 @@
 from __future__ import annotations
 
-import json
 import os
 import socket
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any, Callable, ClassVar, Literal
 
-from flint.core import _guest_http
+from ..guest import http as guest_http
+from ..guest.agent import GuestAgent
+from ..types import BootResult
 
 RecoveryState = Literal["alive", "paused", "dead"]
 
 
-def row_backend_metadata(row: dict) -> dict:
-    """Return the per-sandbox backend_metadata dict from a state-store row.
-
-    Rows can carry it as either a pre-parsed dict (``backend_metadata``) or
-    the raw ``backend_meta_json`` TEXT column. Accept either.
-    """
-    meta = row.get("backend_metadata")
-    if isinstance(meta, dict):
-        return meta
-    raw = row.get("backend_meta_json")
-    if isinstance(raw, str) and raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return {}
-
-
-@dataclass
-class BackendBootResult:
-    """Return value of :meth:`BackendPlugin.create`/:meth:`BackendPlugin.resume`.
-
-    Only ``agent_url``/``guest_ip`` and ``process``/``pid`` are part of the
-    hypervisor-agnostic contract — everything else is either convenience for
-    existing backends or lives in ``backend_metadata`` for backends that need
-    to stash arbitrary per-VM state (socket path, chroot dir, namespace name…).
-    """
-
-    process: Any = None
-    pid: int = -1
-    vm_dir: str = ""
-    socket_path: str = ""
-    ns_name: str = ""
-    guest_ip: str = ""
-    agent_url: str = ""
-    chroot_base: str = ""
-    backend_vm_ref: str = ""
-    runtime_dir: str = ""
-    guest_arch: str = ""
-    transport_ref: str = ""
-    timings: dict[str, float] = field(default_factory=dict)
-    t_total: float = 0.0
-    backend_metadata: dict[str, Any] = field(default_factory=dict)
-
-
 class BackendPlugin(ABC):
     """Contract every Flint backend implements.
+
+    A backend drives one hypervisor: it starts, pauses, resumes and stops VMs
+    and finds them again after a restart. It never touches the state store:
+    the :class:`~flint.core.manager.SandboxManager` owns sandbox state and
+    records every transition.
 
     Subclasses set three class attributes:
 
@@ -74,14 +33,23 @@ class BackendPlugin(ABC):
     * ``supported_platforms`` — tuple of platform strings, each in the form
       ``"<system>"`` or ``"<system>-<machine>"`` (lowercase, e.g. ``"linux"``,
       ``"darwin-arm64"``). Empty tuple means "any platform".
+
+    and declares what it can do with the capability flags below, which the
+    manager and daemon check instead of the backend's identity.
     """
 
     name: ClassVar[str]
     kind: ClassVar[str]
     display_name: ClassVar[str] = ""
     supported_platforms: ClassVar[tuple[str, ...]] = ()
+
+    # ── Capabilities ──────────────────────────────────────────────────────
     # The credential proxy needs the VM's own network namespace.
     supports_network_policy: ClassVar[bool] = True
+    # VMs can be allowed to reach their tenant's other VMs (per-VM namespaces on one bridge).
+    supports_tenant_networks: ClassVar[bool] = False
+    # VMs can boot from a cluster's shared root disks and move between hosts live.
+    supports_live_migration: ClassVar[bool] = False
 
     def preflight(self) -> list[str]:
         """Check whether this backend is usable on the current host.
@@ -132,6 +100,8 @@ class BackendPlugin(ABC):
     def stop_pool(self) -> None:
         pass
 
+    # ── VM lifecycle ──────────────────────────────────────────────────────
+
     @abstractmethod
     def create(
         self,
@@ -141,49 +111,64 @@ class BackendPlugin(ABC):
         use_pool: bool,
         use_pyroute2: bool,
         vm_id: str | None = None,
-    ) -> BackendBootResult:
-        pass
+    ) -> BootResult:
+        """Start a new VM from a template."""
 
     @abstractmethod
     def kill(self, entry) -> None:
-        pass
+        """Stop a VM and delete everything it holds (disk, jail, network)."""
 
     @abstractmethod
-    def pause(self, entry, state_store) -> None:
-        pass
+    def pause(self, entry) -> str:
+        """Save the running VM's state to disk and stop its VMM.
+
+        Returns where the state is (recorded as the sandbox's pause snapshot).
+        On failure the VM keeps running.
+        """
 
     @abstractmethod
-    def resume(self, row: dict) -> BackendBootResult:
-        pass
+    def resume(self, row: Mapping) -> BootResult:
+        """Start a paused VM again from the state :meth:`pause` saved."""
+
+    def discard_paused(self, row: Mapping) -> None:
+        """Delete what a paused sandbox left behind: its snapshot, jail and network."""
+
+    @abstractmethod
+    def check_entry_alive(self, entry) -> tuple[bool, str | None]:
+        """Whether a running VM's VMM is still there, and if not, why."""
+
+    @abstractmethod
+    def recover_row(self, row: Mapping) -> tuple[RecoveryState, Any]:
+        """After a daemon restart: ``("alive", entry)`` for a VM still running
+        (adopted), ``("paused", None)``, or ``("dead", None)`` once whatever
+        it left is cleaned up."""
 
     def vm_resources(self) -> tuple[int, int]:
         """(vCPUs, memory in MiB) of one VM, for tenant quotas. Firecracker's defaults."""
         return 1, 128
 
-    def discard_paused(self, row: dict) -> None:
-        """Delete what a paused sandbox left behind: its snapshot, jail and network."""
+    # Hooks for host-level confinement (cgroups) around the lifecycle. Backends
+    # whose VMMs aren't host processes of their own need none of them.
+
+    def force_stop(self, vm_id: str, *, pid: int, root: str, process=None) -> bool:
+        """Stop every process of a VM (before its network is torn down). True if it did anything."""
+        return False
+
+    def prepare_recovery(self, rows: list[Mapping]) -> None:
+        """Before recovery probes the rows: get surviving VMMs into a state recovery can handle."""
+
+    def confine_recovered(self, row: Mapping) -> None:
+        """Re-apply resource limits to an adopted VM; raise if it can't be confined."""
+
+    # ── The guest agent ───────────────────────────────────────────────────
 
     def connect_guest(self, entry) -> socket.socket:
-        """Start connecting to the VM's guest agent; see :func:`_guest_http.connect`."""
-        return _guest_http.connect(entry.agent_url)
+        """Start connecting to the VM's guest agent; see :func:`flint.core.guest.http.connect`."""
+        return guest_http.connect(entry.agent_url)
 
-    def proxy_guest_request(
-        self,
-        entry,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        timeout: float = 65,
-    ) -> tuple[int, bytes]:
-        return _guest_http.request(self.connect_guest(entry), method, path, body, timeout)
-
-    @abstractmethod
-    async def bridge_terminal(self, entry, websocket) -> None:
-        pass
-
-    @abstractmethod
-    def check_entry_alive(self, entry) -> tuple[bool, str | None]:
-        pass
+    def guest(self, entry) -> GuestAgent:
+        """A client for the VM's guest agent."""
+        return GuestAgent(lambda: self.connect_guest(entry))
 
     def usage(self, entry) -> tuple[float, int] | None:
         """``(cpu_seconds, memory_bytes)`` the VM has used, or None if unknown.
@@ -204,10 +189,7 @@ class BackendPlugin(ABC):
             return None
         return cpu_seconds, rss
 
-    @abstractmethod
-    def recover_row(self, row: dict):
-        """Return ``(RecoveryState, entry_or_none)``."""
-        pass
+    # ── Templates ─────────────────────────────────────────────────────────
 
     @abstractmethod
     def build_template(self, name: str, dockerfile: str, rootfs_size_mb: int = 500) -> dict:
@@ -224,7 +206,11 @@ class BackendPlugin(ABC):
     # them beneath that root without following symlinks, because the VMM
     # can write inside its jail.
 
-    def pause_files(self, row: dict) -> tuple[str, dict[str, str]]:
+    def vmm_binary(self) -> str:
+        """The hypervisor binary, for host inventory (""if there is none)."""
+        return ""
+
+    def pause_files(self, row: Mapping) -> tuple[str, dict[str, str]]:
         """``(root, files)`` holding a paused sandbox's complete state."""
         raise NotImplementedError(f"backend {self.name!r} can't export snapshots")
 
@@ -234,7 +220,7 @@ class BackendPlugin(ABC):
         ``snapshot`` returned. The files use :meth:`pause_files` names."""
         raise NotImplementedError(f"backend {self.name!r} can't checkpoint")
 
-    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BackendBootResult:
+    def import_snapshot(self, vm_id: str, src_dir: str, *, allow_internet_access: bool, use_pool: bool = True) -> BootResult:
         """Start ``vm_id`` on this host from a pause or checkpoint snapshot
         restored into ``src_dir`` (files named as in :meth:`pause_files`).
         Consumes ``src_dir``'s files."""
@@ -255,5 +241,4 @@ class BackendPlugin(ABC):
         )
 
 
-# Backward-compatible alias — existing code imports ``HostBackend``.
-HostBackend = BackendPlugin
+__all__ = ["BackendPlugin", "BootResult", "RecoveryState"]

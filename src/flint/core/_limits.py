@@ -33,7 +33,7 @@ def _whole_device(device: int, sysfs: Path = Path("/sys/dev/block")) -> str:
 
 
 def vm_cgroup(vm_id: str, kind: str) -> str:
-    parent = os.environ.get("FLINT_CH_PARENT_CGROUP", "cloud-hypervisor") if kind == "linux-cloud-hypervisor" else config.JAILER_PARENT_CGROUP
+    parent = config.CH_PARENT_CGROUP if kind == "linux-cloud-hypervisor" else config.JAILER_PARENT_CGROUP
     return f"/sys/fs/cgroup/{parent}/{vm_id}"
 
 
@@ -109,34 +109,6 @@ def cgroup_limits(path: str, rootfs: str, *, vcpus: int = 1, memory_mib: int = 1
     if os.major(device) or not vmm_disk_limit:
         device = _whole_device(device)
         (group / "io.max").write_text(f"{device} rbps={DISK_BPS} wbps={DISK_BPS}")
-
-
-def prepare_recovered(backend, rows: list[dict]) -> None:
-    """Move legacy processes out of delegated parents before enabling controllers."""
-    for row in rows:
-        if owns_process(row["pid"], row["vm_dir"]):
-            attach_process(vm_cgroup(row["vm_id"], backend.kind), row["pid"])
-
-
-def enforce_recovered(backend, row: dict) -> None:
-    if not owns_process(row["pid"], row["vm_dir"]):
-        raise RuntimeError("Recovered process identity does not match its jail")
-    group = vm_cgroup(row["vm_id"], backend.kind)
-    cpus, memory = backend.vm_resources()
-    if backend.kind == "linux-cloud-hypervisor" and not os.major(os.stat(os.path.join(row["vm_dir"], "rootfs.ext4")).st_dev):
-        import json
-        from . import _cloud_hypervisor as ch
-        status, body = ch.ch_get(row["socket_path"], "/api/v1/vm.info")
-        disks = json.loads(body).get("config", {}).get("disks", []) if status == 200 else []
-        if not disks or any(
-            (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("size") != DISK_BPS
-            or (disk.get("rate_limiter_config") or {}).get("bandwidth", {}).get("refill_time") != 1000
-            for disk in disks
-        ):
-            raise RuntimeError("Recovered shared-disk VM needs a bounded disk configuration; restore from its snapshot")
-    cgroup_limits(group, os.path.join(row["vm_dir"], "rootfs.ext4"), vcpus=cpus, memory_mib=memory,
-                  vmm_disk_limit=backend.kind == "linux-cloud-hypervisor")
-    attach_process(group, row["pid"])
 
 
 def network_limits(ns_name: str, tap_name: str) -> None:

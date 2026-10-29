@@ -10,7 +10,7 @@ import time
 import h11
 import pytest
 
-from flint.core import _guest_http
+from flint.core.guest import http as _guest_http
 
 
 def _guest(send) -> socket.socket:

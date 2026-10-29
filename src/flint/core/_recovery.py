@@ -38,13 +38,12 @@ class RecoveryEngine:
 
         log.info("Recovery: found %d active sandbox(es) to probe", len(active))
         daemon_pid = os.getpid()
-        if self._manager._backend.kind.startswith("linux-"):
-            from ._limits import prepare_recovered
-            prepare_recovered(self._manager._backend, active)
+        backend = self._manager.backend
+        backend.prepare_recovery(active)
 
         for row in active:
-            vm_id = row["vm_id"]
-            if row["state"] in (SandboxState.DELETING.value, SandboxState.ERROR.value):
+            vm_id = row.vm_id
+            if row.state in (SandboxState.DELETING, SandboxState.ERROR):
                 # Cleanup intent survives restart. Never reclaim it as serving.
                 try:
                     self._manager.kill(vm_id)
@@ -52,25 +51,20 @@ class RecoveryEngine:
                 except Exception:
                     log.exception("[%s] deletion retained for retry during recovery", vm_id[:8])
                 continue
-            probe, entry = self._manager._backend.recover_row(row)
+            probe, entry = backend.recover_row(row)
 
             if probe == "alive" and entry is not None:
-                if self._manager._backend.kind.startswith("linux-"):
-                    from ._limits import enforce_recovered
+                try:
+                    backend.confine_recovered(row)
+                except Exception:
+                    log.exception("[%s] recovered VM could not be confined", vm_id[:8])
+                    self._store.transition_state(vm_id, SandboxState.DELETING, detail="recovery enforcement failed")
                     try:
-                        enforce_recovered(self._manager._backend, row)
+                        self._manager.kill(vm_id)
                     except Exception:
-                        log.exception("[%s] recovered VM could not be confined", vm_id[:8])
-                        self._store.transition_state(vm_id, SandboxState.DELETING, detail="recovery enforcement failed")
-                        try:
-                            self._manager.kill(vm_id)
-                        except Exception:
-                            log.exception("[%s] deletion retained for retry during recovery", vm_id[:8])
-                        continue
-                entry.tenant = row.get("tenant") or ""
-                entry.availability = row.get("availability") or ""
-                with self._manager._lock:
-                    self._manager._sandboxes[vm_id] = entry
+                        log.exception("[%s] deletion retained for retry during recovery", vm_id[:8])
+                    continue
+                self._manager.track(entry)
                 self._store.update_sandbox(vm_id, daemon_pid=daemon_pid)
                 report.reclaimed += 1
             elif probe == "paused":

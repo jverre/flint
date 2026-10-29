@@ -28,9 +28,8 @@ def delegated_cgroups():
 
 
 def test_deletion_recovery_stops_serving_and_retries_until_private_data_is_wiped(tmp_path):
-    from flint.core._jailer import JailSpec
-    from flint.core._limits import vm_cgroup
-    from flint.core._netns import ensure_host_firewall
+    from flint.core.vmm.firecracker.jail import FirecrackerJail
+    from flint.core.net.netns import ensure_host_firewall
     from flint.core._state_store import StateStore
     from flint.core._recovery import RecoveryEngine
     from flint.core._health import HealthMonitor
@@ -39,8 +38,9 @@ def test_deletion_recovery_stops_serving_and_retries_until_private_data_is_wiped
     from flint.core.types import SandboxState
 
     vm_id = str(uuid.uuid4())
-    spec = JailSpec(vm_id, "review-" + vm_id[:8])
-    root = Path(spec.chroot_root)
+    spec = FirecrackerJail(vm_id)
+    ns_name = "review-" + vm_id[:8]
+    root = Path(spec.root)
     root.mkdir(parents=True)
     (root / "tmp").mkdir()
     target = root / "service"
@@ -50,10 +50,10 @@ def test_deletion_recovery_stops_serving_and_retries_until_private_data_is_wiped
     disk.write_bytes(b"tenant secret" * 4096)
     alias = tmp_path / "outside-link"
     os.link(disk, alias)
-    subprocess.run(["ip", "netns", "add", spec.ns_name], check=True)
-    subprocess.run(["ip", "-n", spec.ns_name, "link", "set", "lo", "up"], check=True)
-    subprocess.run(["ip", "-n", spec.ns_name, "addr", "add", "172.16.0.2/32", "dev", "lo"], check=True)
-    process = subprocess.Popen(["ip", "netns", "exec", spec.ns_name, "chroot", str(root), "/service"],
+    subprocess.run(["ip", "netns", "add", ns_name], check=True)
+    subprocess.run(["ip", "-n", ns_name, "link", "set", "lo", "up"], check=True)
+    subprocess.run(["ip", "-n", ns_name, "addr", "add", "172.16.0.2/32", "dev", "lo"], check=True)
+    process = subprocess.Popen(["ip", "netns", "exec", ns_name, "chroot", str(root), "/service"],
                                env={**os.environ, "FLINT_TEST_LISTEN": "0.0.0.0:5000"})
     store = StateStore(str(tmp_path / "state.db"))
     try:
@@ -61,8 +61,8 @@ def test_deletion_recovery_stops_serving_and_retries_until_private_data_is_wiped
         while not (root / "tmp/peer-ready").exists():
             assert process.poll() is None and time.monotonic() < deadline
             time.sleep(.01)
-        store.insert_sandbox(vm_id, process.pid, str(root), spec.socket_path_on_host, spec.ns_name,
-                             SandboxState.RUNNING, os.getpid(), chroot_base=spec.chroot_base, tenant="a")
+        store.insert_sandbox(vm_id, process.pid, str(root), spec.socket_path, ns_name,
+                             SandboxState.RUNNING, os.getpid(), chroot_base=spec.base, tenant="a")
         store.transition_state(vm_id, SandboxState.DELETING, detail="deletion pending")
         ensure_host_firewall()
         backend = LinuxFirecrackerBackend()
@@ -85,7 +85,7 @@ def test_deletion_recovery_stops_serving_and_retries_until_private_data_is_wiped
             RecoveryEngine(store, manager).recover()
             assert manager.get_entry(vm_id) is None
             assert store.get_sandbox(vm_id)["state"] == "Dead"
-            assert not root.exists() and not Path(vm_cgroup(vm_id, backend.kind)).exists()
+            assert not root.exists() and not Path(spec.cgroup).exists()
             held.seek(0)
             assert set(held.read()) == {0}
     finally:

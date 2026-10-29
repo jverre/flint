@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import base64
 import json
 import os
 import queue
@@ -11,10 +9,9 @@ import threading
 import time
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
-
-import websockets.sync.client as ws_sync
 
 from flint.core._template_registry import register_template_artifact, update_template_artifact_status
 from flint.core.config import (
@@ -30,9 +27,9 @@ from flint.core.config import (
     VZ_READY_TIMEOUT,
     VZ_ROOTFS_PATH,
 )
-from flint.core.types import SandboxState
+from flint.core.types import BootResult, SandboxRow
 
-from .base import BackendBootResult, HostBackend
+from .base import BackendPlugin
 
 
 @dataclass
@@ -113,7 +110,7 @@ class _BackendThread:
         raise value
 
 
-class MacOSVirtualizationBackend(HostBackend):
+class MacOSVirtualizationBackend(BackendPlugin):
     name = "macos-vz"
     kind = "macos-vz-arm64"
     display_name = "Virtualization.framework (macOS arm64)"
@@ -207,7 +204,7 @@ class MacOSVirtualizationBackend(HostBackend):
         use_pool: bool,
         use_pyroute2: bool,
         vm_id: str | None = None,
-    ) -> BackendBootResult:
+    ) -> BootResult:
         if template_id != DEFAULT_TEMPLATE_ID:
             raise NotImplementedError("Custom macOS templates are not implemented yet.")
 
@@ -252,24 +249,17 @@ class MacOSVirtualizationBackend(HostBackend):
         self._handles[vm_id] = handle
 
         total_ms = (time.monotonic() - t0) * 1000
-        return BackendBootResult(
+        return BootResult(
+            vm_id=vm_id,
             process=handle,
-            pid=handle.process_id,
             vm_dir=runtime_dir,
-            socket_path="",
-            ns_name="",
             guest_ip=handle.guest_ip,
             agent_url=f"http://{handle.guest_ip}:{AGENT_PORT}",
-            chroot_base="",
-            backend_vm_ref=vm_id,
-            runtime_dir=runtime_dir,
-            guest_arch="arm64",
-            transport_ref=f"tcp:{handle.guest_ip}:{AGENT_PORT}",
             timings={
                 "artifact_prepare_ms": total_ms,
             },
             t_total=t0,
-            backend_metadata={
+            metadata={
                 "boot_config_path": boot_config_path,
                 "machine_id_path": machine_id_path,
                 "console_log_path": console_log_path,
@@ -291,12 +281,12 @@ class MacOSVirtualizationBackend(HostBackend):
         from flint.core._wipe import wipe_tree
         wipe_tree(handle.runtime_dir, entry.vm_id)
 
-    def discard_paused(self, row: dict) -> None:
+    def discard_paused(self, row: Mapping) -> None:
         # The VM is stopped; its runtime directory holds its disk and saved state.
         from flint.core._wipe import wipe_tree
         wipe_tree(row.get("vm_dir") or "", row["vm_id"])
 
-    def pause(self, entry, state_store) -> None:
+    def pause(self, entry) -> str:
         handle = self._coerce_handle(entry)
         if handle is None:
             raise RuntimeError("macOS VM handle not found")
@@ -315,26 +305,12 @@ class MacOSVirtualizationBackend(HostBackend):
         self._runtime.call(lambda: self._stop_vm(handle))
         handle.close()
         self._handles.pop(entry.vm_id, None)
+        return handle.state_path
 
-        entry.state = SandboxState.PAUSED
-        entry.agent_healthy = False
-        entry.process = None
-        entry.pause_state_ref = handle.state_path
-
-        if state_store:
-            state_store.transition_state(entry.vm_id, SandboxState.PAUSED)
-            state_store.set_pause_snapshot(entry.vm_id, handle.state_path)
-
-    def resume(self, row: dict) -> BackendBootResult:
-        runtime_dir = row["vm_dir"]
-        boot_config_path = row.get("backend_meta_json")
-        if boot_config_path:
-            try:
-                meta = json.loads(boot_config_path)
-            except Exception:
-                meta = {}
-        else:
-            meta = {}
+    def resume(self, row: Mapping) -> BootResult:
+        row = SandboxRow.of(row)
+        runtime_dir = row.vm_dir
+        meta = row.backend_metadata
         boot_path = meta.get("boot_config_path") or os.path.join(runtime_dir, "boot.json")
         machine_id_path = meta.get("machine_id_path") or os.path.join(runtime_dir, "machine-id.bin")
         console_log_path = meta.get("console_log_path") or os.path.join(runtime_dir, "console.log")
@@ -360,17 +336,13 @@ class MacOSVirtualizationBackend(HostBackend):
             )
         )
         self._handles[row["vm_id"]] = handle
-        return BackendBootResult(
+        return BootResult(
+            vm_id=row.vm_id,
             process=handle,
-            pid=handle.process_id,
             vm_dir=runtime_dir,
             guest_ip=handle.guest_ip,
             agent_url=f"http://{handle.guest_ip}:{AGENT_PORT}",
-            backend_vm_ref=row["vm_id"],
-            runtime_dir=runtime_dir,
-            guest_arch="arm64",
-            transport_ref=f"tcp:{handle.guest_ip}:{AGENT_PORT}",
-            backend_metadata={
+            metadata={
                 "boot_config_path": boot_path,
                 "machine_id_path": machine_id_path,
                 "console_log_path": console_log_path,
@@ -378,86 +350,6 @@ class MacOSVirtualizationBackend(HostBackend):
                 "state_path": state_path,
             },
         )
-
-    async def bridge_terminal(self, entry, websocket) -> None:
-        await websocket.accept()
-
-        create_body = json.dumps({
-            "cmd": ["/bin/sh", "-i"],
-            "pty": True,
-            "cols": 120,
-            "rows": 40,
-        }).encode()
-        status, resp_body = await asyncio.get_event_loop().run_in_executor(
-            None,
-            self.proxy_guest_request,
-            entry,
-            "POST",
-            "/processes",
-            create_body,
-            65,
-        )
-        if status != 201:
-            await websocket.close(code=1011, reason="Failed to create PTY process")
-            return
-
-        proc_info = json.loads(resp_body)
-        guest_pid = proc_info["pid"]
-        loop = asyncio.get_event_loop()
-        closed = False
-
-        def _read_guest_ws():
-            nonlocal closed
-            try:
-                guest_ws_url = f"ws://{entry.guest_ip}:{AGENT_PORT}/processes/{guest_pid}/output"
-                guest_ws = ws_sync.connect(guest_ws_url)
-                for message in guest_ws:
-                    if closed:
-                        break
-                    try:
-                        ev = json.loads(message)
-                        if ev.get("type") in ("stdout", "stderr") and ev.get("data"):
-                            raw = base64.b64decode(ev["data"])
-                            asyncio.run_coroutine_threadsafe(websocket.send_bytes(raw), loop)
-                        elif ev.get("type") == "exit":
-                            break
-                    except Exception:
-                        pass
-                guest_ws.close()
-            except Exception:
-                pass
-
-        reader_thread = threading.Thread(target=_read_guest_ws, daemon=True)
-        reader_thread.start()
-
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/input",
-                    data,
-                    5,
-                )
-        except Exception:
-            pass
-        finally:
-            closed = True
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.proxy_guest_request,
-                    entry,
-                    "POST",
-                    f"/processes/{guest_pid}/signal",
-                    json.dumps({"signal": 9}).encode(),
-                    2,
-                )
-            except Exception:
-                pass
 
     def check_entry_alive(self, entry) -> tuple[bool, str | None]:
         handle = self._coerce_handle(entry)
@@ -481,8 +373,9 @@ class MacOSVirtualizationBackend(HostBackend):
         if handle is None or handle.pausing:
             return None
         files = {}
+        guest = self.guest(entry)
         for name in ("stat", "meminfo"):
-            status, body = self.proxy_guest_request(entry, "GET", f"/files?path=/proc/{name}", timeout=1)
+            status, body = guest.request("GET", f"/files?path=/proc/{name}", timeout=1)
             if status != 200:
                 return None
             files[name] = body.decode(errors="replace")
@@ -492,7 +385,7 @@ class MacOSVirtualizationBackend(HostBackend):
         mem = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in files["meminfo"].splitlines() if ":" in line)}
         return busy / 100, (mem["MemTotal"] - mem["MemAvailable"]) * 1024
 
-    def recover_row(self, row: dict):
+    def recover_row(self, row: Mapping):
         pause_state_ref = row.get("pause_state_ref")
         if pause_state_ref and os.path.exists(pause_state_ref):
             return "paused", None

@@ -273,7 +273,7 @@ open(sys.argv[1],"w").write(json.dumps({"requests":len(pauses),"resets":0,"failu
 
 def test_single_host_tenant_boundaries_and_peer_opt_in():
     """Exercise nftables, NAT and control-port exclusions with real TCP stacks."""
-    from flint.core import _netns as net
+    from flint.core.net import netns as net
     from flint.core._limits import network_limits
     from flint.core.config import GUEST_IP, GUEST_MAC, HOST_IP, HOST_TAP_MAC, BRIDGE_IP, PROXY_PORT
 

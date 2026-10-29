@@ -2,8 +2,8 @@
 
 import sys
 
-from flint.core._migration_network import MigrationNetwork
-from flint.core._netns import ensure_host_firewall
+from flint.core.net.migration_network import MigrationNetwork
+from flint.core.net.netns import ensure_host_firewall
 
 VM = "07ce885b-bf8a-41c3-a9c5-6dc9f09cba11"
 role = sys.argv[1]

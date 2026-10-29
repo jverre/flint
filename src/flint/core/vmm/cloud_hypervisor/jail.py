@@ -15,6 +15,9 @@ the daemon opens the TAP and passes the fd, so the VMM never needs
 CAP_NET_ADMIN, which would let it rewrite its namespace's firewall. Each VMM
 also gets its own cgroup and runs with ``--seccomp true``. The log lives outside
 the chroot so the VMM can't rewrite it.
+
+On a migration network (``FLINT_SHARED_ROOTFS_DIR``) the VMM opens its TAP
+itself, so the chroot then has ``/dev/net/tun``.
 """
 
 from __future__ import annotations
@@ -24,54 +27,43 @@ import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
+from typing import ClassVar
 
-from . import config
-from . import _cloud_hypervisor as _ch
-from ._artifacts import shared_readonly
-from ._jailfs import own
-from ._identities import vm_identity, release
-from .config import JAILER_BASE_DIR, JAILER_SHARED_DIR, log
-
-CH_JAIL_DIR = f"{JAILER_BASE_DIR}/cloud-hypervisor"
-CH_CGROUP_ROOT = f"/sys/fs/cgroup/{os.environ.get('FLINT_CH_PARENT_CGROUP', 'cloud-hypervisor')}"
+from ... import config
+from ...config import log
+from ..._artifacts import shared_readonly
+from ..common import stop_process
+from ..jail import Jail
+from . import api
 
 # Paths as the VMM sees them inside its chroot.
 JAIL_BINARY = "/cloud-hypervisor"
 JAIL_KERNEL = "/vmlinux"
 JAIL_ROOTFS = "/rootfs.ext4"
-JAIL_SOCKET = "/ch.sock"
+
+
+def jail_dir() -> str:
+    """Where every CH jail lives."""
+    return f"{config.JAILER_BASE_DIR}/cloud-hypervisor"
 
 
 @dataclass(frozen=True)
-class ChJail:
-    vm_id: str
-
-    @property
-    def identity(self) -> tuple[int, int]:
-        return vm_identity(self.vm_id)
+class CloudHypervisorJail(Jail):
+    SOCKET: ClassVar[str] = "/ch.sock"
+    LOG_NAME: ClassVar[str] = "cloud-hypervisor.log"
 
     @property
     def base(self) -> str:
-        return f"{CH_JAIL_DIR}/{self.vm_id}"
-
-    @property
-    def root(self) -> str:
-        return f"{self.base}/root"
-
-    @property
-    def socket_path(self) -> str:
-        return self.host_path(JAIL_SOCKET)
-
-    @property
-    def log_path(self) -> str:
-        return f"{self.base}/cloud-hypervisor.log"
+        return f"{jail_dir()}/{self.vm_id}"
 
     @property
     def cgroup(self) -> str:
-        return f"{CH_CGROUP_ROOT}/{self.vm_id}"
+        return f"/sys/fs/cgroup/{config.CH_PARENT_CGROUP}/{self.vm_id}"
 
-    def host_path(self, jail_path: str) -> str:
-        return self.root + jail_path
+    @property
+    def shared_disk_marker(self) -> str:
+        """Present while the root disk is a bind mount of a shared disk; outside the chroot."""
+        return f"{self.base}/shared-rootfs"
 
     def prepare(self) -> None:
         """Create the chroot with the VMM binary, kernel and device nodes."""
@@ -81,25 +73,14 @@ class ChJail:
         os.mknod(kvm, 0o600 | stat.S_IFCHR, os.makedev(10, 232))
         os.chown(kvm, *self.identity)
         os.mknod(self.host_path("/dev/urandom"), 0o444 | stat.S_IFCHR, os.makedev(1, 9))
-        if os.environ.get("FLINT_SHARED_ROOTFS_DIR"):
+        if config.SHARED_ROOTFS_DIR:
             os.mkdir(self.host_path("/dev/net"))
             os.mknod(self.host_path("/dev/net/tun"), 0o600 | stat.S_IFCHR, os.makedev(10, 200))
             os.chown(self.host_path("/dev/net/tun"), *self.identity)
-        os.link(shared_readonly(_ch_binary(), JAILER_SHARED_DIR, mode=0o555), self.host_path(JAIL_BINARY))
-        os.link(shared_readonly(config.KERNEL_PATH, JAILER_SHARED_DIR), self.host_path(JAIL_KERNEL))
-
-    def give(self, jail_path: str) -> str:
-        """Make a file or directory in the chroot owned and writable by the VMM. Returns its host path."""
-        path = self.host_path(jail_path)
-        own(path, *self.identity, 0o700 if os.path.isdir(path) else 0o600)
-        return path
-
-    def link_shared(self, src: str, jail_path: str) -> None:
-        """Hard-link a read-only artifact shared by all VMs into the chroot."""
-        os.link(shared_readonly(src, JAILER_SHARED_DIR), self.host_path(jail_path))
+        os.link(shared_readonly(_ch_binary(), config.JAILER_SHARED_DIR, mode=0o555), self.host_path(JAIL_BINARY))
+        os.link(shared_readonly(config.KERNEL_PATH, config.JAILER_SHARED_DIR), self.host_path(JAIL_KERNEL))
 
     def spawn(self, ns_name: str, *, vcpus: int | None = None, memory_mib: int | None = None) -> subprocess.Popen:
-        """Start the jailed VMM and wait for its API socket."""
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -109,7 +90,7 @@ class ChJail:
             "ip", "netns", "exec", ns_name,
             "setpriv", "--no-new-privs", "--",
             "chroot", f"--userspec={uid}:{uid}", "--groups=", self.root,
-            JAIL_BINARY, "--api-socket", f"path={JAIL_SOCKET}", "--seccomp", "true",
+            JAIL_BINARY, "--api-socket", f"path={self.SOCKET}", "--seccomp", "true",
         ]
         with open(self.log_path, "a") as log_fd:
             process = subprocess.Popen(
@@ -118,36 +99,34 @@ class ChJail:
             )
         try:
             self._enter_cgroup(process.pid, vcpus=vcpus, memory_mib=memory_mib)
-            _ch.wait_for_api_socket(self.socket_path, process=process, log_path=self.log_path)
-        except Exception:
-            process.kill()
-            process.wait(timeout=2)
+            api.wait_for_api_socket(self.socket_path, process=process, log_path=self.log_path)
+        except BaseException:
+            stop_process(process)
             raise
         return process
 
     def _enter_cgroup(self, pid: int, *, vcpus: int | None = None, memory_mib: int | None = None) -> None:
-        from ._limits import cgroup_limits
+        from ..._limits import attach_process, cgroup_limits
         cgroup_limits(self.cgroup, self.host_path(JAIL_ROOTFS), vcpus=vcpus or config.CH_CPU_COUNT,
                       memory_mib=memory_mib or config.CH_MEMORY_BYTES // (1 << 20), vmm_disk_limit=True)
         # ip/setpriv/chroot exec into the VMM, so the pid is the VMM's for its lifetime.
         if config.JAILER_CGROUP_VER != 2:
             log.warning("cloud-hypervisor jail: cgroup v1 not supported, VMM %s runs without its own cgroup", self.vm_id[:8])
             return
-        from ._limits import attach_process
         attach_process(self.cgroup, pid)
 
     def cleanup(self) -> None:
-        from ._limits import stop_processes
+        from ..._identities import release
+        from ..._limits import stop_processes
+        from ..._wipe import wipe_tree
         stop_processes(self.cgroup)
-        marker = f"{self.base}/shared-rootfs"
-        if os.path.exists(marker):
+        if os.path.exists(self.shared_disk_marker):
             target = self.host_path(JAIL_ROOTFS)
             # Never lazily unmount a disk a VMM might still be using.
             if subprocess.run(["mountpoint", "-q", target]).returncode == 0:
                 subprocess.run(["umount", target], check=True, capture_output=True, timeout=30)
-            os.unlink(marker)
+            os.unlink(self.shared_disk_marker)
         # Wipe only once the shared disk is unmounted: it isn't this jail's to wipe.
-        from ._wipe import wipe_tree
         wipe_tree(self.base, self.vm_id)
         try:
             os.rmdir(self.cgroup)
