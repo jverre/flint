@@ -103,4 +103,4 @@ If you set `allow_internet_access=False`, the namespace has no veth: the VM can 
 
 ## Implementation
 
-Networking is set up in `src/flint/core/_netns.py`, and the pool lives in `src/flint/core/_netns_pool.py`. By default Flint uses [pyroute2](https://pyroute2.org/) to create and configure the namespace, but you can fall back to shell commands with `use_pyroute2=False` if pyroute2 isn't available. Both paths apply the same isolation rules.
+Networking is set up in `src/flint/core/net/netns.py`, and the pool lives in `src/flint/core/net/netns_pool.py`. By default Flint uses [pyroute2](https://pyroute2.org/) to create and configure the namespace, but you can fall back to shell commands with `use_pyroute2=False` if pyroute2 isn't available. Both paths apply the same isolation rules.

@@ -23,10 +23,14 @@ Plus a lifecycle method set:
 - `install_dependencies(**kwargs)` — optional hook for fetching binaries.
 - `ensure_runtime_ready()` — one-time host setup (e.g. create the `br-flint` bridge on Linux).
 - `ensure_default_template()` — build or register the default template on daemon startup.
-- `create`, `kill`, `pause`, `resume`, `recover_row` — per-sandbox lifecycle.
+- `create`, `kill`, `pause`, `resume`, `recover_row` — per-sandbox lifecycle. `create` and `resume` return a `BootResult`; anything the backend needs to find the VM again goes in its opaque `metadata`.
 - `build_template`, `delete_template_artifact` — template operations.
 
-See `src/flint/core/backends/base.py` in the repo for the full ABC.
+Backends only drive the hypervisor. `SandboxManager` owns sandbox state: it records every transition (created, paused, resumed, deleted) in the state store, so a backend's `pause()` just saves the VM and returns where its state is.
+
+What a backend can do is declared with capability flags (`supports_network_policy`, `supports_tenant_networks`, `supports_live_migration`), which the manager checks instead of the backend's `kind`. Talking to the guest agent (exec, files, the PTY terminal) is shared: every backend only provides `connect_guest(entry)`, and `flint.core.guest` does the rest.
+
+See `src/flint/core/backends/base.py` in the repo for the full ABC. The two Linux backends share `LinuxVmmBackend` (`backends/linux.py`): pooling, kill, pause, recovery and cgroup confinement are written once, and each hypervisor supplies its boot/resume/snapshot code and its jail from `flint.core.vmm.firecracker` or `flint.core.vmm.cloud_hypervisor`.
 
 ## Registration and discovery
 
@@ -50,7 +54,7 @@ At daemon startup the registry picks one backend:
 1. If `--backend` or `FLINT_BACKEND` is set, use that one (error if not installed).
 2. Otherwise pick the first backend whose `supported_platforms` match the host. On Linux that's Firecracker (it's registered first); on macOS it's macOS-VZ.
 
-The chosen backend is carried on `SandboxManager._backend` and its `kind` is persisted on every state-store row, so recovery after a daemon crash can route each row to the right backend.
+The chosen backend is carried on `SandboxManager.backend` and its `kind` is persisted on every state-store row, so recovery after a daemon crash can route each row to the right backend.
 
 ## Shipped backends
 
