@@ -37,9 +37,9 @@ func TestCleanPathRejectsTraversal(t *testing.T) {
 		{"..", ""},
 		{"../../etc/passwd", ""},
 		{"foo/../../../bar", ""},
-		{"a/b/../c", "a/c"},      // normalised but stays within root
-		{"a/./b", "a/b"},         // dot collapsed
-		{"/a/b/c/", "a/b/c"},    // leading + trailing slashes
+		{"a/b/../c", "a/c"},  // normalised but stays within root
+		{"a/./b", "a/b"},     // dot collapsed
+		{"/a/b/c/", "a/b/c"}, // leading + trailing slashes
 		{"../", ""},
 		{"foo/../../..", ""},
 	}

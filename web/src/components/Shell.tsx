@@ -1,8 +1,8 @@
 // App frame: full-height sidebar, centred search, page outlet.
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { recentVMs, useHosts, useIsAdmin, usePlatform, useSession, useTemplates, useVms } from "../api/hooks";
-import { api, getToken, setToken } from "../api/client";
+import { recentVMs, signOut, useHosts, useIsAdmin, usePlatform, useSession, useTemplates, useVms } from "../api/hooks";
+import { getToken, setToken } from "../api/client";
 import { cubeSVG, token } from "../kit/svg";
 import { dispatchPageKey, isTyping, keyName, type KeyHint } from "../kit/keys";
 import { stateLabel } from "../kit/format";
@@ -168,7 +168,7 @@ function ConnMenu({ onClose }: { onClose: () => void }) {
       <div className="msep" />
       {plat?.mock && <button className="mi" role="menuitem" onClick={() => { sessionStorage.removeItem("flint.mock"); location.href = location.pathname + "?live"; }}><Icon k="out" /><span className="grow">Leave demo data</span></button>}
       {session && <div className="mi" style={{ cursor: "default" }}><span className="grow">{session.identity.replace(/^[^:]*:/, "")}<small>{session.kind}{session.tenants.length ? ` · ${session.tenants.join(", ")}` : ""}</small></span></div>}
-      {session && <button className="mi" role="menuitem" onClick={async () => { await api.post("/auth/logout").catch(() => undefined); location.reload(); }}><Icon k="out" /><span className="grow">Sign out</span></button>}
+      {session && <button className="mi" role="menuitem" onClick={async () => { await signOut().catch(() => undefined); location.reload(); }}><Icon k="out" /><span className="grow">Sign out</span></button>}
       {!session && getToken() && <button className="mi" role="menuitem" onClick={() => { setToken(""); location.reload(); }}><Icon k="out" /><span className="grow">Sign out<small>forget the API token in this browser</small></span></button>}
     </div>
   );

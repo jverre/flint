@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strconv"
 
 	"github.com/gorilla/websocket"
 )
@@ -14,14 +13,8 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleProcessOutput(w http.ResponseWriter, r *http.Request) {
-	pid, err := strconv.Atoi(r.PathValue("pid"))
-	if err != nil {
-		http.Error(w, `{"error":"invalid pid"}`, http.StatusBadRequest)
-		return
-	}
-	h, err := requireProcess(pid)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+	h, ok := requestProcess(w, r)
+	if !ok {
 		return
 	}
 

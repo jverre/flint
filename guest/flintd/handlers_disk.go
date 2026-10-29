@@ -90,7 +90,7 @@ func handleDiskDetach(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	writeOK(w)
 }
 
 const (
@@ -124,17 +124,6 @@ func handleFreeze(freeze bool) http.HandlerFunc {
 			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("%s: %v", req.Path, errno))
 			return
 		}
-		writeJSON(w, map[string]bool{"ok": true})
+		writeOK(w)
 	}
-}
-
-func jsonError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
 }

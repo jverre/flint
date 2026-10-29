@@ -1,7 +1,5 @@
 import { useMemo } from "react";
-import { useEvents, useIsCluster, useMetrics, useProcesses } from "../../api/hooks";
-import { useQuery } from "@tanstack/react-query";
-import { api } from "../../api/client";
+import { useEvents, useIsCluster, useMetrics, useProcesses, useVmTimeline } from "../../api/hooks";
 import type { FlintEvent, VM } from "../../api/types";
 import { Feed, Sec, type FeedItem } from "../../components/ui";
 import { fmtClock, fmtMs } from "../../kit/format";
@@ -64,7 +62,7 @@ function Processes({ vm, running }: { vm: VM; running: boolean }) {
                   <td className="num">{x.pid ?? "—"}</td>
                   <td className="vm-cmd" title={cmdText(x.cmd)}>{cmdText(x.cmd) || <span className="dim">—</span>}{x.pty ? <span className="dim"> · pty</span> : null}</td>
                   <td>{x.tag ? <span className="tag dim">{x.tag}</span> : <span className="dim">—</span>}</td>
-                  <td>{x.running === undefined ? <span className="dim">—</span> : x.running ? "yes" : <span className="dim">exited{x.exit_code != null ? ` (${x.exit_code})` : ""}</span>}</td>
+                  <td>{!x.exited ? "yes" : <span className="dim">exited{x.exit_code != null ? ` (${x.exit_code})` : ""}</span>}</td>
                 </tr>
               ))}
             </tbody>
@@ -133,20 +131,7 @@ function evText(e: FlintEvent): string {
 function useVmEvents(id: string) {
   const cluster = useIsCluster();
   const live = useEvents().events;
-  const hist = useQuery<FlintEvent[]>({
-    queryKey: ["vm-events", id], retry: false, staleTime: Infinity,
-    queryFn: async () => {
-      // The timeline is oldest-first, a page at a time: page forward (bounded) so the newest are included.
-      let since = 0, all: FlintEvent[] = [];
-      for (let i = 0; i < 6; i++) {
-        const r = await api.get<{ events: FlintEvent[]; next: number }>(`/vms/${id}/timeline`, { query: { since, limit: 1000 } });
-        all = all.concat(r.events);
-        if (r.events.length < 1000) break;
-        since = r.next;
-      }
-      return all;
-    },
-  });
+  const hist = useVmTimeline(id);
   const items = useMemo(() => {
     const seen = new Set<string>(), out: { e: FlintEvent; k: string; fresh: boolean }[] = [];
     for (const e of live) if (e.vm_id === id) { const k = `${e.type}|${e.ts}`; if (!seen.has(k)) { seen.add(k); out.push({ e, k: e._k, fresh: false }); } }

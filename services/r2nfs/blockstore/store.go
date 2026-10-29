@@ -47,9 +47,22 @@ type Remote interface {
 	PutObject(ctx context.Context, key string, data []byte) error
 }
 
-func hashKey(prefix string, data []byte) string {
+// A key is "<kind>/<sha256 of the content>": a LocalStore keeps each kind
+// of object in a directory of that name.
+const (
+	chunkKind = "chunks"
+	layerKind = "layers"
+)
+
+// objectKinds lists every kind of object, for garbage collection.
+var objectKinds = []string{chunkKind, layerKind}
+
+// tempPrefix names a LocalStore's files that are still being written.
+const tempPrefix = ".put-"
+
+func hashKey(kind string, data []byte) string {
 	sum := sha256.Sum256(data)
-	return prefix + hex.EncodeToString(sum[:])
+	return kind + "/" + hex.EncodeToString(sum[:])
 }
 
 func validKey(key string) error {
@@ -87,7 +100,7 @@ func (s *LocalStore) Put(key string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".put-*")
+	tmp, err := os.CreateTemp(filepath.Dir(p), tempPrefix+"*")
 	if err != nil {
 		return err
 	}

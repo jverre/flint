@@ -49,13 +49,10 @@ func TestCollectGarbageKeepsOnlySharedChunks(t *testing.T) {
 	if err := os.Link(bitmap, bitmap+".retired"); err != nil {
 		t.Fatal(err)
 	}
-	if err := blockstore.PrepareDelete(filepath.Join(dir, "base")); err != nil {
+	if _, err := blockstore.Delete(filepath.Join(dir, "base")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wipeAll(filepath.Join(dir, "base")); err != nil {
-		t.Fatal(err)
-	}
-	removed, _, err := collectGarbage(dir, store, storeDir, nil)
+	removed, _, err := collectGarbage(dir, store, store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

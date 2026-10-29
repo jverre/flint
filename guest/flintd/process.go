@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -25,10 +26,6 @@ type multiplexedChannel struct {
 	mu        sync.RWMutex
 	consumers []chan outputEvent
 	closed    bool
-}
-
-func newMultiplexedChannel() *multiplexedChannel {
-	return &multiplexedChannel{}
 }
 
 func (mc *multiplexedChannel) fork() <-chan outputEvent {
@@ -71,14 +68,27 @@ type processHandler struct {
 	tag       string
 	isPty     bool
 	cmd       *exec.Cmd
-	ptyFile   *os.File              // master side (PTY mode)
-	stdinPipe io.WriteCloser        // pipe mode
-	stdinMu   sync.Mutex            // guards stdinPipe writes
+	ptyFile   *os.File       // master side (PTY mode)
+	stdinPipe io.WriteCloser // pipe mode
+	stdinMu   sync.Mutex     // guards stdinPipe writes
 	data      *multiplexedChannel
-	earlyCh   <-chan outputEvent     // pre-forked consumer (used by /exec)
-	exitCode  *int
+	exitCode  atomic.Pointer[int] // set once the process has exited
 	cancel    context.CancelFunc
-	done      chan struct{}          // closed when process exits
+}
+
+// processInfo describes a process in GET /processes replies.
+type processInfo struct {
+	PID      int      `json:"pid"`
+	Tag      string   `json:"tag"`
+	Pty      bool     `json:"pty"`
+	Cmd      []string `json:"cmd"`
+	Exited   bool     `json:"exited"`
+	ExitCode *int     `json:"exit_code,omitempty"` // only once exited
+}
+
+func (h *processHandler) info() processInfo {
+	code := h.exitCode.Load()
+	return processInfo{PID: h.pid, Tag: h.tag, Pty: h.isPty, Cmd: h.cmd.Args, Exited: code != nil, ExitCode: code}
 }
 
 // startProcessRequest contains the parameters for starting a new process.
@@ -92,22 +102,20 @@ type startProcessRequest struct {
 	Tag  string            `json:"tag,omitempty"`
 }
 
-// startProcess creates and starts a new process. If earlySubscribe is true,
-// a consumer channel is forked before readers start (prevents race for fast commands).
-// The channel is returned as the second value (nil if earlySubscribe is false).
+// startProcess creates and starts a new process.
 func startProcess(req startProcessRequest) (*processHandler, error) {
-	return startProcessWithOptions(req, false)
+	h, _, err := startProcessWithOptions(req, false)
+	return h, err
 }
 
+// startProcessSubscribed starts a process and returns a consumer of its
+// output forked before any is read, so a command that exits at once can't
+// finish before the caller is listening.
 func startProcessSubscribed(req startProcessRequest) (*processHandler, <-chan outputEvent, error) {
-	h, err := startProcessWithOptions(req, true)
-	if err != nil {
-		return nil, nil, err
-	}
-	return h, h.earlyCh, nil
+	return startProcessWithOptions(req, true)
 }
 
-func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*processHandler, error) {
+func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*processHandler, <-chan outputEvent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cmd := exec.CommandContext(ctx, req.Cmd[0], req.Cmd[1:]...)
@@ -125,14 +133,13 @@ func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*pro
 		tag:    req.Tag,
 		isPty:  req.Pty,
 		cmd:    cmd,
-		data:   newMultiplexedChannel(),
+		data:   &multiplexedChannel{},
 		cancel: cancel,
-		done:   make(chan struct{}),
 	}
 
-	// Pre-fork a consumer before readers start to avoid missing output from fast commands
+	var early <-chan outputEvent
 	if earlySubscribe {
-		h.earlyCh = h.data.fork()
+		early = h.data.fork()
 	}
 
 	var readersWg sync.WaitGroup
@@ -153,7 +160,7 @@ func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*pro
 		})
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, nil, err
 		}
 		h.ptyFile = ptmx
 		h.pid = cmd.Process.Pid
@@ -170,23 +177,23 @@ func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*pro
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, nil, err
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, nil, err
 		}
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, nil, err
 		}
 		h.stdinPipe = stdin
 
 		if err := cmd.Start(); err != nil {
 			cancel()
-			return nil, err
+			return nil, nil, err
 		}
 		h.pid = cmd.Process.Pid
 
@@ -200,6 +207,10 @@ func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*pro
 			h.readLoop("stderr", stderr, 32768)
 		}()
 	}
+
+	// Registered before the wait goroutine starts, as that removes it on
+	// exit: otherwise a fast command would stay listed forever.
+	pm.add(h)
 
 	// Wait goroutine: wait for readers to drain BEFORE sending exit event
 	go func() {
@@ -215,22 +226,19 @@ func startProcessWithOptions(req startProcessRequest, earlySubscribe bool) (*pro
 				code = -1
 			}
 		}
-		h.exitCode = &code
+		h.exitCode.Store(&code)
 		h.data.send(outputEvent{Type: "exit", Code: &code})
 		h.data.close()
 		if h.ptyFile != nil {
 			h.ptyFile.Close()
 		}
-		close(h.done)
-		// Auto-remove from manager after exit
 		pm.remove(h.pid)
 	}()
 
 	// Set OOM score for the child
 	go setOOMScore(h.pid)
 
-	pm.add(h)
-	return h, nil
+	return h, early, nil
 }
 
 func (h *processHandler) readLoop(stream string, r io.Reader, chunkSize int) {
@@ -275,20 +283,6 @@ func (h *processHandler) resize(cols, rows uint16) error {
 	return pty.Setsize(h.ptyFile, &pty.Winsize{Cols: cols, Rows: rows})
 }
 
-func (h *processHandler) toJSON() map[string]any {
-	result := map[string]any{
-		"pid":   h.pid,
-		"tag":   h.tag,
-		"pty":   h.isPty,
-		"cmd":   h.cmd.Args,
-		"exited": h.exitCode != nil,
-	}
-	if h.exitCode != nil {
-		result["exit_code"] = *h.exitCode
-	}
-	return result
-}
-
 func setOOMScore(pid int) {
 	path := "/proc/" + strconv.Itoa(pid) + "/oom_score_adj"
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -298,9 +292,3 @@ func setOOMScore(pid int) {
 	defer f.Close()
 	f.WriteString("500")
 }
-
-// waitDone blocks until the process exits.
-func (h *processHandler) waitDone() {
-	<-h.done
-}
-

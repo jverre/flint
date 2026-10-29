@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -36,7 +37,8 @@ import (
 type ImageManager struct {
 	dir        string // image directories: dir/<id>
 	store      blockstore.Store
-	volumesDir string // image <id> is mounted at volumesDir/<id>
+	local      *blockstore.LocalStore // store's local part, at dir/store
+	volumesDir string                 // image <id> is mounted at volumesDir/<id>
 
 	servingNBD atomic.Bool // sandboxes can attach exports
 
@@ -82,7 +84,7 @@ func newImageManager(dir, volumesDir string, remote blockstore.Remote) (*ImageMa
 		store = &blockstore.TieredStore{Local: local, Remote: prefixedRemote{"blocks/", remote}}
 	}
 	m := &ImageManager{
-		dir: dir, store: store, volumesDir: volumesDir,
+		dir: dir, store: store, local: local, volumesDir: volumesDir,
 		attached: map[string]*attachment{}, exported: map[string]*sharedImage{}, exports: map[string]*nbdExport{},
 	}
 	go m.flushLoop()
@@ -273,7 +275,7 @@ func unmountAndWait(path, dev string) {
 }
 
 // Delete removes image id (unmounting it first), wiping its overlay and the
-// chunks and layers no other image shares (see wipe.go).
+// chunks and layers no other image shares (see blockstore/wipe.go).
 func (m *ImageManager) Delete(id string) error {
 	m.mu.Lock()
 	exported := m.exported[id] != nil
@@ -284,10 +286,7 @@ func (m *ImageManager) Delete(id string) error {
 	m.Unmount(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := blockstore.PrepareDelete(m.imageDir(id)); err != nil {
-		return err
-	}
-	wiped, err := wipeAll(m.imageDir(id))
+	wiped, err := blockstore.Delete(m.imageDir(id))
 	if err != nil {
 		return err
 	}
@@ -298,13 +297,49 @@ func (m *ImageManager) Delete(id string) error {
 	for _, sh := range m.exported {
 		open = append(open, sh.img.Manifest())
 	}
-	n, freed, err := collectGarbage(m.dir, m.store, filepath.Join(m.dir, "store"), open)
+	n, freed, err := collectGarbage(m.dir, m.store, m.local, open)
 	if err != nil {
 		return fmt.Errorf("image %s: collecting unshared chunks failed; retry deletion: %w", id, err)
-	} else {
-		log.Printf("Deleted image %s: wiped %d bytes of overlay, %d unshared objects (%d bytes)", id, wiped, n, freed)
 	}
+	log.Printf("Deleted image %s: wiped %d bytes of overlay, %d unshared objects (%d bytes)", id, wiped, n, freed)
 	return nil
+}
+
+// collectGarbage wipes and removes the objects in local that no image under
+// imagesDir references, nor any of open (the manifests of images open in
+// memory). It keeps everything if it can't read every image's references.
+// It must not run while an image is being created or snapshotted.
+func collectGarbage(imagesDir string, store blockstore.Store, local *blockstore.LocalStore, open []blockstore.Manifest) (removed int, freed int64, err error) {
+	manifests := append([]blockstore.Manifest(nil), open...)
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, e := range entries {
+		dir := filepath.Join(imagesDir, e.Name())
+		if !e.IsDir() || dir == filepath.Clean(local.Dir) {
+			continue
+		}
+		m, err := blockstore.ReadManifest(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // not an image
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		manifests = append(manifests, m)
+	}
+	keep := map[string]bool{}
+	for _, m := range manifests {
+		refs, err := blockstore.References(store, m)
+		if err != nil {
+			return 0, 0, err
+		}
+		for k := range refs {
+			keep[k] = true
+		}
+	}
+	return local.Collect(keep)
 }
 
 // Export lets clientIP attach image imageID over NBD as export name. A

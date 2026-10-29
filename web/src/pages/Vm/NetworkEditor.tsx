@@ -2,9 +2,8 @@
 // Header values are write-only: existing ones are never shown, and an empty
 // field keeps the current value, but only while its domain and name are unchanged.
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { api } from "../../api/client";
-import { invalidateVMs } from "../../api/hooks";
+import { useState } from "react";
+import { invalidateVMs, setNetworkPolicy, useNetworkPolicy } from "../../api/hooks";
 import type { NetworkPolicy, VM } from "../../api/types";
 import { useToast } from "../../components/ui";
 import { errMsg } from "./common";
@@ -61,18 +60,17 @@ function toPolicy(rows: Row[], values: Values): NetworkPolicy {
 }
 
 export default function NetworkEditor({ vm, onDone }: { vm: VM; onDone: () => void }) {
+  const policy = useNetworkPolicy(vm.id);
+  if (policy.isError) return <p className="vm-strip-err" role="alert">{errMsg(policy.error)}</p>;
+  if (!policy.isSuccess) return <p className="dim">Loading…</p>;
+  return <PolicyForm vm={vm} initial={policy.data} onDone={onDone} />;
+}
+
+function PolicyForm({ vm, initial, onDone }: { vm: VM; initial: NetworkPolicy | null; onDone: () => void }) {
   const toast = useToast(), qc = useQueryClient();
-  const [state, setState] = useState<{ rows: Row[]; values: Values } | null>(null);
-  const [loadErr, setLoadErr] = useState("");
+  // Edits start from the policy as loaded; a later refetch doesn't discard them.
+  const [state, setState] = useState(() => load(initial));
   const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    let live = true;
-    api.get<{ network_policy: NetworkPolicy | null }>(`/vms/${vm.id}/network-policy`)
-      .then((r) => live && setState(load(r.network_policy)), (e) => live && setLoadErr(errMsg(e)));
-    return () => { live = false; };
-  }, [vm.id]);
-  if (loadErr) return <p className="vm-strip-err" role="alert">{loadErr}</p>;
-  if (!state) return <p className="dim">Loading…</p>;
 
   const { rows, values } = state;
   const set = (next: Row[]) => setState({ rows: next, values });
@@ -82,7 +80,7 @@ export default function NetworkEditor({ vm, onDone }: { vm: VM; onDone: () => vo
   const save = async () => {
     setBusy(true);
     try {
-      await api.put(`/vms/${vm.id}/network-policy`, { body: toPolicy(rows, values) });
+      await setNetworkPolicy(vm.id, toPolicy(rows, values));
       toast("Network policy saved.");
       invalidateVMs(qc, vm.id);
       onDone();

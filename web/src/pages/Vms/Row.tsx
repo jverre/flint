@@ -13,6 +13,7 @@ const subText = (v: VM) =>
   : v.state === "error" ? <small className="errc">failed</small>
   : v.state === "lost" ? <small className="wrn">lost</small>
   : v.state === "paused" ? <small>paused</small>
+  : v.state === "unknown" ? <small className="dim" title={`state: ${v.raw.cluster_state || v.raw.state}`}>unknown state</small>
   : <small>{v.template}</small>;
 
 export interface RowProps {

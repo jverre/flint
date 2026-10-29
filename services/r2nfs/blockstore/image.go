@@ -283,7 +283,7 @@ func (img *Image) Snapshot() (Manifest, error) {
 			l.Chunks[idx] = zeroChunk
 			continue
 		}
-		key := hashKey("chunks/", data)
+		key := hashKey(chunkKind, data)
 		if err := img.store.Put(key, data); err != nil {
 			return Manifest{}, err
 		}
@@ -297,7 +297,7 @@ func (img *Image) Snapshot() (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	key := hashKey("layers/", data)
+	key := hashKey(layerKind, data)
 	if err := img.store.Put(key, data); err != nil {
 		return Manifest{}, err
 	}
@@ -408,7 +408,7 @@ func writeFileAtomic(path string, data []byte) error {
 			return currentErr
 		}
 		if currentErr != nil || !os.SameFile(old, current) {
-			if _, err := WipeFile(retired); err != nil {
+			if _, err := wipeFile(retired); err != nil {
 				return err
 			}
 		}
@@ -452,7 +452,7 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := dir.Sync(); err != nil {
 		return err
 	}
-	if _, err := WipeFile(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if _, err := wipeFile(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	if err := os.Remove(retired); err != nil && !errors.Is(err, fs.ErrNotExist) {

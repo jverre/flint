@@ -1,7 +1,9 @@
 // Wire types (as returned by the daemon / control plane) and the normalised shapes pages use.
-// Contract: flint-design/API-CONTRACT.md (daemon src/flint/daemon/server.py, cluster cluster/internal/server).
+// There is no separate contract document: the source of truth is the servers themselves, i.e. the
+// daemon (src/flint/daemon/server.py, which relays guest-agent replies from guest/flintd unchanged)
+// and the control plane (cluster/internal/server). Keep these types in step with them.
 
-export type RawState = "Starting" | "Started" | "Running" | "Paused" | "Error" | "Dead" | "Migrating" | "Recovering" | "Lost" | string;
+export type RawState = "Starting" | "Started" | "Running" | "Paused" | "Error" | "Deleting" | "Dead" | "Migrating" | "Recovering" | "Lost" | string;
 
 export interface RawVM {
   vm_id: string;
@@ -34,7 +36,8 @@ export interface NetworkPolicy {
   [k: string]: unknown;
 }
 
-export type VMState = "running" | "paused" | "starting" | "error" | "stopped" | "migrating" | "recovering" | "lost";
+/** "unknown": a state this UI doesn't know (a newer server); shown as such, never as a failure. */
+export type VMState = "running" | "paused" | "starting" | "error" | "stopped" | "deleting" | "migrating" | "recovering" | "lost" | "unknown";
 
 export interface VM {
   id: string;
@@ -115,5 +118,8 @@ export interface Token { id: string; kind: "admin" | "service"; tenants: string[
 
 export interface FlintEvent { type: string; ts: number; vm_id?: string; host_id?: string; tenant?: string; vm?: RawVM; from?: string; to?: string; [k: string]: unknown }
 
-export interface ProcessInfo { pid: number; cmd?: string[] | string; tag?: string; pty?: boolean; running?: boolean; exit_code?: number | null; [k: string]: unknown }
+/** A process the guest agent started (guest/flintd/process.go `processInfo`), relayed as is.
+ *  The agent forgets a process once it exits, so listed ones are almost always `exited: false`. */
+export interface ProcessInfo { pid: number; tag: string; pty: boolean; cmd: string[]; exited: boolean; exit_code?: number }
+/** An entry of GET /vms/{id}/files/list (guest/flintd/handlers_files.go `fileInfo`). */
 export interface FileEntry { name: string; size: number; is_dir: boolean; mode: string }

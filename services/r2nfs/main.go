@@ -157,15 +157,21 @@ func isValidID(s string) bool {
 	return true
 }
 
-func writeJSONError(w http.ResponseWriter, status int, err error) {
+// The management API replies JSON: {"ok":true}, or {"error": msg} with an
+// HTTP error status.
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }
 
 func writeOK(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // registerImageRoutes adds the image API; without images every call is 503.
@@ -173,12 +179,12 @@ func registerImageRoutes(mux *http.ServeMux, images *ImageManager) {
 	withImage := func(h func(w http.ResponseWriter, r *http.Request, id string)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if images == nil {
-				writeJSONError(w, http.StatusServiceUnavailable, fmt.Errorf("image-backed volumes are not enabled"))
+				writeJSONError(w, http.StatusServiceUnavailable, "image-backed volumes are not enabled")
 				return
 			}
 			id := r.PathValue("id")
 			if !isValidID(id) {
-				writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid image id"))
+				writeJSONError(w, http.StatusBadRequest, "invalid image id")
 				return
 			}
 			h(w, r, id)
@@ -191,29 +197,29 @@ func registerImageRoutes(mux *http.ServeMux, images *ImageManager) {
 			ReadOnly bool   `json:"readonly"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid json"))
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if req.From != "" && !isValidID(req.From) {
-			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid source image"))
+			writeJSONError(w, http.StatusBadRequest, "invalid source image")
 			return
 		}
 		if err := images.Create(id, req.Size, req.From, req.ReadOnly); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err)
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeOK(w)
 	}))
 	mux.HandleFunc("DELETE /images/{id}", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
 		if err := images.Delete(id); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeOK(w)
 	}))
 	mux.HandleFunc("POST /images/{id}/mount", withImage(func(w http.ResponseWriter, r *http.Request, id string) {
 		if err := images.Mount(id); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeOK(w)
@@ -230,15 +236,15 @@ func registerImageRoutes(mux *http.ServeMux, images *ImageManager) {
 			ReadOnly bool   `json:"readonly"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("invalid json"))
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if !isValidID(req.Image) || net.ParseIP(req.ClientIP) == nil {
-			writeJSONError(w, http.StatusBadRequest, fmt.Errorf("image and client_ip are required"))
+			writeJSONError(w, http.StatusBadRequest, "image and client_ip are required")
 			return
 		}
 		if err := images.Export(name, req.Image, req.ClientIP, req.ReadOnly); err != nil {
-			writeJSONError(w, http.StatusConflict, err)
+			writeJSONError(w, http.StatusConflict, err.Error())
 			return
 		}
 		writeOK(w)
@@ -259,8 +265,7 @@ func newMgmtHandler(exports *ExportManager, volumes *VolumeManager, images *Imag
 
 // serveMgmtAPI runs a small HTTP server for managing NFS exports.
 func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager, images *ImageManager) {
-	mux := http.NewServeMux()
-	registerMgmtRoutes(mux, exports, volumes, images)
+	handler := newMgmtHandler(exports, volumes, images)
 	log.Printf("Management API on %s", addr)
 	var listener net.Listener
 	var err error
@@ -276,7 +281,7 @@ func serveMgmtAPI(addr string, exports *ExportManager, volumes *VolumeManager, i
 	if err != nil {
 		log.Fatalf("management listener: %v", err)
 	}
-	if err := http.Serve(listener, mux); err != nil {
+	if err := http.Serve(listener, handler); err != nil {
 		log.Fatalf("Management API error: %v", err)
 	}
 }
@@ -292,38 +297,35 @@ func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *Vol
 			TemplateID string `json:"template_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if req.ClientIP == "" || req.VMID == "" {
-			http.Error(w, `{"error":"client_ip and vm_id are required"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "client_ip and vm_id are required")
 			return
 		}
 		if net.ParseIP(req.ClientIP) == nil {
-			http.Error(w, `{"error":"invalid client_ip"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid client_ip")
 			return
 		}
 		if !isValidID(req.VMID) {
-			http.Error(w, `{"error":"invalid vm_id"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid vm_id")
 			return
 		}
 		if req.TemplateID == "" {
 			req.TemplateID = "default"
 		}
 		if !isValidID(req.TemplateID) {
-			http.Error(w, `{"error":"invalid template_id"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid template_id")
 			return
 		}
 		exports.Register(req.ClientIP, req.VMID, req.TemplateID)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		writeOK(w)
 	})
 
 	mux.HandleFunc("DELETE /exports/{client_ip}", func(w http.ResponseWriter, r *http.Request) {
-		clientIP := r.PathValue("client_ip")
-		exports.Deregister(clientIP)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		exports.Deregister(r.PathValue("client_ip"))
+		writeOK(w)
 	})
 
 	mux.HandleFunc("POST /mounts", func(w http.ResponseWriter, r *http.Request) {
@@ -335,32 +337,27 @@ func registerMgmtRoutes(mux *http.ServeMux, exports *ExportManager, volumes *Vol
 			ReadOnly bool   `json:"readonly"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
 		if !isValidID(req.ID) || net.ParseIP(req.ClientIP) == nil || req.Volume == "" {
-			http.Error(w, `{"error":"id, client_ip and volume are required"}`, http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "id, client_ip and volume are required")
 			return
 		}
 		if err := volumes.Register(req.ID, req.ClientIP, req.Volume, req.Subpath, req.ReadOnly); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		writeOK(w)
 	})
 
 	mux.HandleFunc("DELETE /mounts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		volumes.Deregister(r.PathValue("id"))
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		writeOK(w)
 	})
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "ok", "exports": exports.Count(), "mounts": volumes.Count(),
 			"r2": exports.r2 != nil, "volumes_dir": volumes.root, "images": images != nil,
 			"nbd": images != nil && images.servingNBD.Load(),
