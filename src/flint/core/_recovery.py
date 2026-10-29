@@ -1,4 +1,4 @@
-"""Crash recovery engine — reclaims running sandboxes after daemon restart."""
+"""Crash recovery engine — reclaims running sandboxes after daemon restart, and repairs their host state."""
 
 from __future__ import annotations
 
@@ -31,15 +31,16 @@ class RecoveryEngine:
     def recover(self) -> RecoveryReport:
         report = RecoveryReport()
         active = self._store.list_active()
+        backend = self._manager.backend
+        backend.prepare_recovery(active)
 
         if not active:
             log.debug("Recovery: no active sandboxes to recover")
+            self._manager.refresh_tenant_networks()
             return report
 
         log.info("Recovery: found %d active sandbox(es) to probe", len(active))
         daemon_pid = os.getpid()
-        backend = self._manager.backend
-        backend.prepare_recovery(active)
 
         for row in active:
             vm_id = row.vm_id
@@ -74,5 +75,18 @@ class RecoveryEngine:
                 self._store.transition_state(vm_id, SandboxState.DEAD, detail="cleaned up during recovery")
                 report.dead_cleaned += 1
 
+        self._reconcile()
         log.info("Recovery: %s", report)
         return report
+
+    def _reconcile(self) -> None:
+        """Repair what surviving VMs need outside their VMM: host networking, and
+        the credential proxies of running ones, which didn't survive the restart."""
+        backend = self._manager.backend
+        for row in self._store.list_active():
+            if row.state not in (SandboxState.RUNNING, SandboxState.PAUSED):
+                continue
+            backend.reconcile_recovered(row)
+            if row.state == SandboxState.RUNNING and backend.supports_network_policy:
+                self._manager.restore_network_policy(row.vm_id)
+        self._manager.refresh_tenant_networks()

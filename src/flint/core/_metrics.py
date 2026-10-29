@@ -46,7 +46,7 @@ class MetricsSampler:
         while True:
             try:
                 # In a thread: a backend may ask the guest over the network.
-                await asyncio.to_thread(self._sample_all)
+                await asyncio.to_thread(self.sample)
             except Exception:
                 log.exception("MetricsSampler tick failed")
             try:
@@ -54,7 +54,7 @@ class MetricsSampler:
             except asyncio.CancelledError:
                 return
 
-    def _sample_all(self) -> None:
+    def sample(self) -> None:
         entries = self._get_vms()
         active_ids = set()
         for entry in entries:
