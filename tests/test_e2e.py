@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from .conftest import AUTH, BASE_URL, TEST_STATE_DIR, api
+import flint
 from flint import Sandbox, Template
 
 
@@ -224,6 +225,10 @@ def test_pause_and_resume(sandbox):
     assert again.status_code == 409, f"resuming a running VM: {again.status_code} {again.text}"
     unknown = api.post(f"{BASE_URL}/vms/00000000-0000-4000-8000-000000000000/resume", timeout=30.0)
     assert unknown.status_code == 404, f"resuming an unknown VM: {unknown.status_code} {unknown.text}"
+    with pytest.raises(flint.NotFound):
+        Sandbox.connect("00000000-0000-4000-8000-000000000000").resume()
+    with pytest.raises(flint.Conflict):
+        sandbox.resume()
 
 
 # ── Filesystem operations ────────────────────────────────────────────────────
@@ -560,12 +565,18 @@ def test_network_policy_injects_credentials_over_https(require_sandbox):
 
 
 def test_set_timeout(sandbox):
-    """Set a timeout on a sandbox and verify it is reflected in VM details."""
+    """Set a timeout on a sandbox and verify it is reflected in VM details; a bad one is refused."""
     sandbox.set_timeout(300, policy="kill")
     data = sandbox._fetch()
     assert data is not None
     assert data.get("timeout_seconds") == 300
     assert data.get("timeout_policy") == "kill"
+    with pytest.raises(flint.InvalidRequest) as e:
+        sandbox.set_timeout(300, policy="explode")
+    assert e.value.status_code == 400 and "timeout_policy" in e.value.detail, e.value.detail
+    bad = api.patch(f"{BASE_URL}/vms/{sandbox.id}", json={"timeout_seconds": "soon"}, timeout=10.0)
+    assert bad.status_code == 400, bad.text
+    assert sandbox._fetch().get("timeout_policy") == "kill"
 
 
 # ── VM state & details ─────────────────────────────────────────────────────
@@ -730,7 +741,7 @@ def test_list_processes(sandbox):
 
 
 def test_create_process(sandbox):
-    """Spawn a process inside the sandbox and verify it returns a PID."""
+    """Spawn a process inside the sandbox: it returns a PID, and the VM's timeline records it."""
     resp = api.post(
         f"{BASE_URL}/vms/{sandbox.id}/processes",
         json={"cmd": ["/bin/sh", "-c", "echo proc_ok"]},
@@ -741,6 +752,15 @@ def test_create_process(sandbox):
     resp.raise_for_status()
     data = resp.json()
     assert "pid" in data or "id" in data
+    deadline = time.monotonic() + 10
+    while True:
+        timeline = api.get(f"{BASE_URL}/vms/{sandbox.id}/timeline", timeout=10.0).json()["events"]
+        started = [e for e in timeline if e["type"] == "vm.process_started"]
+        if started or time.monotonic() > deadline:
+            break
+        time.sleep(0.1)
+    assert started, f"no vm.process_started event; the timeline has {[e['type'] for e in timeline]}"
+    assert (started[0]["vm_id"], started[0]["cmd"], started[0]["pid"]) == (sandbox.id, "echo proc_ok", data.get("pid")), started
 
 
 # ── Additional happy-path flows ────────────────────────────────────────────
